@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    name: Linux Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            python3 \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+  windows-build:
+    name: Windows Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package Win11 artifact
+        shell: pwsh
+        run: |
+          $outDir = "dist/win11/PowderGame"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $exe = Get-ChildItem build -Recurse -Filter "powder_game.exe" | Select-Object -First 1
+          if (-not $exe) { throw "powder_game.exe not found" }
+
+          $shaderDir = Join-Path $exe.Directory.FullName "shaders"
+          if (-not (Test-Path $shaderDir)) { throw "shaders directory not found next to executable" }
+
+          Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
+          Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
+
+          @"
+Powder Game (Windows 11 x64)
+
+Run:
+- Double-click powder_game.exe
+
+Controls:
+- 1: Sand brush
+- 2: Water brush
+- 3: Solid brush
+- 4: Erase brush
+- 5: Smoke brush
+- 6: Fire brush
+- [ / ]: Decrease / increase brush radius
+- Left mouse: paint
+- Esc: quit
+
+Notes:
+- Keep the shaders/ folder next to powder_game.exe.
+- Requires a GPU/driver with OpenGL 4.3+ support.
+"@ | Set-Content -Path (Join-Path $outDir "README.txt")
+
+          New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
+          Compress-Archive -Path "$outDir/*" -DestinationPath "dist/win11/PowderGame-win11-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PowderGame-win11-x64
+          path: dist/win11/PowderGame-win11-x64.zip
