@@ -11,8 +11,10 @@ layout(rg16f, binding = 3) uniform readonly image2D lbmSrc2;
 layout(rgba16f, binding = 4) uniform writeonly image2D lbmDst0;
 layout(rgba16f, binding = 5) uniform writeonly image2D lbmDst1;
 layout(rg16f, binding = 6) uniform writeonly image2D lbmDst2;
+layout(r8ui, binding = 7) uniform readonly uimage2D tileActiveTex;
 
 uniform ivec2 gridSize;
+uniform ivec2 tileSize;
 uniform float omega;
 uniform float restMix;
 uniform float maxVelocity;
@@ -49,6 +51,11 @@ struct Dist {
 
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool tileActive(ivec2 coord) {
+    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
 }
 
 bool isSolid(ivec2 coord) {
@@ -143,6 +150,10 @@ float postCollision(ivec2 source, int i) {
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (!inBounds(coord)) {
+        return;
+    }
+    if (!tileActive(coord)) {
+        storeDist(coord, loadDist(coord));
         return;
     }
 

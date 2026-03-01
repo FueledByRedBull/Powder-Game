@@ -3,14 +3,16 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rg16f, binding = 0) uniform readonly image2D smokeVelSrc;
-layout(r16f, binding = 1) uniform readonly image2D smokeDenSrc;
+layout(r8, binding = 1) uniform readonly image2D smokeDenSrc;
 layout(r16f, binding = 2) uniform readonly image2D heatTex;
 
 layout(rg16f, binding = 3) uniform writeonly image2D smokeVelDst;
-layout(r16f, binding = 4) uniform writeonly image2D smokeDenDst;
+layout(r8, binding = 4) uniform writeonly image2D smokeDenDst;
+layout(r8ui, binding = 5) uniform readonly uimage2D tileActiveTex;
 
 uniform ivec2 smokeSize;
 uniform ivec2 heatSize;
+uniform ivec2 tileSize;
 uniform float dt;
 uniform float velocityDissipation;
 uniform float densityDissipation;
@@ -63,9 +65,20 @@ float sampleHeat(vec2 smokeUv) {
     return imageLoad(heatTex, heat_coord).x;
 }
 
+bool tileActive(ivec2 coord) {
+    ivec2 full_coord = coord * 4 + ivec2(2);
+    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+    if (!tileActive(coord)) {
+        imageStore(smokeVelDst, coord, imageLoad(smokeVelSrc, coord));
+        imageStore(smokeDenDst, coord, imageLoad(smokeDenSrc, coord));
         return;
     }
 

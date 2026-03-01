@@ -22,11 +22,13 @@ private:
 
     static constexpr int kGridWidth = 1000;
     static constexpr int kGridHeight = 1000;
+    static constexpr int kWorkgroupSize = 16;
     static constexpr int kHeatWidth = kGridWidth / 2;
     static constexpr int kHeatHeight = kGridHeight / 2;
     static constexpr int kSmokeWidth = kGridWidth / 4;
     static constexpr int kSmokeHeight = kGridHeight / 4;
-    static constexpr int kWorkgroupSize = 16;
+    static constexpr int kTileWidth = (kGridWidth + kWorkgroupSize - 1) / kWorkgroupSize;
+    static constexpr int kTileHeight = (kGridHeight + kWorkgroupSize - 1) / kWorkgroupSize;
 
     GLFWwindow* window_ = nullptr;
     bool gl_ready_ = false;
@@ -74,6 +76,9 @@ private:
     GLuint heat_a_ = 0;
     GLuint heat_b_ = 0;
 
+    GLuint tile_active_a_ = 0;
+    GLuint tile_active_b_ = 0;
+
     GLuint desired_buffer_ = 0;
     GLuint proposed_velocity_buffer_ = 0;
     GLuint winner_buffer_ = 0;
@@ -98,6 +103,8 @@ private:
     GLuint coupling_heat_program_ = 0;
     GLuint coupling_smoke_program_ = 0;
     GLuint coupling_sand_drag_program_ = 0;
+    GLuint tile_build_program_ = 0;
+    GLuint tile_dilate_program_ = 0;
     GLuint render_program_ = 0;
 
     GLuint fullscreen_vao_ = 0;
@@ -113,6 +120,7 @@ private:
     void UpdateInput();
     void RunFrame(float dt);
     void RunSpawnPass();
+    void RunTileActivityPass();
     void RunSandPass(float dt);
     void RunWaterPass();
     void RunSmokePass(float dt);

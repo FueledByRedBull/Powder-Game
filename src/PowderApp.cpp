@@ -158,6 +158,8 @@ void PowderApp::Shutdown() {
         DeleteProgram(sand_prepare_program_);
         DeleteProgram(spawn_program_);
         DeleteProgram(init_state_program_);
+        DeleteProgram(tile_dilate_program_);
+        DeleteProgram(tile_build_program_);
 
         DeleteBuffer(winner_buffer_);
         DeleteBuffer(proposed_velocity_buffer_);
@@ -189,6 +191,8 @@ void PowderApp::Shutdown() {
         DeleteTexture(velocity_a_);
         DeleteTexture(material_b_);
         DeleteTexture(material_a_);
+        DeleteTexture(tile_active_b_);
+        DeleteTexture(tile_active_a_);
 
         if (fullscreen_vao_ != 0U) {
             glDeleteVertexArrays(1, &fullscreen_vao_);
@@ -228,8 +232,8 @@ void PowderApp::CreateTextures() {
 
     smoke_vel_a_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
     smoke_vel_b_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
-    smoke_den_a_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_LINEAR);
-    smoke_den_b_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_LINEAR);
+    smoke_den_a_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_LINEAR);
+    smoke_den_b_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_LINEAR);
     smoke_pressure_a_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
     smoke_pressure_b_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
     smoke_divergence_ = CreateTexture(kSmokeWidth, kSmokeHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
@@ -239,6 +243,9 @@ void PowderApp::CreateTextures() {
 
     heat_a_ = CreateTexture(kHeatWidth, kHeatHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_LINEAR);
     heat_b_ = CreateTexture(kHeatWidth, kHeatHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_LINEAR);
+
+    tile_active_a_ = CreateTexture(kTileWidth, kTileHeight, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
+    tile_active_b_ = CreateTexture(kTileWidth, kTileHeight, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
 }
 
 void PowderApp::CreateBuffers() {
@@ -290,6 +297,8 @@ void PowderApp::CreatePrograms() {
     coupling_smoke_program_ = glutil::CreateComputeProgramFromFile((shader_root / "coupling_smoke.comp").string());
     coupling_sand_drag_program_ =
         glutil::CreateComputeProgramFromFile((shader_root / "coupling_sand_drag.comp").string());
+    tile_build_program_ = glutil::CreateComputeProgramFromFile((shader_root / "tile_build.comp").string());
+    tile_dilate_program_ = glutil::CreateComputeProgramFromFile((shader_root / "tile_dilate.comp").string());
 
     render_program_ = glutil::CreateProgramFromFiles((shader_root / "fullscreen.vert").string(),
                                                      (shader_root / "composite.frag").string());
@@ -376,6 +385,7 @@ void PowderApp::UpdateInput() {
 void PowderApp::RunFrame(float dt) {
     ++frame_index_;
     RunSpawnPass();
+    RunTileActivityPass();
     RunSandPass(dt);
     RunWaterPass();
     RunSmokePass(dt);
@@ -463,10 +473,38 @@ void PowderApp::RunSpawnPass() {
     glBindImageTexture(6, CurrentFire(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
     glBindImageTexture(7, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(8, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(9, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(9, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8);
 
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+}
+
+void PowderApp::RunTileActivityPass() {
+    glUseProgram(tile_build_program_);
+    glUniform2i(glGetUniformLocation(tile_build_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(tile_build_program_, "heatSize"), kHeatWidth, kHeatHeight);
+    glUniform2i(glGetUniformLocation(tile_build_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+    glUniform2i(glGetUniformLocation(tile_build_program_, "tileSize"), kTileWidth, kTileHeight);
+    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
+    glBindImageTexture(1, CurrentVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(2, water_pressure_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(3, CurrentFire(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(4, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(5, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(6, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8);
+    glBindImageTexture(7, CurrentLbm0(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+    glBindImageTexture(8, CurrentLbm1(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+    glBindImageTexture(9, CurrentLbm2(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(10, tile_active_a_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+    DispatchGrid(kTileWidth, kTileHeight);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    glUseProgram(tile_dilate_program_);
+    glUniform2i(glGetUniformLocation(tile_dilate_program_, "tileSize"), kTileWidth, kTileHeight);
+    glBindImageTexture(0, tile_active_a_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    glBindImageTexture(1, tile_active_b_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+    DispatchGrid(kTileWidth, kTileHeight);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
 
 void PowderApp::RunSandPass(float dt) {
@@ -483,6 +521,7 @@ void PowderApp::RunSandPass(float dt) {
 
     glUseProgram(sand_desired_program_);
     glUniform2i(glGetUniformLocation(sand_desired_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(sand_desired_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(sand_desired_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(sand_desired_program_, "gravity"), 240.0F);
     glUniform1f(glGetUniformLocation(sand_desired_program_, "maxSpeed"), 280.0F);
@@ -492,6 +531,7 @@ void PowderApp::RunSandPass(float dt) {
     glUniform1ui(glGetUniformLocation(sand_desired_program_, "frameIndex"), frame_index_);
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
     glBindImageTexture(1, CurrentVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(2, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, desired_buffer_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, proposed_velocity_buffer_);
     DispatchGrid(kGridWidth, kGridHeight);
@@ -504,7 +544,9 @@ void PowderApp::RunSandPass(float dt) {
 
     glUseProgram(sand_resolve_program_);
     glUniform2i(glGetUniformLocation(sand_resolve_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(sand_resolve_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1ui(glGetUniformLocation(sand_resolve_program_, "frameIndex"), frame_index_);
+    glBindImageTexture(0, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, desired_buffer_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, winner_buffer_);
     DispatchGrid(kGridWidth, kGridHeight);
@@ -512,12 +554,14 @@ void PowderApp::RunSandPass(float dt) {
 
     glUseProgram(sand_commit_program_);
     glUniform2i(glGetUniformLocation(sand_commit_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(sand_commit_program_, "tileSize"), kTileWidth, kTileHeight);
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
     glBindImageTexture(1, CurrentVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(2, CurrentStress(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(3, NextMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
     glBindImageTexture(4, NextVelocity(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
     glBindImageTexture(5, NextStress(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(6, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, desired_buffer_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, proposed_velocity_buffer_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, winner_buffer_);
@@ -530,6 +574,7 @@ void PowderApp::RunSandPass(float dt) {
 void PowderApp::RunWaterPass() {
     glUseProgram(water_lbm_program_);
     glUniform2i(glGetUniformLocation(water_lbm_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(water_lbm_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(water_lbm_program_, "omega"), 1.08F);
     glUniform1f(glGetUniformLocation(water_lbm_program_, "restMix"), 0.012F);
     glUniform1f(glGetUniformLocation(water_lbm_program_, "maxVelocity"), 0.75F);
@@ -540,15 +585,18 @@ void PowderApp::RunWaterPass() {
     glBindImageTexture(4, NextLbm0(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glBindImageTexture(5, NextLbm1(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glBindImageTexture(6, NextLbm2(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    glBindImageTexture(7, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     glUseProgram(water_pressure_program_);
     glUniform2i(glGetUniformLocation(water_pressure_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(water_pressure_program_, "tileSize"), kTileWidth, kTileHeight);
     glBindImageTexture(0, NextLbm0(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
     glBindImageTexture(1, NextLbm1(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
     glBindImageTexture(2, NextLbm2(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(3, water_pressure_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(3, water_pressure_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(4, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -559,39 +607,47 @@ void PowderApp::RunSmokePass(float dt) {
     glUseProgram(smoke_advect_program_);
     glUniform2i(glGetUniformLocation(smoke_advect_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
     glUniform2i(glGetUniformLocation(smoke_advect_program_, "heatSize"), kHeatWidth, kHeatHeight);
+    glUniform2i(glGetUniformLocation(smoke_advect_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(smoke_advect_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(smoke_advect_program_, "velocityDissipation"), 0.986F);
     glUniform1f(glGetUniformLocation(smoke_advect_program_, "densityDissipation"), 0.976F);
     glUniform1f(glGetUniformLocation(smoke_advect_program_, "buoyancy"), 1.45F);
     glBindImageTexture(0, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8);
     glBindImageTexture(2, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(3, NextSmokeVel(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(4, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(4, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
+    glBindImageTexture(5, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(smoke_vorticity_program_);
     glUniform2i(glGetUniformLocation(smoke_vorticity_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+    glUniform2i(glGetUniformLocation(smoke_vorticity_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(smoke_vorticity_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(smoke_vorticity_program_, "epsilon"), 0.22F);
     glBindImageTexture(0, NextSmokeVel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, NextSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(1, NextSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8);
     glBindImageTexture(2, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
+    glBindImageTexture(4, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     glUseProgram(smoke_divergence_program_);
     glUniform2i(glGetUniformLocation(smoke_divergence_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+    glUniform2i(glGetUniformLocation(smoke_divergence_program_, "tileSize"), kTileWidth, kTileHeight);
     glBindImageTexture(0, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(1, smoke_divergence_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(2, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     glUseProgram(smoke_pressure_clear_program_);
     glUniform2i(glGetUniformLocation(smoke_pressure_clear_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+    glUniform2i(glGetUniformLocation(smoke_pressure_clear_program_, "tileSize"), kTileWidth, kTileHeight);
     glBindImageTexture(0, CurrentSmokePressure(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(1, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
@@ -599,9 +655,11 @@ void PowderApp::RunSmokePass(float dt) {
     for (int i = 0; i < kPressureIterations; ++i) {
         glUseProgram(smoke_pressure_jacobi_program_);
         glUniform2i(glGetUniformLocation(smoke_pressure_jacobi_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+        glUniform2i(glGetUniformLocation(smoke_pressure_jacobi_program_, "tileSize"), kTileWidth, kTileHeight);
         glBindImageTexture(0, smoke_divergence_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(1, CurrentSmokePressure(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(2, NextSmokePressure(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+        glBindImageTexture(3, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
         DispatchGrid(kSmokeWidth, kSmokeHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         SwapSmokePressurePing();
@@ -609,11 +667,13 @@ void PowderApp::RunSmokePass(float dt) {
 
     glUseProgram(smoke_project_program_);
     glUniform2i(glGetUniformLocation(smoke_project_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
+    glUniform2i(glGetUniformLocation(smoke_project_program_, "tileSize"), kTileWidth, kTileHeight);
     glBindImageTexture(0, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8);
     glBindImageTexture(2, CurrentSmokePressure(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(3, NextSmokeVel(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(4, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(4, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
+    glBindImageTexture(5, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -624,6 +684,7 @@ void PowderApp::RunFireHeatPass(float dt) {
     glUseProgram(fire_rd_program_);
     glUniform2i(glGetUniformLocation(fire_rd_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform2i(glGetUniformLocation(fire_rd_program_, "heatSize"), kHeatWidth, kHeatHeight);
+    glUniform2i(glGetUniformLocation(fire_rd_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(fire_rd_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(fire_rd_program_, "diffusionU"), 0.00025F);
     glUniform1f(glGetUniformLocation(fire_rd_program_, "diffusionV"), 0.00012F);
@@ -632,12 +693,14 @@ void PowderApp::RunFireHeatPass(float dt) {
     glBindImageTexture(0, CurrentFire(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(1, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(2, NextFire(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    glBindImageTexture(3, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(heat_diffuse_program_);
     glUniform2i(glGetUniformLocation(heat_diffuse_program_, "heatSize"), kHeatWidth, kHeatHeight);
     glUniform2i(glGetUniformLocation(heat_diffuse_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(heat_diffuse_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(heat_diffuse_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(heat_diffuse_program_, "diffusion"), 0.22F);
     glUniform1f(glGetUniformLocation(heat_diffuse_program_, "decay"), 0.09F);
@@ -645,6 +708,7 @@ void PowderApp::RunFireHeatPass(float dt) {
     glBindImageTexture(0, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(1, NextFire(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(2, NextHeat(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(3, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kHeatWidth, kHeatHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -656,21 +720,25 @@ void PowderApp::RunCouplingPass(float dt) {
     glUseProgram(coupling_fire_program_);
     glUniform2i(glGetUniformLocation(coupling_fire_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform2i(glGetUniformLocation(coupling_fire_program_, "heatSize"), kHeatWidth, kHeatHeight);
+    glUniform2i(glGetUniformLocation(coupling_fire_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(coupling_fire_program_, "dt"), dt);
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
     glBindImageTexture(1, water_pressure_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(2, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(3, CurrentFire(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
+    glBindImageTexture(4, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(coupling_heat_program_);
     glUniform2i(glGetUniformLocation(coupling_heat_program_, "heatSize"), kHeatWidth, kHeatHeight);
     glUniform2i(glGetUniformLocation(coupling_heat_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(coupling_heat_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(coupling_heat_program_, "dt"), dt);
     glBindImageTexture(0, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(1, CurrentFire(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(2, water_pressure_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(3, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kHeatWidth, kHeatHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -678,21 +746,25 @@ void PowderApp::RunCouplingPass(float dt) {
     glUniform2i(glGetUniformLocation(coupling_smoke_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
     glUniform2i(glGetUniformLocation(coupling_smoke_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform2i(glGetUniformLocation(coupling_smoke_program_, "heatSize"), kHeatWidth, kHeatHeight);
+    glUniform2i(glGetUniformLocation(coupling_smoke_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(coupling_smoke_program_, "dt"), dt);
     glBindImageTexture(0, CurrentSmokeVel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8);
     glBindImageTexture(2, CurrentFire(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(3, CurrentHeat(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(4, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kSmokeWidth, kSmokeHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(coupling_sand_drag_program_);
     glUniform2i(glGetUniformLocation(coupling_sand_drag_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(glGetUniformLocation(coupling_sand_drag_program_, "tileSize"), kTileWidth, kTileHeight);
     glUniform1f(glGetUniformLocation(coupling_sand_drag_program_, "dt"), dt);
     glUniform1f(glGetUniformLocation(coupling_sand_drag_program_, "drag"), 0.18F);
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
     glBindImageTexture(1, water_pressure_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(2, CurrentVelocity(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
+    glBindImageTexture(3, tile_active_b_, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
@@ -880,6 +952,17 @@ GLuint PowderApp::CreateTexture(int width,
     const int texel_count = width * height;
     if (internal_format == GL_R16UI) {
         const std::vector<unsigned short> zeros(static_cast<std::size_t>(texel_count), 0U);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, zeros.data());
+    } else if (internal_format == GL_R8UI) {
+        const std::vector<unsigned char> zeros(static_cast<std::size_t>(texel_count), 0U);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, zeros.data());
+    } else if (type == GL_UNSIGNED_BYTE) {
+        const int channels = (format == GL_RG) ? 2 : (format == GL_RGBA ? 4 : 1);
+        const std::vector<unsigned char> zeros(static_cast<std::size_t>(texel_count * channels), 0U);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, zeros.data());
+    } else if (type == GL_HALF_FLOAT) {
+        const int channels = (format == GL_RG) ? 2 : (format == GL_RGBA ? 4 : 1);
+        const std::vector<std::uint16_t> zeros(static_cast<std::size_t>(texel_count * channels), 0U);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, zeros.data());
     } else {
         const int channels = (format == GL_RG) ? 2 : (format == GL_RGBA ? 4 : 1);

@@ -5,8 +5,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r16f, binding = 0) uniform readonly image2D divergenceTex;
 layout(r16f, binding = 1) uniform readonly image2D pressureSrc;
 layout(r16f, binding = 2) uniform writeonly image2D pressureDst;
+layout(r8ui, binding = 3) uniform readonly uimage2D tileActiveTex;
 
 uniform ivec2 smokeSize;
+uniform ivec2 tileSize;
 
 ivec2 clampSmoke(ivec2 coord) {
     return clamp(coord, ivec2(0), smokeSize - ivec2(1));
@@ -16,9 +18,19 @@ float pressure(ivec2 coord) {
     return imageLoad(pressureSrc, clampSmoke(coord)).x;
 }
 
+bool tileActive(ivec2 coord) {
+    ivec2 full_coord = coord * 4 + ivec2(2);
+    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+    if (!tileActive(coord)) {
+        imageStore(pressureDst, coord, vec4(pressure(coord), 0.0, 0.0, 0.0));
         return;
     }
 

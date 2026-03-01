@@ -1,0 +1,35 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D tileActiveSrc;
+layout(r8ui, binding = 1) uniform writeonly uimage2D tileActiveDst;
+
+uniform ivec2 tileSize;
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < tileSize.x && coord.y < tileSize.y;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    uint tile_is_active = 0u;
+    for (int oy = -1; oy <= 1 && tile_is_active == 0u; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            ivec2 sample_coord = coord + ivec2(ox, oy);
+            if (!inBounds(sample_coord)) {
+                continue;
+            }
+            if (imageLoad(tileActiveSrc, sample_coord).r != 0u) {
+                tile_is_active = 1u;
+                break;
+            }
+        }
+    }
+
+    imageStore(tileActiveDst, coord, uvec4(tile_is_active, 0u, 0u, 0u));
+}

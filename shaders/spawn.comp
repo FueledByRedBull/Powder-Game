@@ -11,7 +11,7 @@ layout(rg16f, binding = 5) uniform image2D lbm2Tex;
 layout(rg16f, binding = 6) uniform image2D fireTex;
 layout(r16f, binding = 7) uniform image2D heatTex;
 layout(rg16f, binding = 8) uniform image2D smokeVelTex;
-layout(r16f, binding = 9) uniform image2D smokeDenTex;
+layout(r8, binding = 9) uniform image2D smokeDenTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 heatSize;

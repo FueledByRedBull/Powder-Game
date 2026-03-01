@@ -4,6 +4,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16ui, binding = 0) uniform readonly uimage2D materialSrc;
 layout(rg16f, binding = 1) uniform readonly image2D velocitySrc;
+layout(r8ui, binding = 2) uniform readonly uimage2D tileActiveTex;
 
 layout(std430, binding = 0) buffer DesiredTarget {
     int desired[];
@@ -14,6 +15,7 @@ layout(std430, binding = 1) buffer ProposedVelocity {
 };
 
 uniform ivec2 gridSize;
+uniform ivec2 tileSize;
 uniform float dt;
 uniform float gravity;
 uniform float maxSpeed;
@@ -24,6 +26,11 @@ uniform uint frameIndex;
 
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool tileActive(ivec2 coord) {
+    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
 }
 
 bool emptyCell(ivec2 coord) {
@@ -50,6 +57,11 @@ void main() {
     }
 
     int index = linearIndex(coord);
+    if (!tileActive(coord)) {
+        desired[index] = -1;
+        proposed[index] = vec2(0.0);
+        return;
+    }
 
     if (imageLoad(materialSrc, coord).r != 1u) {
         desired[index] = -1;

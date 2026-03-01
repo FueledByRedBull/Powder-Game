@@ -5,9 +5,11 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r16f, binding = 0) uniform image2D heatTex;
 layout(rg16f, binding = 1) uniform readonly image2D fireTex;
 layout(r16f, binding = 2) uniform readonly image2D waterPressureTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D tileActiveTex;
 
 uniform ivec2 heatSize;
 uniform ivec2 gridSize;
+uniform ivec2 tileSize;
 uniform float dt;
 
 float fireSample(ivec2 full_coord) {
@@ -20,9 +22,18 @@ float waterSample(ivec2 full_coord) {
     return abs(imageLoad(waterPressureTex, clamped).x);
 }
 
+bool tileActive(ivec2 coord) {
+    ivec2 full_coord = coord * 2 + ivec2(1);
+    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= heatSize.x || coord.y >= heatSize.y) {
+        return;
+    }
+    if (!tileActive(coord)) {
         return;
     }
 

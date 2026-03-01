@@ -28,6 +28,8 @@ This project focuses on one goal: keep the simulation on the GPU and maintain in
 - `Fire` reaction-diffusion + half-res heat coupling
 - Cross-material coupling passes (fire/heat/smoke/water/sand)
 - No CPU readback in the frame loop
+- Active-tile culling pass to skip heavy work in idle regions
+- Tuned texture formats (smoke density in `R8`) to reduce bandwidth
 - Windows packaging script for standalone `.exe` output
 
 ## Controls
@@ -88,13 +90,12 @@ Per-frame compute flow:
 
 ## Current Status
 
-Milestones `1-6` are implemented from `PLAN.md`.
+Milestones `1-7` are implemented from `PLAN.md`.
 
 Current focus areas:
 
-- tuning visual behavior and stability constants
-- material look/contrast polish
-- future optimization pass (tile compaction/format tuning)
+- simulation tuning and visual polish
+- deeper active-tile compaction strategies (indirect-dispatch path)
 
 ## Build Philosophy
 

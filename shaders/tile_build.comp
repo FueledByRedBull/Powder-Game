@@ -1,0 +1,118 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
+layout(rg16f, binding = 1) uniform readonly image2D velocityTex;
+layout(r16f, binding = 2) uniform readonly image2D waterPressureTex;
+layout(rg16f, binding = 3) uniform readonly image2D fireTex;
+layout(r16f, binding = 4) uniform readonly image2D heatTex;
+layout(rg16f, binding = 5) uniform readonly image2D smokeVelTex;
+layout(r8, binding = 6) uniform readonly image2D smokeDenTex;
+layout(rgba16f, binding = 7) uniform readonly image2D lbmTex0;
+layout(rgba16f, binding = 8) uniform readonly image2D lbmTex1;
+layout(rg16f, binding = 9) uniform readonly image2D lbmTex2;
+layout(r8ui, binding = 10) uniform writeonly uimage2D tileActiveTex;
+
+uniform ivec2 gridSize;
+uniform ivec2 heatSize;
+uniform ivec2 smokeSize;
+uniform ivec2 tileSize;
+
+bool inBounds(ivec2 coord, ivec2 size) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < size.x && coord.y < size.y;
+}
+
+bool fullCellActive(ivec2 coord) {
+    if (imageLoad(materialTex, coord).r != 0u) {
+        return true;
+    }
+    vec2 velocity = imageLoad(velocityTex, coord).xy;
+    if (dot(velocity, velocity) > 0.0036) {
+        return true;
+    }
+    if (abs(imageLoad(waterPressureTex, coord).x) > 0.0035) {
+        return true;
+    }
+    if (imageLoad(fireTex, coord).y > 0.015) {
+        return true;
+    }
+    vec4 a0 = imageLoad(lbmTex0, coord);
+    vec4 a1 = imageLoad(lbmTex1, coord);
+    vec4 a2 = imageLoad(lbmTex2, coord);
+
+    float rho = a0.x + a0.y + a0.z + a0.w + a1.x + a1.y + a1.z + a1.w + a2.x;
+    if (!isnan(rho) && !isinf(rho) && abs(rho - 1.0) > 0.0035) {
+        return true;
+    }
+
+    float ux = (a0.y + a1.y + a2.x) - (a0.w + a1.z + a1.w);
+    float uy = (a0.z + a1.y + a1.z) - (a1.x + a1.w + a2.x);
+    if (ux * ux + uy * uy > 0.0001) {
+        return true;
+    }
+
+    return false;
+}
+
+bool heatCellActive(ivec2 coord) {
+    return imageLoad(heatTex, coord).x > 0.02;
+}
+
+bool smokeCellActive(ivec2 coord) {
+    float density = imageLoad(smokeDenTex, coord).x;
+    if (density > 0.015) {
+        return true;
+    }
+    vec2 velocity = imageLoad(smokeVelTex, coord).xy;
+    return dot(velocity, velocity) > 0.0004;
+}
+
+void main() {
+    ivec2 tile_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(tile_coord, tileSize)) {
+        return;
+    }
+
+    ivec2 full_min = tile_coord * 16;
+    ivec2 full_max = min(full_min + ivec2(16), gridSize);
+
+    bool tile_is_active = false;
+
+    for (int y = full_min.y; y < full_max.y && !tile_is_active; ++y) {
+        for (int x = full_min.x; x < full_max.x; ++x) {
+            if (fullCellActive(ivec2(x, y))) {
+                tile_is_active = true;
+                break;
+            }
+        }
+    }
+
+    if (!tile_is_active) {
+        ivec2 heat_min = clamp(full_min / 2, ivec2(0), heatSize - ivec2(1));
+        ivec2 heat_max = clamp((full_max - ivec2(1)) / 2, ivec2(0), heatSize - ivec2(1));
+        for (int y = heat_min.y; y <= heat_max.y && !tile_is_active; ++y) {
+            for (int x = heat_min.x; x <= heat_max.x; ++x) {
+                if (heatCellActive(ivec2(x, y))) {
+                    tile_is_active = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!tile_is_active) {
+        ivec2 smoke_min = clamp(full_min / 4, ivec2(0), smokeSize - ivec2(1));
+        ivec2 smoke_max = clamp((full_max - ivec2(1)) / 4, ivec2(0), smokeSize - ivec2(1));
+        for (int y = smoke_min.y; y <= smoke_max.y && !tile_is_active; ++y) {
+            for (int x = smoke_min.x; x <= smoke_max.x; ++x) {
+                if (smokeCellActive(ivec2(x, y))) {
+                    tile_is_active = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    imageStore(tileActiveTex, tile_coord, uvec4(tile_is_active ? 1u : 0u, 0u, 0u, 0u));
+}

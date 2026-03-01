@@ -9,6 +9,7 @@ layout(r16f, binding = 2) uniform readonly image2D stressSrc;
 layout(r16ui, binding = 3) uniform uimage2D materialDst;
 layout(rg16f, binding = 4) uniform image2D velocityDst;
 layout(r16f, binding = 5) uniform image2D stressDst;
+layout(r8ui, binding = 6) uniform readonly uimage2D tileActiveTex;
 
 layout(std430, binding = 0) buffer DesiredTarget {
     int desired[];
@@ -23,10 +24,16 @@ layout(std430, binding = 2) buffer WinnerBuffer {
 };
 
 uniform ivec2 gridSize;
+uniform ivec2 tileSize;
 const uint kIndexMask = (1u << 20u) - 1u;
 
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool tileActive(ivec2 coord) {
+    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
 }
 
 int linearIndex(ivec2 coord) {
@@ -59,6 +66,9 @@ float slopeStress(ivec2 coord, float previous) {
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (!inBounds(coord)) {
+        return;
+    }
+    if (!tileActive(coord)) {
         return;
     }
 

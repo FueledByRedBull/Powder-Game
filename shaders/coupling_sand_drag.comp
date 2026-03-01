@@ -5,8 +5,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
 layout(r16f, binding = 1) uniform readonly image2D waterPressureTex;
 layout(rg16f, binding = 2) uniform image2D velocityTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D tileActiveTex;
 
 uniform ivec2 gridSize;
+uniform ivec2 tileSize;
 uniform float dt;
 uniform float drag;
 
@@ -18,9 +20,17 @@ float pressureAt(ivec2 coord) {
     return imageLoad(waterPressureTex, clampGrid(coord)).x;
 }
 
+bool tileActive(ivec2 coord) {
+    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
+    return imageLoad(tileActiveTex, tile).r != 0u;
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+    if (!tileActive(coord)) {
         return;
     }
 
