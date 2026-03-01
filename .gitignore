@@ -1,0 +1,7 @@
+build/
+build-win/
+dist/
+
+*.user
+*.suo
+*.tmp

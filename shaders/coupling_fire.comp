@@ -1,0 +1,49 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
+layout(r16f, binding = 1) uniform readonly image2D waterPressureTex;
+layout(r16f, binding = 2) uniform readonly image2D heatTex;
+layout(rg16f, binding = 3) uniform image2D fireTex;
+
+uniform ivec2 gridSize;
+uniform ivec2 heatSize;
+uniform float dt;
+
+float sampleHeat(ivec2 full_coord) {
+    vec2 uv = (vec2(full_coord) + vec2(0.5)) / vec2(gridSize);
+    ivec2 heat_coord = clamp(ivec2(uv * vec2(heatSize)), ivec2(0), heatSize - ivec2(1));
+    return imageLoad(heatTex, heat_coord).x;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+
+    uint material = imageLoad(materialTex, coord).r;
+    float water = abs(imageLoad(waterPressureTex, coord).x);
+    float heat = sampleHeat(coord);
+
+    vec2 fire = imageLoad(fireTex, coord).xy;
+
+    float ignition = smoothstep(0.42, 0.78, heat);
+    if (material == 2u) {
+        ignition *= 0.2;
+    } else if (material == 0u) {
+        ignition *= 0.6;
+    }
+
+    float burn_rate = (material == 1u) ? 0.38 : 0.20;
+    float recharge = (material == 1u) ? 0.025 : 0.08;
+
+    fire.y = clamp(fire.y + (ignition * fire.x - burn_rate * fire.y) * dt, 0.0, 1.0);
+    fire.x = clamp(fire.x + (recharge * (1.0 - fire.x) - fire.y * 0.30) * dt, 0.0, 1.0);
+
+    float damp = 1.0 - clamp(water * 0.7, 0.0, 0.85);
+    fire.y *= damp;
+
+    imageStore(fireTex, coord, vec4(fire, 0.0, 0.0));
+}

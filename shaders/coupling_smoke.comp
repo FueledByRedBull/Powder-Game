@@ -1,0 +1,63 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform image2D smokeVelTex;
+layout(r16f, binding = 1) uniform image2D smokeDenTex;
+layout(rg16f, binding = 2) uniform readonly image2D fireTex;
+layout(r16f, binding = 3) uniform readonly image2D heatTex;
+
+uniform ivec2 smokeSize;
+uniform ivec2 gridSize;
+uniform ivec2 heatSize;
+uniform float dt;
+
+ivec2 clampGrid(ivec2 coord) {
+    return clamp(coord, ivec2(0), gridSize - ivec2(1));
+}
+
+float fireSample(ivec2 coord) {
+    return imageLoad(fireTex, clampGrid(coord)).y;
+}
+
+float heatSample(ivec2 smoke_coord) {
+    vec2 uv = (vec2(smoke_coord) + vec2(0.5)) / vec2(smokeSize);
+    ivec2 heat_coord = clamp(ivec2(uv * vec2(heatSize)), ivec2(0), heatSize - ivec2(1));
+    return imageLoad(heatTex, heat_coord).x;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+
+    ivec2 full_base = coord * 4;
+    float f0 = fireSample(full_base + ivec2(0, 0));
+    float f1 = fireSample(full_base + ivec2(3, 0));
+    float f2 = fireSample(full_base + ivec2(0, 3));
+    float f3 = fireSample(full_base + ivec2(3, 3));
+    float fire_avg = 0.25 * (f0 + f1 + f2 + f3);
+    float fire_peak = max(max(f0, f1), max(f2, f3));
+
+    float heat = heatSample(coord);
+
+    vec2 velocity = imageLoad(smokeVelTex, coord).xy;
+    float density = imageLoad(smokeDenTex, coord).x;
+
+    float inject = max(fire_peak - 0.24, 0.0) * 1.25;
+    float passive_fade = mix(0.34, 0.12, clamp(heat * 1.4, 0.0, 1.0));
+    density = max(density - passive_fade * dt, 0.0);
+    density = clamp(density + inject * dt, 0.0, 1.0);
+
+    float upward = inject * 5.0 + max(heat - 0.20, 0.0) * 1.8;
+    velocity.y = clamp(velocity.y * 0.985 + upward * dt, -1.0, 3.2);
+    velocity.x *= 0.86;
+    velocity *= 0.996;
+
+    // Very weak lateral drift only while flames are active to avoid a static "fungus" veil.
+    velocity.x += (fire_avg - 0.45) * 0.03 * dt;
+
+    imageStore(smokeVelTex, coord, vec4(velocity, 0.0, 0.0));
+    imageStore(smokeDenTex, coord, vec4(density, 0.0, 0.0, 0.0));
+}

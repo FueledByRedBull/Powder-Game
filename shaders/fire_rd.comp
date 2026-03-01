@@ -1,0 +1,71 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform readonly image2D fireSrc;
+layout(r16f, binding = 1) uniform readonly image2D heatTex;
+layout(rg16f, binding = 2) uniform writeonly image2D fireDst;
+
+uniform ivec2 gridSize;
+uniform ivec2 heatSize;
+uniform float dt;
+uniform float diffusionU;
+uniform float diffusionV;
+uniform float feed;
+uniform float kill;
+
+ivec2 clampGrid(ivec2 coord) {
+    return clamp(coord, ivec2(0), gridSize - ivec2(1));
+}
+
+vec2 fireAt(ivec2 coord) {
+    return imageLoad(fireSrc, clampGrid(coord)).xy;
+}
+
+float localHeat(ivec2 coord) {
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(gridSize);
+    ivec2 heat_coord = clamp(ivec2(uv * vec2(heatSize)), ivec2(0), heatSize - ivec2(1));
+    return imageLoad(heatTex, heat_coord).x;
+}
+
+vec2 laplacian(ivec2 coord) {
+    vec2 c = fireAt(coord);
+
+    vec2 n = fireAt(coord + ivec2(0, 1));
+    vec2 s = fireAt(coord + ivec2(0, -1));
+    vec2 e = fireAt(coord + ivec2(1, 0));
+    vec2 w = fireAt(coord + ivec2(-1, 0));
+
+    vec2 ne = fireAt(coord + ivec2(1, 1));
+    vec2 nw = fireAt(coord + ivec2(-1, 1));
+    vec2 se = fireAt(coord + ivec2(1, -1));
+    vec2 sw = fireAt(coord + ivec2(-1, -1));
+
+    return (n + s + e + w) * 0.2 + (ne + nw + se + sw) * 0.05 - c;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+
+    vec2 state = fireAt(coord);
+    float u = state.x;
+    float v = state.y;
+
+    vec2 lap = laplacian(coord);
+    float heat = localHeat(coord);
+
+    float local_feed = feed + heat * 0.015;
+    float local_kill = max(0.005, kill - heat * 0.012);
+
+    float reaction = u * v * v;
+    float du = diffusionU * lap.x - reaction + local_feed * (1.0 - u);
+    float dv = diffusionV * lap.y + reaction - (local_kill + local_feed) * v;
+
+    u = clamp(u + du * dt, 0.0, 1.0);
+    v = clamp(v + dv * dt + heat * 0.03 * dt, 0.0, 1.0);
+
+    imageStore(fireDst, coord, vec4(u, v, 0.0, 0.0));
+}

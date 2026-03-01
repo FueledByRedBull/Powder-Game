@@ -1,0 +1,52 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D heatSrc;
+layout(rg16f, binding = 1) uniform readonly image2D fireTex;
+layout(r16f, binding = 2) uniform writeonly image2D heatDst;
+
+uniform ivec2 heatSize;
+uniform ivec2 gridSize;
+uniform float dt;
+uniform float diffusion;
+uniform float decay;
+uniform float fireToHeat;
+
+ivec2 clampHeat(ivec2 coord) {
+    return clamp(coord, ivec2(0), heatSize - ivec2(1));
+}
+
+float heatAt(ivec2 coord) {
+    return imageLoad(heatSrc, clampHeat(coord)).x;
+}
+
+float fireSample(ivec2 full_coord) {
+    ivec2 clamped = clamp(full_coord, ivec2(0), gridSize - ivec2(1));
+    return imageLoad(fireTex, clamped).y;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= heatSize.x || coord.y >= heatSize.y) {
+        return;
+    }
+
+    float center = heatAt(coord);
+    float left = heatAt(coord + ivec2(-1, 0));
+    float right = heatAt(coord + ivec2(1, 0));
+    float down = heatAt(coord + ivec2(0, -1));
+    float up = heatAt(coord + ivec2(0, 1));
+
+    float lap = left + right + down + up - 4.0 * center;
+
+    ivec2 full = coord * 2;
+    float fire_avg = 0.25 *
+                     (fireSample(full) + fireSample(full + ivec2(1, 0)) + fireSample(full + ivec2(0, 1)) +
+                      fireSample(full + ivec2(1, 1)));
+
+    float source = fire_avg * fireToHeat;
+    float next_heat = clamp(center + (diffusion * lap + source - decay * center) * dt, 0.0, 1.0);
+
+    imageStore(heatDst, coord, vec4(next_heat, 0.0, 0.0, 0.0));
+}

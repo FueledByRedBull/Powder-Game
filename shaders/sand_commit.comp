@@ -1,0 +1,98 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16ui, binding = 0) uniform readonly uimage2D materialSrc;
+layout(rg16f, binding = 1) uniform readonly image2D velocitySrc;
+layout(r16f, binding = 2) uniform readonly image2D stressSrc;
+
+layout(r16ui, binding = 3) uniform uimage2D materialDst;
+layout(rg16f, binding = 4) uniform image2D velocityDst;
+layout(r16f, binding = 5) uniform image2D stressDst;
+
+layout(std430, binding = 0) buffer DesiredTarget {
+    int desired[];
+};
+
+layout(std430, binding = 1) buffer ProposedVelocity {
+    vec2 proposed[];
+};
+
+layout(std430, binding = 2) buffer WinnerBuffer {
+    uint winner[];
+};
+
+uniform ivec2 gridSize;
+const uint kIndexMask = (1u << 20u) - 1u;
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+int linearIndex(ivec2 coord) {
+    return coord.y * gridSize.x + coord.x;
+}
+
+ivec2 unflatten(int index) {
+    int y = index / gridSize.x;
+    int x = index - y * gridSize.x;
+    return ivec2(x, y);
+}
+
+bool occupiedOrBoundary(ivec2 coord) {
+    if (!inBounds(coord)) {
+        return true;
+    }
+    return imageLoad(materialSrc, coord).r != 0u;
+}
+
+float slopeStress(ivec2 coord, float previous) {
+    bool below = occupiedOrBoundary(coord + ivec2(0, -1));
+    bool below_left = occupiedOrBoundary(coord + ivec2(-1, -1));
+    bool below_right = occupiedOrBoundary(coord + ivec2(1, -1));
+
+    float support = (below ? 0.55 : 0.0) + (below_left ? 0.225 : 0.0) + (below_right ? 0.225 : 0.0);
+    float target = clamp(1.0 - support, 0.0, 1.0);
+    return clamp(mix(previous, target, 0.35), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    if (imageLoad(materialSrc, coord).r != 1u) {
+        return;
+    }
+
+    int index = linearIndex(coord);
+    int destination = desired[index];
+    if (destination < 0 || destination >= gridSize.x * gridSize.y) {
+        return;
+    }
+
+    int winner_index = int(winner[destination] & kIndexMask);
+    if (winner_index != index) {
+        vec2 held = imageLoad(velocitySrc, coord).xy;
+        held.x *= 0.85;
+        held.y = max(held.y, -8.0);
+        imageStore(velocityDst, coord, vec4(held, 0.0, 0.0));
+        imageStore(stressDst, coord, vec4(slopeStress(coord, imageLoad(stressSrc, coord).x), 0.0, 0.0, 0.0));
+        return;
+    }
+
+    ivec2 target = unflatten(destination);
+    vec2 target_velocity = proposed[index];
+    float source_stress = imageLoad(stressSrc, coord).x;
+
+    if (target != coord) {
+        imageStore(materialDst, coord, uvec4(0u));
+        imageStore(velocityDst, coord, vec4(0.0));
+        imageStore(stressDst, coord, vec4(0.0));
+    }
+
+    imageStore(materialDst, target, uvec4(1u, 0u, 0u, 0u));
+    imageStore(velocityDst, target, vec4(target_velocity, 0.0, 0.0));
+    imageStore(stressDst, target, vec4(slopeStress(target, source_stress), 0.0, 0.0, 0.0));
+}

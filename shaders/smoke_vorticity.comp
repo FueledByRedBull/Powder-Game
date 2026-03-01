@@ -1,0 +1,55 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform readonly image2D smokeVelSrc;
+layout(r16f, binding = 1) uniform readonly image2D smokeDenSrc;
+layout(rg16f, binding = 2) uniform writeonly image2D smokeVelDst;
+layout(r16f, binding = 3) uniform writeonly image2D smokeDenDst;
+
+uniform ivec2 smokeSize;
+uniform float dt;
+uniform float epsilon;
+
+ivec2 clampSmoke(ivec2 coord) {
+    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
+}
+
+vec2 vel(ivec2 coord) {
+    return imageLoad(smokeVelSrc, clampSmoke(coord)).xy;
+}
+
+float curlAt(ivec2 coord) {
+    vec2 left = vel(coord + ivec2(-1, 0));
+    vec2 right = vel(coord + ivec2(1, 0));
+    vec2 down = vel(coord + ivec2(0, -1));
+    vec2 up = vel(coord + ivec2(0, 1));
+
+    float dv_dx = (right.y - left.y) * 0.5;
+    float du_dy = (up.x - down.x) * 0.5;
+    return dv_dx - du_dy;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+
+    float w = curlAt(coord);
+    float wL = abs(curlAt(coord + ivec2(-1, 0)));
+    float wR = abs(curlAt(coord + ivec2(1, 0)));
+    float wB = abs(curlAt(coord + ivec2(0, -1)));
+    float wT = abs(curlAt(coord + ivec2(0, 1)));
+
+    vec2 gradient = vec2(wR - wL, wT - wB);
+    float grad_len = length(gradient);
+    vec2 n = (grad_len > 1e-5) ? gradient / grad_len : vec2(0.0);
+    vec2 force = epsilon * vec2(n.y, -n.x) * w;
+
+    vec2 next_velocity = vel(coord) + force * dt;
+    float density = imageLoad(smokeDenSrc, coord).x;
+
+    imageStore(smokeVelDst, coord, vec4(next_velocity, 0.0, 0.0));
+    imageStore(smokeDenDst, coord, vec4(density, 0.0, 0.0, 0.0));
+}

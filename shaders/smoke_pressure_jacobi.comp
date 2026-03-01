@@ -1,0 +1,33 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D divergenceTex;
+layout(r16f, binding = 1) uniform readonly image2D pressureSrc;
+layout(r16f, binding = 2) uniform writeonly image2D pressureDst;
+
+uniform ivec2 smokeSize;
+
+ivec2 clampSmoke(ivec2 coord) {
+    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
+}
+
+float pressure(ivec2 coord) {
+    return imageLoad(pressureSrc, clampSmoke(coord)).x;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+
+    float pL = pressure(coord + ivec2(-1, 0));
+    float pR = pressure(coord + ivec2(1, 0));
+    float pB = pressure(coord + ivec2(0, -1));
+    float pT = pressure(coord + ivec2(0, 1));
+
+    float divergence = imageLoad(divergenceTex, coord).x;
+    float next_pressure = (pL + pR + pB + pT - divergence) * 0.25;
+    imageStore(pressureDst, coord, vec4(next_pressure, 0.0, 0.0, 0.0));
+}

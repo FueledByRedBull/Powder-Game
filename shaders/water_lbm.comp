@@ -1,0 +1,176 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
+
+layout(rgba16f, binding = 1) uniform readonly image2D lbmSrc0;
+layout(rgba16f, binding = 2) uniform readonly image2D lbmSrc1;
+layout(rg16f, binding = 3) uniform readonly image2D lbmSrc2;
+
+layout(rgba16f, binding = 4) uniform writeonly image2D lbmDst0;
+layout(rgba16f, binding = 5) uniform writeonly image2D lbmDst1;
+layout(rg16f, binding = 6) uniform writeonly image2D lbmDst2;
+
+uniform ivec2 gridSize;
+uniform float omega;
+uniform float restMix;
+uniform float maxVelocity;
+
+const ivec2 kDirs[9] = ivec2[9](
+    ivec2(0, 0),
+    ivec2(1, 0),
+    ivec2(0, 1),
+    ivec2(-1, 0),
+    ivec2(0, -1),
+    ivec2(1, 1),
+    ivec2(-1, 1),
+    ivec2(-1, -1),
+    ivec2(1, -1)
+);
+
+const float kWeights[9] = float[9](
+    4.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 9.0,
+    1.0 / 36.0,
+    1.0 / 36.0,
+    1.0 / 36.0,
+    1.0 / 36.0
+);
+
+const int kOpposite[9] = int[9](0, 3, 4, 1, 2, 7, 8, 5, 6);
+
+struct Dist {
+    float f[9];
+};
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool isSolid(ivec2 coord) {
+    if (!inBounds(coord)) {
+        return true;
+    }
+    return imageLoad(materialTex, coord).r != 0u;
+}
+
+Dist restState(float rho) {
+    Dist d;
+    for (int i = 0; i < 9; ++i) {
+        d.f[i] = kWeights[i] * rho;
+    }
+    return d;
+}
+
+float density(Dist d) {
+    return d.f[0] + d.f[1] + d.f[2] + d.f[3] + d.f[4] + d.f[5] + d.f[6] + d.f[7] + d.f[8];
+}
+
+Dist sanitizeDist(Dist d) {
+    for (int i = 0; i < 9; ++i) {
+        float fi = d.f[i];
+        if (isnan(fi) || isinf(fi) || fi < 0.0) {
+            d.f[i] = 0.0;
+        }
+    }
+
+    float rho = density(d);
+    if (isnan(rho) || isinf(rho) || rho < 1e-4) {
+        return restState(1.0);
+    }
+    return d;
+}
+
+Dist loadDist(ivec2 coord) {
+    vec4 a0 = imageLoad(lbmSrc0, coord);
+    vec4 a1 = imageLoad(lbmSrc1, coord);
+    vec4 a2 = imageLoad(lbmSrc2, coord);
+
+    Dist d;
+    d.f[0] = a0.x;
+    d.f[1] = a0.y;
+    d.f[2] = a0.z;
+    d.f[3] = a0.w;
+    d.f[4] = a1.x;
+    d.f[5] = a1.y;
+    d.f[6] = a1.z;
+    d.f[7] = a1.w;
+    d.f[8] = a2.x;
+    return sanitizeDist(d);
+}
+
+void storeDist(ivec2 coord, Dist d) {
+    imageStore(lbmDst0, coord, vec4(d.f[0], d.f[1], d.f[2], d.f[3]));
+    imageStore(lbmDst1, coord, vec4(d.f[4], d.f[5], d.f[6], d.f[7]));
+    imageStore(lbmDst2, coord, vec4(d.f[8], 0.0, 0.0, 0.0));
+}
+
+vec2 velocity(Dist d, float rho) {
+    float inv_rho = 1.0 / max(rho, 1e-5);
+    float ux = (d.f[1] + d.f[5] + d.f[8]) - (d.f[3] + d.f[6] + d.f[7]);
+    float uy = (d.f[2] + d.f[5] + d.f[6]) - (d.f[4] + d.f[7] + d.f[8]);
+    vec2 u = vec2(ux, uy) * inv_rho;
+
+    float speed = length(u);
+    if (speed > maxVelocity && speed > 0.0) {
+        u *= maxVelocity / speed;
+    }
+    return u;
+}
+
+float equilibrium(int i, float rho, vec2 u) {
+    vec2 dir = vec2(kDirs[i]);
+    float cu = dot(dir, u);
+    float uu = dot(u, u);
+    return kWeights[i] * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu);
+}
+
+float postCollision(ivec2 source, int i) {
+    Dist d = loadDist(source);
+    float rho = clamp(density(d), 0.6, 1.6);
+    vec2 u = velocity(d, rho);
+
+    float fi = d.f[i];
+    float feq = max(equilibrium(i, rho, u), 0.0);
+    float out_f = fi + omega * (feq - fi);
+    return max(out_f, 0.0);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    if (isSolid(coord)) {
+        storeDist(coord, restState(1.0));
+        return;
+    }
+
+    Dist current = loadDist(coord);
+    Dist next;
+
+    for (int i = 0; i < 9; ++i) {
+        ivec2 source = coord - kDirs[i];
+        if (isSolid(source)) {
+            next.f[i] = current.f[kOpposite[i]];
+        } else {
+            next.f[i] = postCollision(source, i);
+        }
+    }
+
+    float rho_next = density(next);
+    if (isnan(rho_next) || isinf(rho_next) || rho_next < 0.2 || rho_next > 2.4) {
+        next = restState(1.0);
+    }
+
+    for (int i = 0; i < 9; ++i) {
+        next.f[i] = mix(next.f[i], kWeights[i], restMix);
+    }
+
+    storeDist(coord, next);
+}

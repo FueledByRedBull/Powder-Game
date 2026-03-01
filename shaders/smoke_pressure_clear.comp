@@ -1,0 +1,16 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform writeonly image2D pressureTex;
+
+uniform ivec2 smokeSize;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+
+    imageStore(pressureTex, coord, vec4(0.0));
+}

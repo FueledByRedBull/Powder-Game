@@ -1,0 +1,132 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16ui, binding = 0) uniform uimage2D materialTex;
+layout(rg16f, binding = 1) uniform image2D velocityTex;
+layout(r16f, binding = 2) uniform image2D stressTex;
+layout(rgba16f, binding = 3) uniform image2D lbm0Tex;
+layout(rgba16f, binding = 4) uniform image2D lbm1Tex;
+layout(rg16f, binding = 5) uniform image2D lbm2Tex;
+layout(rg16f, binding = 6) uniform image2D fireTex;
+layout(r16f, binding = 7) uniform image2D heatTex;
+layout(rg16f, binding = 8) uniform image2D smokeVelTex;
+layout(r16f, binding = 9) uniform image2D smokeDenTex;
+
+uniform ivec2 gridSize;
+uniform ivec2 heatSize;
+uniform ivec2 smokeSize;
+uniform ivec2 brushCenter;
+uniform int brushRadius;
+uniform int materialMode;
+uniform int spawnWater;
+uniform float waterDensityBoost;
+uniform vec2 waterVelocity;
+uniform int spawnSmoke;
+uniform float smokeDensity;
+uniform vec2 smokeVelocity;
+uniform int spawnFire;
+uniform vec2 fireSeed;
+uniform float heatAdd;
+uniform int clearEffects;
+
+float equilibrium(float weight, float rho, vec2 velocity, vec2 dir) {
+    float cu = dot(dir, velocity);
+    float uu = dot(velocity, velocity);
+    return weight * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu);
+}
+
+void writeWater(ivec2 coord, float rho, vec2 velocity) {
+    float f0 = equilibrium(4.0 / 9.0, rho, velocity, vec2(0.0, 0.0));
+    float f1 = equilibrium(1.0 / 9.0, rho, velocity, vec2(1.0, 0.0));
+    float f2 = equilibrium(1.0 / 9.0, rho, velocity, vec2(0.0, 1.0));
+    float f3 = equilibrium(1.0 / 9.0, rho, velocity, vec2(-1.0, 0.0));
+    float f4 = equilibrium(1.0 / 9.0, rho, velocity, vec2(0.0, -1.0));
+    float f5 = equilibrium(1.0 / 36.0, rho, velocity, vec2(1.0, 1.0));
+    float f6 = equilibrium(1.0 / 36.0, rho, velocity, vec2(-1.0, 1.0));
+    float f7 = equilibrium(1.0 / 36.0, rho, velocity, vec2(-1.0, -1.0));
+    float f8 = equilibrium(1.0 / 36.0, rho, velocity, vec2(1.0, -1.0));
+
+    imageStore(lbm0Tex, coord, vec4(f0, f1, f2, f3));
+    imageStore(lbm1Tex, coord, vec4(f4, f5, f6, f7));
+    imageStore(lbm2Tex, coord, vec4(f8, 0.0, 0.0, 0.0));
+}
+
+ivec2 toHeatCoord(ivec2 coord) {
+    vec2 uv = (vec2(coord) + 0.5) / vec2(gridSize);
+    ivec2 mapped = ivec2(uv * vec2(heatSize));
+    return clamp(mapped, ivec2(0), heatSize - ivec2(1));
+}
+
+ivec2 toSmokeCoord(ivec2 coord) {
+    vec2 uv = (vec2(coord) + 0.5) / vec2(gridSize);
+    ivec2 mapped = ivec2(uv * vec2(smokeSize));
+    return clamp(mapped, ivec2(0), smokeSize - ivec2(1));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+
+    ivec2 d = coord - brushCenter;
+    int radius_sq = brushRadius * brushRadius;
+    if (dot(d, d) > radius_sq) {
+        return;
+    }
+
+    if (materialMode >= 0) {
+        uint current_material = imageLoad(materialTex, coord).r;
+        bool allow_write = !(materialMode == 1 && current_material == 2u);
+
+        if (allow_write) {
+            imageStore(materialTex, coord, uvec4(uint(materialMode), 0u, 0u, 0u));
+            if (materialMode == 0) {
+                imageStore(velocityTex, coord, vec4(0.0));
+                imageStore(stressTex, coord, vec4(0.0));
+            } else if (materialMode == 1) {
+                imageStore(velocityTex, coord, vec4(0.0));
+                imageStore(stressTex, coord, vec4(0.05, 0.0, 0.0, 0.0));
+                writeWater(coord, 1.0, vec2(0.0));
+            } else if (materialMode == 2) {
+                imageStore(velocityTex, coord, vec4(0.0));
+                imageStore(stressTex, coord, vec4(1.0, 0.0, 0.0, 0.0));
+                writeWater(coord, 1.0, vec2(0.0));
+            }
+        }
+    }
+
+    if (spawnWater == 1) {
+        float rho = max(0.2, 1.0 + waterDensityBoost);
+        writeWater(coord, rho, waterVelocity);
+    }
+
+    if (spawnFire == 1) {
+        vec2 current_fire = imageLoad(fireTex, coord).xy;
+        current_fire = max(current_fire, fireSeed);
+        imageStore(fireTex, coord, vec4(current_fire, 0.0, 0.0));
+
+        ivec2 heat_coord = toHeatCoord(coord);
+        float current_heat = imageLoad(heatTex, heat_coord).x;
+        imageStore(heatTex, heat_coord, vec4(max(current_heat, heatAdd), 0.0, 0.0, 0.0));
+    }
+
+    if (spawnSmoke == 1) {
+        ivec2 smoke_coord = toSmokeCoord(coord);
+        float current_density = imageLoad(smokeDenTex, smoke_coord).x;
+        imageStore(smokeDenTex, smoke_coord, vec4(max(current_density, smokeDensity), 0.0, 0.0, 0.0));
+        imageStore(smokeVelTex, smoke_coord, vec4(smokeVelocity, 0.0, 0.0));
+    }
+
+    if (clearEffects == 1) {
+        imageStore(fireTex, coord, vec4(1.0, 0.0, 0.0, 0.0));
+
+        ivec2 heat_coord = toHeatCoord(coord);
+        imageStore(heatTex, heat_coord, vec4(0.0));
+
+        ivec2 smoke_coord = toSmokeCoord(coord);
+        imageStore(smokeVelTex, smoke_coord, vec4(0.0));
+        imageStore(smokeDenTex, smoke_coord, vec4(0.0));
+    }
+}

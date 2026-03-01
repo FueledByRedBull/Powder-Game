@@ -1,0 +1,48 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform readonly image2D smokeVelSrc;
+layout(r16f, binding = 1) uniform readonly image2D smokeDenSrc;
+layout(r16f, binding = 2) uniform readonly image2D pressureTex;
+
+layout(rg16f, binding = 3) uniform writeonly image2D smokeVelDst;
+layout(r16f, binding = 4) uniform writeonly image2D smokeDenDst;
+
+uniform ivec2 smokeSize;
+
+ivec2 clampSmoke(ivec2 coord) {
+    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
+}
+
+float pressure(ivec2 coord) {
+    return imageLoad(pressureTex, clampSmoke(coord)).x;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return;
+    }
+
+    vec2 velocity = imageLoad(smokeVelSrc, coord).xy;
+
+    float pL = pressure(coord + ivec2(-1, 0));
+    float pR = pressure(coord + ivec2(1, 0));
+    float pB = pressure(coord + ivec2(0, -1));
+    float pT = pressure(coord + ivec2(0, 1));
+
+    vec2 gradient = vec2(pR - pL, pT - pB) * 0.5;
+    vec2 projected_velocity = velocity - gradient;
+
+    if (coord.x == 0 || coord.x == smokeSize.x - 1) {
+        projected_velocity.x = 0.0;
+    }
+    if (coord.y == 0 || coord.y == smokeSize.y - 1) {
+        projected_velocity.y = 0.0;
+    }
+
+    float density = imageLoad(smokeDenSrc, coord).x;
+    imageStore(smokeVelDst, coord, vec4(projected_velocity, 0.0, 0.0));
+    imageStore(smokeDenDst, coord, vec4(density, 0.0, 0.0, 0.0));
+}
