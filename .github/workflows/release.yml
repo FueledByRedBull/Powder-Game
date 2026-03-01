@@ -38,27 +38,28 @@ jobs:
           Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
           Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
 
-          @"
-Powder Game (Windows 11 x64)
-
-Run:
-- Double-click powder_game.exe
-
-Controls:
-- 1: Sand brush
-- 2: Water brush
-- 3: Solid brush
-- 4: Erase brush
-- 5: Smoke brush
-- 6: Fire brush
-- [ / ]: Decrease / increase brush radius
-- Left mouse: paint
-- Esc: quit
-
-Notes:
-- Keep the shaders/ folder next to powder_game.exe.
-- Requires a GPU/driver with OpenGL 4.3+ support.
-"@ | Set-Content -Path (Join-Path $outDir "README.txt")
+          $readme = @(
+            "Powder Game (Windows 11 x64)",
+            "",
+            "Run:",
+            "- Double-click powder_game.exe",
+            "",
+            "Controls:",
+            "- 1: Sand brush",
+            "- 2: Water brush",
+            "- 3: Solid brush",
+            "- 4: Erase brush",
+            "- 5: Smoke brush",
+            "- 6: Fire brush",
+            "- [ / ]: Decrease / increase brush radius",
+            "- Left mouse: paint",
+            "- Esc: quit",
+            "",
+            "Notes:",
+            "- Keep the shaders/ folder next to powder_game.exe.",
+            "- Requires a GPU/driver with OpenGL 4.3+ support."
+          )
+          $readme | Set-Content -Path (Join-Path $outDir "README.txt")
 
           New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
           Compress-Archive -Path "$outDir/*" -DestinationPath "dist/win11/PowderGame-win11-x64.zip" -Force
