@@ -1,0 +1,36 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D srcTileActiveTex;
+layout(r8ui, binding = 1) uniform writeonly uimage2D dstTileActiveTex;
+
+uniform ivec2 srcTileSize;
+uniform ivec2 dstTileSize;
+uniform int scale;
+
+bool inBounds(ivec2 coord, ivec2 size) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < size.x && coord.y < size.y;
+}
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(dst, dstTileSize)) {
+        return;
+    }
+
+    ivec2 src_min = dst * scale;
+    ivec2 src_max = min(src_min + ivec2(scale), srcTileSize);
+
+    uint is_active = 0u;
+    for (int y = src_min.y; y < src_max.y && is_active == 0u; ++y) {
+        for (int x = src_min.x; x < src_max.x; ++x) {
+            if (imageLoad(srcTileActiveTex, ivec2(x, y)).r != 0u) {
+                is_active = 1u;
+                break;
+            }
+        }
+    }
+
+    imageStore(dstTileActiveTex, dst, uvec4(is_active, 0u, 0u, 0u));
+}

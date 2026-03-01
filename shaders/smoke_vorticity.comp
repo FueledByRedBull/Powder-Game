@@ -8,6 +8,14 @@ layout(rg16f, binding = 2) uniform writeonly image2D smokeVelDst;
 layout(r8, binding = 3) uniform writeonly image2D smokeDenDst;
 layout(r8ui, binding = 4) uniform readonly uimage2D tileActiveTex;
 
+layout(std430, binding = 12) readonly buffer ActiveTileList {
+    uint activeTiles[];
+};
+
+layout(std430, binding = 13) readonly buffer ActiveTileCounter {
+    uint activeTileCount;
+};
+
 uniform ivec2 smokeSize;
 uniform ivec2 tileSize;
 uniform float dt;
@@ -38,9 +46,23 @@ bool tileActive(ivec2 coord) {
     return imageLoad(tileActiveTex, tile).r != 0u;
 }
 
-void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+ivec2 dispatchCoord() {
+    uint group = gl_WorkGroupID.x;
+    if (group >= activeTileCount) {
+        return ivec2(-1);
+    }
+    uint packed_tile = activeTiles[group];
+    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
+    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
     if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return ivec2(-1);
+    }
+    return coord;
+}
+
+void main() {
+    ivec2 coord = dispatchCoord();
+    if (coord.x < 0) {
         return;
     }
     if (!tileActive(coord)) {

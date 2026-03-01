@@ -29,6 +29,10 @@ private:
     static constexpr int kSmokeHeight = kGridHeight / 4;
     static constexpr int kTileWidth = (kGridWidth + kWorkgroupSize - 1) / kWorkgroupSize;
     static constexpr int kTileHeight = (kGridHeight + kWorkgroupSize - 1) / kWorkgroupSize;
+    static constexpr int kHeatTileWidth = (kHeatWidth + kWorkgroupSize - 1) / kWorkgroupSize;
+    static constexpr int kHeatTileHeight = (kHeatHeight + kWorkgroupSize - 1) / kWorkgroupSize;
+    static constexpr int kSmokeTileWidth = (kSmokeWidth + kWorkgroupSize - 1) / kWorkgroupSize;
+    static constexpr int kSmokeTileHeight = (kSmokeHeight + kWorkgroupSize - 1) / kWorkgroupSize;
 
     GLFWwindow* window_ = nullptr;
     bool gl_ready_ = false;
@@ -78,6 +82,20 @@ private:
 
     GLuint tile_active_a_ = 0;
     GLuint tile_active_b_ = 0;
+    GLuint tile_active_heat_a_ = 0;
+    GLuint tile_active_heat_b_ = 0;
+    GLuint tile_active_smoke_a_ = 0;
+    GLuint tile_active_smoke_b_ = 0;
+
+    GLuint tile_list_full_ = 0;
+    GLuint tile_count_full_ = 0;
+    GLuint tile_dispatch_full_ = 0;
+    GLuint tile_list_heat_ = 0;
+    GLuint tile_count_heat_ = 0;
+    GLuint tile_dispatch_heat_ = 0;
+    GLuint tile_list_smoke_ = 0;
+    GLuint tile_count_smoke_ = 0;
+    GLuint tile_dispatch_smoke_ = 0;
 
     GLuint desired_buffer_ = 0;
     GLuint proposed_velocity_buffer_ = 0;
@@ -105,6 +123,9 @@ private:
     GLuint coupling_sand_drag_program_ = 0;
     GLuint tile_build_program_ = 0;
     GLuint tile_dilate_program_ = 0;
+    GLuint tile_downsample_program_ = 0;
+    GLuint tile_compact_program_ = 0;
+    GLuint tile_dispatch_program_ = 0;
     GLuint render_program_ = 0;
 
     GLuint fullscreen_vao_ = 0;
@@ -166,6 +187,8 @@ private:
     GLuint NextHeat() const;
 
     static void DispatchGrid(int width, int height);
+    static void DispatchIndirect(GLuint dispatch_buffer);
+    static void BindActiveTileBuffers(GLuint tile_list_buffer, GLuint tile_count_buffer);
     static int CellCount();
 
     GLuint CreateTexture(int width,

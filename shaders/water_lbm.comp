@@ -13,6 +13,14 @@ layout(rgba16f, binding = 5) uniform writeonly image2D lbmDst1;
 layout(rg16f, binding = 6) uniform writeonly image2D lbmDst2;
 layout(r8ui, binding = 7) uniform readonly uimage2D tileActiveTex;
 
+layout(std430, binding = 12) readonly buffer ActiveTileList {
+    uint activeTiles[];
+};
+
+layout(std430, binding = 13) readonly buffer ActiveTileCounter {
+    uint activeTileCount;
+};
+
 uniform ivec2 gridSize;
 uniform ivec2 tileSize;
 uniform float omega;
@@ -49,20 +57,33 @@ struct Dist {
     float f[9];
 };
 
+shared uint sSolid[18][18];
+shared float sF0[18][18];
+shared float sF1[18][18];
+shared float sF2[18][18];
+shared float sF3[18][18];
+shared float sF4[18][18];
+shared float sF5[18][18];
+shared float sF6[18][18];
+shared float sF7[18][18];
+shared float sF8[18][18];
+
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+ivec2 dispatchTile() {
+    uint group = gl_WorkGroupID.x;
+    if (group >= activeTileCount) {
+        return ivec2(-1);
+    }
+    uint packed_tile = activeTiles[group];
+    return ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
 }
 
 bool tileActive(ivec2 coord) {
     ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
     return imageLoad(tileActiveTex, tile).r != 0u;
-}
-
-bool isSolid(ivec2 coord) {
-    if (!inBounds(coord)) {
-        return true;
-    }
-    return imageLoad(materialTex, coord).r != 0u;
 }
 
 Dist restState(float rho) {
@@ -92,7 +113,7 @@ Dist sanitizeDist(Dist d) {
     return d;
 }
 
-Dist loadDist(ivec2 coord) {
+Dist loadDistGlobal(ivec2 coord) {
     vec4 a0 = imageLoad(lbmSrc0, coord);
     vec4 a1 = imageLoad(lbmSrc1, coord);
     vec4 a2 = imageLoad(lbmSrc2, coord);
@@ -108,6 +129,20 @@ Dist loadDist(ivec2 coord) {
     d.f[7] = a1.w;
     d.f[8] = a2.x;
     return sanitizeDist(d);
+}
+
+Dist loadDistShared(ivec2 shared_coord) {
+    Dist d;
+    d.f[0] = sF0[shared_coord.y][shared_coord.x];
+    d.f[1] = sF1[shared_coord.y][shared_coord.x];
+    d.f[2] = sF2[shared_coord.y][shared_coord.x];
+    d.f[3] = sF3[shared_coord.y][shared_coord.x];
+    d.f[4] = sF4[shared_coord.y][shared_coord.x];
+    d.f[5] = sF5[shared_coord.y][shared_coord.x];
+    d.f[6] = sF6[shared_coord.y][shared_coord.x];
+    d.f[7] = sF7[shared_coord.y][shared_coord.x];
+    d.f[8] = sF8[shared_coord.y][shared_coord.x];
+    return d;
 }
 
 void storeDist(ivec2 coord, Dist d) {
@@ -136,41 +171,77 @@ float equilibrium(int i, float rho, vec2 u) {
     return kWeights[i] * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu);
 }
 
-float postCollision(ivec2 source, int i) {
-    Dist d = loadDist(source);
-    float rho = clamp(density(d), 0.6, 1.6);
-    vec2 u = velocity(d, rho);
+float postCollision(Dist source_d, int i) {
+    float rho = clamp(density(source_d), 0.6, 1.6);
+    vec2 u = velocity(source_d, rho);
 
-    float fi = d.f[i];
+    float fi = source_d.f[i];
     float feq = max(equilibrium(i, rho, u), 0.0);
     float out_f = fi + omega * (feq - fi);
     return max(out_f, 0.0);
 }
 
+void stageSharedTile(ivec2 group_base) {
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    for (int y = local.y; y < 18; y += 16) {
+        for (int x = local.x; x < 18; x += 16) {
+            ivec2 coord = group_base + ivec2(x - 1, y - 1);
+            Dist d = restState(1.0);
+            bool solid = true;
+            if (inBounds(coord)) {
+                solid = imageLoad(materialTex, coord).r != 0u;
+                d = loadDistGlobal(coord);
+            }
+
+            sSolid[y][x] = solid ? 1u : 0u;
+            sF0[y][x] = d.f[0];
+            sF1[y][x] = d.f[1];
+            sF2[y][x] = d.f[2];
+            sF3[y][x] = d.f[3];
+            sF4[y][x] = d.f[4];
+            sF5[y][x] = d.f[5];
+            sF6[y][x] = d.f[6];
+            sF7[y][x] = d.f[7];
+            sF8[y][x] = d.f[8];
+        }
+    }
+}
+
 void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tile = dispatchTile();
+    if (tile.x < 0) {
+        return;
+    }
+
+    ivec2 group_base = tile * 16;
+    ivec2 coord = group_base + ivec2(gl_LocalInvocationID.xy);
+
+    stageSharedTile(group_base);
+    barrier();
+
     if (!inBounds(coord)) {
         return;
     }
     if (!tileActive(coord)) {
-        storeDist(coord, loadDist(coord));
+        storeDist(coord, loadDistGlobal(coord));
         return;
     }
 
-    if (isSolid(coord)) {
+    ivec2 local = ivec2(gl_LocalInvocationID.xy) + ivec2(1);
+    if (sSolid[local.y][local.x] != 0u) {
         storeDist(coord, restState(1.0));
         return;
     }
 
-    Dist current = loadDist(coord);
+    Dist current = loadDistShared(local);
     Dist next;
 
     for (int i = 0; i < 9; ++i) {
-        ivec2 source = coord - kDirs[i];
-        if (isSolid(source)) {
+        ivec2 source_local = local - kDirs[i];
+        if (sSolid[source_local.y][source_local.x] != 0u) {
             next.f[i] = current.f[kOpposite[i]];
         } else {
-            next.f[i] = postCollision(source, i);
+            next.f[i] = postCollision(loadDistShared(source_local), i);
         }
     }
 

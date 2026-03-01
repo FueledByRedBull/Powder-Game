@@ -7,8 +7,17 @@ layout(r16f, binding = 1) uniform readonly image2D pressureSrc;
 layout(r16f, binding = 2) uniform writeonly image2D pressureDst;
 layout(r8ui, binding = 3) uniform readonly uimage2D tileActiveTex;
 
+layout(std430, binding = 12) readonly buffer ActiveTileList {
+    uint activeTiles[];
+};
+
+layout(std430, binding = 13) readonly buffer ActiveTileCounter {
+    uint activeTileCount;
+};
+
 uniform ivec2 smokeSize;
 uniform ivec2 tileSize;
+uniform int passIndex;
 
 ivec2 clampSmoke(ivec2 coord) {
     return clamp(coord, ivec2(0), smokeSize - ivec2(1));
@@ -24,9 +33,29 @@ bool tileActive(ivec2 coord) {
     return imageLoad(tileActiveTex, tile).r != 0u;
 }
 
-void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+ivec2 dispatchCoord() {
+    uint group = gl_WorkGroupID.x;
+    if (group >= activeTileCount) {
+        return ivec2(-1);
+    }
+    uint packed_tile = activeTiles[group];
+    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
+    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
     if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
+        return ivec2(-1);
+    }
+    return coord;
+}
+
+void main() {
+    ivec2 coord = dispatchCoord();
+    if (coord.x < 0) {
+        return;
+    }
+
+    uint adaptive_iterations = clamp(4u + (activeTileCount / 10u), 4u, 20u);
+    if (uint(passIndex) >= adaptive_iterations) {
+        imageStore(pressureDst, coord, vec4(pressure(coord), 0.0, 0.0, 0.0));
         return;
     }
     if (!tileActive(coord)) {
