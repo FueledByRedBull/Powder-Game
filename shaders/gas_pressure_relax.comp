@@ -1,0 +1,68 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 1) uniform readonly image2D pressureSrc;
+layout(r32f, binding = 2) uniform writeonly image2D pressureDst;
+layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+
+uniform ivec2 gridSize;
+uniform int boundaryScale;
+
+// 0: fluid, 1: physical solid/outside, 2: omitted mixed correction footprint.
+int cellKind(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return 1;
+    }
+    ivec2 fineMin = coord * boundaryScale;
+    ivec2 fineMax = fineMin + ivec2(boundaryScale);
+    if (any(greaterThan(fineMax, imageSize(boundaryTex)))) {
+        return 1;
+    }
+    bool solid = false;
+    bool fluid = false;
+    for (int y = fineMin.y; y < fineMax.y; ++y) {
+        for (int x = fineMin.x; x < fineMax.x; ++x) {
+            bool occupied = imageLoad(boundaryTex, ivec2(x, y)).r != 0u;
+            solid = solid || occupied;
+            fluid = fluid || !occupied;
+        }
+    }
+    return solid ? (fluid ? 2 : 1) : 0;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+    if (cellKind(coord) != 0) {
+        imageStore(pressureDst, coord, vec4(0.0));
+        return;
+    }
+
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float pressure_sum = 0.0;
+    float diagonal = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 neighbor = coord + offsets[i];
+        int kind = cellKind(neighbor);
+        if (kind == 0) {
+            pressure_sum += imageLoad(pressureSrc, neighbor).x;
+        }
+        // A removed fluid footprint has zero correction, not a new Neumann wall.
+        if (kind != 1) {
+            diagonal += 1.0;
+        }
+    }
+    float rhs = imageLoad(rhsTex, coord).x;
+    float h = float(boundaryScale);
+    float pressure = 0.0;
+    if (diagonal > 0.0) {
+        float jacobi = (pressure_sum - rhs * h * h) / diagonal;
+        // Damping removes the two-cycle of pure Jacobi on closed fluid regions.
+        pressure = mix(imageLoad(pressureSrc, coord).x, jacobi, 2.0 / 3.0);
+    }
+    imageStore(pressureDst, coord, vec4(pressure, 0.0, 0.0, 0.0));
+}

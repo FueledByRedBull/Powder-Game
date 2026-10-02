@@ -1,0 +1,222 @@
+#version 430
+
+layout(local_size_x = 256) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) readonly buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+layout(std430, binding = 1) buffer UFaceWeights {
+    // ponytail: unit-mass capacity fits 32-bit weights; widen for heavier loads.
+    uint uWeights[];
+};
+
+layout(std430, binding = 2) buffer VFaceWeights {
+    uint vWeights[];
+};
+
+layout(std430, binding = 3) buffer UFaceVelocitySums {
+    ivec2 uVelocitySums[];
+};
+
+layout(std430, binding = 4) buffer VFaceVelocitySums {
+    ivec2 vVelocitySums[];
+};
+
+layout(std430, binding = 5) buffer WaterCellCounts {
+    uint cellCounts[];
+};
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform int maxParticles;
+uniform float velocityScale;
+uniform float weightScale;
+
+bool cellInBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool blockedCell(ivec2 coord) {
+    return !cellInBounds(coord) || imageLoad(boundaryTex, coord).r != 0u;
+}
+
+void quadraticWeights(float x, out vec3 w) {
+    float d0 = 1.5 - x;
+    float d1 = x - 1.0;
+    float d2 = x - 0.5;
+    w.x = 0.5 * d0 * d0;
+    w.y = 0.75 - d1 * d1;
+    w.z = 0.5 * d2 * d2;
+}
+
+bool invalidFloat(float value) {
+    return isnan(value) || isinf(value);
+}
+
+bool invalidVec2(vec2 value) {
+    return invalidFloat(value.x) || invalidFloat(value.y);
+}
+
+bool invalidMat2(mat2 value) {
+    return invalidVec2(value[0]) || invalidVec2(value[1]);
+}
+
+int uFaceIndex(ivec2 face) {
+    return face.y * (gridSize.x + 1) + face.x;
+}
+
+int vFaceIndex(ivec2 face) {
+    return face.y * gridSize.x + face.x;
+}
+
+int cellIndex(ivec2 cell) {
+    return cell.y * gridSize.x + cell.x;
+}
+
+// The low word wraps in GLSL; a signed wrap count keeps dense momentum exact.
+int signedCarry(int previous, int delta) {
+    if (delta > 0 && previous > 2147483647 - delta) return 1;
+    if (delta < 0 && previous < (-2147483647 - 1) - delta) return -1;
+    return 0;
+}
+
+void depositCell(ivec2 cell, float weight) {
+    if (weight <= 0.0 || blockedCell(cell)) {
+        return;
+    }
+
+    int index = cellIndex(cell);
+    uint count = uint(round(weight * weightScale));
+    if (atomicAdd(cellCounts[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+}
+
+void depositU(ivec2 face, float weight, float value) {
+    if (weight <= 0.0) {
+        return;
+    }
+    if (face.x < 0 || face.x > gridSize.x || face.y < 0 || face.y >= gridSize.y) {
+        return;
+    }
+    ivec2 leftCell = ivec2(face.x - 1, face.y);
+    ivec2 rightCell = ivec2(face.x, face.y);
+    if (face.x == 0 || face.x == gridSize.x || blockedCell(leftCell) || blockedCell(rightCell)) {
+        return;
+    }
+
+    int index = uFaceIndex(face);
+    uint count = uint(round(weight * weightScale));
+    if (atomicAdd(uWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    int delta = int(round(value * weight * velocityScale));
+    int carry = signedCarry(atomicAdd(uVelocitySums[index].x, delta), delta);
+    if (carry != 0) atomicAdd(uVelocitySums[index].y, carry);
+}
+
+void depositV(ivec2 face, float weight, float value) {
+    if (weight <= 0.0) {
+        return;
+    }
+    if (face.x < 0 || face.x >= gridSize.x || face.y < 0 || face.y > gridSize.y) {
+        return;
+    }
+    ivec2 downCell = ivec2(face.x, face.y - 1);
+    ivec2 upCell = ivec2(face.x, face.y);
+    if (face.y == 0 || face.y == gridSize.y || blockedCell(downCell) || blockedCell(upCell)) {
+        return;
+    }
+
+    int index = vFaceIndex(face);
+    uint count = uint(round(weight * weightScale));
+    if (atomicAdd(vWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    int delta = int(round(value * weight * velocityScale));
+    int carry = signedCarry(atomicAdd(vVelocitySums[index].x, delta), delta);
+    if (carry != 0) atomicAdd(vVelocitySums[index].y, carry);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+
+    WaterParticle particle = particles[index];
+    if (invalidFloat(particle.state1.x)) {
+        atomicAdd(nanInfDetected, 1u);
+        return;
+    }
+    if (particle.state1.x < 0.5) {
+        return;
+    }
+
+    vec2 position = particle.state0.xy;
+    vec2 velocity = particle.state0.zw;
+    float mass = particle.state1.y;
+    mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
+    if (invalidVec2(position) || invalidVec2(velocity) || invalidMat2(affine) || invalidFloat(mass) || mass <= 0.0 ||
+        any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, vec2(gridSize)))) {
+        atomicAdd(nanInfDetected, 1u);
+        return;
+    }
+    vec2 maxMomentum = (abs(velocity) + 1.5 * (abs(affine[0]) + abs(affine[1]))) * mass * velocityScale;
+    if (invalidVec2(maxMomentum) || any(greaterThan(maxMomentum, vec2(2147483520.0))) ||
+        mass * weightScale > 4294967040.0) {
+        atomicAdd(particleOverflowBlocked, 1u);
+        return;
+    }
+
+    vec2 cellSample = position - vec2(0.5);
+    ivec2 cellBase = ivec2(floor(cellSample));
+    vec2 cellFrac = fract(cellSample);
+    depositCell(cellBase, mass * (1.0 - cellFrac.x) * (1.0 - cellFrac.y));
+    depositCell(cellBase + ivec2(1, 0), mass * cellFrac.x * (1.0 - cellFrac.y));
+    depositCell(cellBase + ivec2(0, 1), mass * (1.0 - cellFrac.x) * cellFrac.y);
+    depositCell(cellBase + ivec2(1, 1), mass * cellFrac.x * cellFrac.y);
+
+    vec2 uSample = position - vec2(0.0, 0.5);
+    ivec2 uBase = ivec2(floor(uSample - vec2(0.5)));
+    vec2 uFx = uSample - vec2(uBase);
+    vec3 uWx;
+    vec3 uWy;
+    quadraticWeights(uFx.x, uWx);
+    quadraticWeights(uFx.y, uWy);
+
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            ivec2 face = uBase + ivec2(i, j);
+            vec2 facePos = vec2(float(face.x), float(face.y) + 0.5);
+            vec2 apicVelocity = velocity + affine * (facePos - position);
+            depositU(face, mass * uWx[i] * uWy[j], apicVelocity.x);
+        }
+    }
+
+    vec2 vSample = position - vec2(0.5, 0.0);
+    ivec2 vBase = ivec2(floor(vSample - vec2(0.5)));
+    vec2 vFx = vSample - vec2(vBase);
+    vec3 vWx;
+    vec3 vWy;
+    quadraticWeights(vFx.x, vWx);
+    quadraticWeights(vFx.y, vWy);
+
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            ivec2 face = vBase + ivec2(i, j);
+            vec2 facePos = vec2(float(face.x) + 0.5, float(face.y));
+            vec2 apicVelocity = velocity + affine * (facePos - position);
+            depositV(face, mass * vWx[i] * vWy[j], apicVelocity.y);
+        }
+    }
+}

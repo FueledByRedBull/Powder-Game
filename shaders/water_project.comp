@@ -1,0 +1,78 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D waterUFaceSrc;
+layout(r16f, binding = 1) uniform readonly image2D waterVFaceSrc;
+layout(r32f, binding = 2) uniform readonly image2D pressureTex;
+layout(r16f, binding = 3) uniform writeonly image2D waterUFaceDst;
+layout(r16f, binding = 4) uniform writeonly image2D waterVFaceDst;
+layout(r8ui, binding = 5) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 6) uniform readonly image2D liquidPhiTex;
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform float liquidPhiThreshold;
+uniform float gravityDelta;
+
+bool cellInBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool blocked(ivec2 coord) {
+    if (!cellInBounds(coord)) {
+        return true;
+    }
+    return imageLoad(boundaryTex, coord).r != 0u;
+}
+
+float pressureAt(ivec2 coord) {
+    if (!cellInBounds(coord) || blocked(coord) || imageLoad(liquidPhiTex, coord).x >= liquidPhiThreshold) {
+        return 0.0;
+    }
+    return imageLoad(pressureTex, coord).x;
+}
+
+float checkedHalf(float value) {
+    // Check the result after both forcing and pressure, before binary16 conversion.
+    if (isnan(value) || isinf(value) || abs(value) > 65504.0) {
+        atomicAdd(nanInfDetected, 1u);
+        return 0.0;
+    }
+    return value;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+
+    if (coord.x <= gridSize.x && coord.y < gridSize.y) {
+        float face_u = 0.0;
+        ivec2 left_cell = ivec2(coord.x - 1, coord.y);
+        ivec2 right_cell = ivec2(coord.x, coord.y);
+        // Keep transferred air-face velocities for particles whose kernel crosses the free surface.
+        if (coord.x > 0 && coord.x < gridSize.x && !blocked(left_cell) && !blocked(right_cell)) {
+            float p_left = pressureAt(left_cell);
+            float p_right = pressureAt(right_cell);
+            face_u = imageLoad(waterUFaceSrc, coord).x - (p_right - p_left);
+        }
+        imageStore(waterUFaceDst, coord, vec4(checkedHalf(face_u), 0.0, 0.0, 0.0));
+    }
+
+    if (coord.x < gridSize.x && coord.y <= gridSize.y) {
+        float face_v = 0.0;
+        ivec2 down_cell = ivec2(coord.x, coord.y - 1);
+        ivec2 up_cell = ivec2(coord.x, coord.y);
+        if (coord.y > 0 && coord.y < gridSize.y && !blocked(down_cell) && !blocked(up_cell)) {
+            float p_down = pressureAt(down_cell);
+            float p_up = pressureAt(up_cell);
+            face_v = imageLoad(waterVFaceSrc, coord).x + gravityDelta - (p_up - p_down);
+        }
+        imageStore(waterVFaceDst, coord, vec4(checkedHalf(face_v), 0.0, 0.0, 0.0));
+    }
+}

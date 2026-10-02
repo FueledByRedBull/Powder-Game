@@ -1,0 +1,118 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
+layout(r16f, binding = 1) uniform readonly image2D waterAmountTex;
+layout(rg16f, binding = 2) uniform readonly image2D waterVelocityTex;
+layout(rg16f, binding = 3) uniform writeonly image2D sandVelocityTex;
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+layout(std430, binding = 0) readonly buffer SandGridMass {
+    uint gridMass[];
+};
+
+layout(std430, binding = 1) readonly buffer SandGridMomentumX {
+    ivec2 gridMomentumX[];
+};
+
+layout(std430, binding = 2) readonly buffer SandGridMomentumY {
+    ivec2 gridMomentumY[];
+};
+
+uniform ivec2 gridSize;
+uniform float dt;
+uniform float gravity;
+uniform float damping;
+uniform float drag;
+uniform float wallFriction;
+uniform float massScale;
+uniform float velocityScale;
+
+int linearIndex(ivec2 coord) {
+    return coord.y * (gridSize.x + 2) + coord.x;
+}
+
+ivec2 clampCell(ivec2 coord) {
+    return clamp(coord, ivec2(0), gridSize - ivec2(1));
+}
+
+bool invalid(float value) {
+    return isnan(value) || isinf(value);
+}
+
+float momentum(ivec2 value) {
+    return float(value.x) + 4294967296.0 * float(value.y);
+}
+
+void separate(inout vec2 velocity, vec2 normal) {
+    float inward = dot(velocity, normal);
+    if (inward >= 0.0) return;
+    velocity -= inward * normal;
+    float tangentSpeed = length(velocity);
+    if (tangentSpeed > 0.0) velocity *= max(0.0, 1.0 + wallFriction * inward / tangentSpeed);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, gridSize + ivec2(2)))) {
+        return;
+    }
+
+    ivec2 cell = coord - ivec2(1);
+    bool halo = any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, gridSize));
+    int index = linearIndex(coord);
+    uint massAccum = gridMass[index];
+    float sdf = halo ? 1.0 : imageLoad(boundarySdfTex, cell).x;
+    if (massAccum == 0u) {
+        imageStore(sandVelocityTex, coord, vec4(0.0));
+        return;
+    }
+
+    float invMass = massScale / float(max(massAccum, 1u));
+    vec2 velocity = vec2(momentum(gridMomentumX[index]), momentum(gridMomentumY[index])) * (invMass / velocityScale);
+    velocity.y -= gravity * dt;
+
+    float waterAmount = imageLoad(waterAmountTex, clampCell(cell)).x;
+    vec2 waterVelocity = imageLoad(waterVelocityTex, clampCell(cell)).xy;
+    float dragAlpha = clamp(drag * waterAmount * dt, 0.0, 1.0);
+    velocity = mix(velocity, waterVelocity, dragAlpha);
+
+    // Damping is the velocity retained over one 1/60-second reference step.
+    velocity *= pow(damping, dt * 60.0);
+    if (dt > 0.0) {
+        if (cell.x <= 0) separate(velocity, vec2(1.0, 0.0));
+        if (cell.x >= gridSize.x - 1) separate(velocity, vec2(-1.0, 0.0));
+        if (cell.y <= 0) separate(velocity, vec2(0.0, 1.0));
+        if (cell.y >= gridSize.y - 1) separate(velocity, vec2(0.0, -1.0));
+        if (!halo && sdf <= 0.0) {
+            float left = imageLoad(boundarySdfTex, clampCell(cell + ivec2(-1, 0))).x;
+            float right = imageLoad(boundarySdfTex, clampCell(cell + ivec2(1, 0))).x;
+            float down = imageLoad(boundarySdfTex, clampCell(cell + ivec2(0, -1))).x;
+            float up = imageLoad(boundarySdfTex, clampCell(cell + ivec2(0, 1))).x;
+            vec2 normal = vec2(right - left, up - down);
+            if (length(normal) > 0.00001) {
+                separate(velocity, normalize(normal));
+            } else {
+                // Thin walls can have equal distances on both sides: constrain their blocked axis.
+                bool openX = left > 0.0 || right > 0.0;
+                bool openY = down > 0.0 || up > 0.0;
+                if (openX) separate(velocity, vec2(-sign(velocity.x), 0.0));
+                if (openY) separate(velocity, vec2(0.0, -sign(velocity.y)));
+                if (!openX && !openY) velocity = vec2(0.0);
+            }
+        }
+    }
+    // Validate the final stressed/forced velocity against its binary16 storage range.
+    if (invalid(velocity.x) || invalid(velocity.y) || any(greaterThan(abs(velocity), vec2(65504.0)))) {
+        atomicAdd(nanInfDetected, 1u);
+        velocity = vec2(0.0);
+    }
+    imageStore(sandVelocityTex, coord, vec4(velocity, 0.0, 0.0));
+}

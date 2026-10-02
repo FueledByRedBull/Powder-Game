@@ -1,0 +1,27 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D gasUTex;
+layout(r16f, binding = 1) uniform readonly image2D gasVTex;
+layout(rg16f, binding = 2) uniform writeonly image2D gasCenterVelocityTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+
+uniform ivec2 gasSize;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gasSize.x || coord.y >= gasSize.y) {
+        return;
+    }
+    if (imageLoad(boundaryTex, coord).r != 0u) {
+        imageStore(gasCenterVelocityTex, coord, vec4(0.0));
+        return;
+    }
+
+    float uL = imageLoad(gasUTex, ivec2(coord.x, coord.y)).x;
+    float uR = imageLoad(gasUTex, ivec2(coord.x + 1, coord.y)).x;
+    float vB = imageLoad(gasVTex, ivec2(coord.x, coord.y)).x;
+    float vT = imageLoad(gasVTex, ivec2(coord.x, coord.y + 1)).x;
+    imageStore(gasCenterVelocityTex, coord, vec4(0.5 * (uL + uR), 0.5 * (vB + vT), 0.0, 0.0));
+}

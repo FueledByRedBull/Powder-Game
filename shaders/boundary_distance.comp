@@ -1,0 +1,32 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
+layout(rg32i, binding = 1) uniform readonly iimage2D boundarySeedTex;
+layout(r16f, binding = 2) uniform writeonly image2D boundarySdfTex;
+
+uniform ivec2 gridSize;
+uniform float maxDistance;
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    bool inside = imageLoad(boundaryMaskTex, coord).r != 0u;
+    ivec2 seed = imageLoad(boundarySeedTex, coord).xy;
+    float distance = maxDistance;
+    if (seed.x >= 0 && seed.y >= 0) {
+        // Interface seeds are cell centers on both sides; a half-cell offset preserves their signs.
+        distance = length(vec2(coord - seed)) + 0.5;
+    }
+
+    float signed_distance = inside ? -distance : distance;
+    imageStore(boundarySdfTex, coord, vec4(signed_distance, 0.0, 0.0, 0.0));
+}

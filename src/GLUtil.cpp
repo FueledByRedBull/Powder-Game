@@ -7,7 +7,12 @@
 
 namespace {
 
-GLuint CompileShader(GLenum type, const std::string& source, const std::string& path) {
+std::string PathText(const std::filesystem::path& path) {
+    const auto utf8 = path.generic_u8string();
+    return std::string(utf8.begin(), utf8.end());
+}
+
+GLuint CompileShader(GLenum type, const std::string& source, const std::filesystem::path& path) {
     const GLuint shader = glCreateShader(type);
     const char* source_ptr = source.c_str();
     glShaderSource(shader, 1, &source_ptr, nullptr);
@@ -27,7 +32,7 @@ GLuint CompileShader(GLenum type, const std::string& source, const std::string& 
     }
 
     std::ostringstream error;
-    error << "Shader compilation failed: " << path << "\n" << log.data();
+    error << "Shader compilation failed: " << PathText(path) << "\n" << log.data();
     glDeleteShader(shader);
     throw std::runtime_error(error.str());
 }
@@ -68,10 +73,10 @@ GLuint LinkProgram(const std::vector<GLuint>& shaders) {
 
 namespace glutil {
 
-std::string ReadTextFile(const std::string& path) {
+std::string ReadTextFile(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        throw std::runtime_error("Failed to open file: " + path);
+        throw std::runtime_error("Failed to open file: " + PathText(path));
     }
 
     std::ostringstream stream;
@@ -79,17 +84,23 @@ std::string ReadTextFile(const std::string& path) {
     return stream.str();
 }
 
-GLuint CreateProgramFromFiles(const std::string& vertex_path, const std::string& fragment_path) {
+GLuint CreateProgramFromFiles(const std::filesystem::path& vertex_path, const std::filesystem::path& fragment_path) {
     const std::string vertex_source = ReadTextFile(vertex_path);
     const std::string fragment_source = ReadTextFile(fragment_path);
 
     const GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex_source, vertex_path);
-    const GLuint fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_source, fragment_path);
+    GLuint fragment_shader = 0;
+    try {
+        fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_source, fragment_path);
+    } catch (...) {
+        glDeleteShader(vertex_shader);
+        throw;
+    }
 
     return LinkProgram({vertex_shader, fragment_shader});
 }
 
-GLuint CreateComputeProgramFromFile(const std::string& compute_path) {
+GLuint CreateComputeProgramFromFile(const std::filesystem::path& compute_path) {
     const std::string compute_source = ReadTextFile(compute_path);
     const GLuint compute_shader = CompileShader(GL_COMPUTE_SHADER, compute_source, compute_path);
     return LinkProgram({compute_shader});

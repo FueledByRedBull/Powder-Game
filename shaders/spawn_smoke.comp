@@ -1,0 +1,132 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform image2D gasUTex;
+layout(r16f, binding = 1) uniform image2D gasVTex;
+layout(rg16f, binding = 2) uniform image2D gasCenterVelocityTex;
+layout(r16f, binding = 3) uniform image2D smokeDenTex;
+layout(r16f, binding = 4) uniform image2D temperatureTex;
+layout(r16f, binding = 5) uniform image2D fuelTex;
+layout(r16f, binding = 6) uniform image2D oxidizerTex;
+layout(rg16f, binding = 7) uniform image2D reactionTex;
+layout(r16f, binding = 9) uniform readonly image2D waterAmountTex;
+layout(r8ui, binding = 10) uniform readonly uimage2D boundaryTex;
+
+uniform ivec2 gasSize;
+uniform ivec2 gridSize;
+uniform ivec2 dispatchOrigin;
+uniform ivec2 brushCenter;
+uniform int brushRadius;
+uniform float smokeDensity;
+uniform vec2 gasVelocity;
+uniform float temperatureAdd;
+uniform float fuelAdd;
+uniform float oxidizerAdd;
+uniform float reactionAdd;
+uniform int blockedBySolid;
+uniform int blockedByWater;
+uniform int clearMode;
+
+bool fullCellInsideBrush(ivec2 fullCoord) {
+    vec2 cellCenter = vec2(fullCoord) + vec2(0.5);
+    vec2 brushCenterPx = vec2(brushCenter) + vec2(0.5);
+    vec2 delta = cellCenter - brushCenterPx;
+    return dot(delta, delta) <= float(brushRadius * brushRadius);
+}
+
+bool overlapsBrush(ivec2 coord) {
+    ivec2 fullMin = coord * 2;
+    ivec2 fullMax = min(fullMin + ivec2(2), gridSize);
+    for (int y = fullMin.y; y < fullMax.y; ++y) {
+        for (int x = fullMin.x; x < fullMax.x; ++x) {
+            if (fullCellInsideBrush(ivec2(x, y))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool overlapsWater(ivec2 coord) {
+    ivec2 fullMin = coord * 2;
+    ivec2 fullMax = min(fullMin + ivec2(2), gridSize);
+    for (int y = fullMin.y; y < fullMax.y; ++y) {
+        for (int x = fullMin.x; x < fullMax.x; ++x) {
+            ivec2 fullCoord = ivec2(x, y);
+            if (fullCellInsideBrush(fullCoord) && imageLoad(waterAmountTex, fullCoord).x > 0.015) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void storeOwnedFaces(ivec2 coord, vec2 velocity, bool clearOnly) {
+    if (coord.y < gasSize.y) {
+        ivec2 uFace = ivec2(coord.x, coord.y);
+        float uValue = clearOnly ? 0.0 : clamp(imageLoad(gasUTex, uFace).x + velocity.x, -4.0, 4.0);
+        imageStore(gasUTex, uFace, vec4(uValue, 0.0, 0.0, 0.0));
+    }
+    if (coord.x == gasSize.x - 1 && coord.y < gasSize.y) {
+        ivec2 uFace = ivec2(coord.x + 1, coord.y);
+        float uValue = clearOnly ? 0.0 : clamp(imageLoad(gasUTex, uFace).x + velocity.x, -4.0, 4.0);
+        imageStore(gasUTex, uFace, vec4(uValue, 0.0, 0.0, 0.0));
+    }
+    if (coord.x < gasSize.x) {
+        ivec2 vFace = ivec2(coord.x, coord.y);
+        float vValue = clearOnly ? 0.0 : clamp(imageLoad(gasVTex, vFace).x + velocity.y, -4.0, 4.0);
+        imageStore(gasVTex, vFace, vec4(vValue, 0.0, 0.0, 0.0));
+    }
+    if (coord.y == gasSize.y - 1 && coord.x < gasSize.x) {
+        ivec2 vFace = ivec2(coord.x, coord.y + 1);
+        float vValue = clearOnly ? 0.0 : clamp(imageLoad(gasVTex, vFace).x + velocity.y, -4.0, 4.0);
+        imageStore(gasVTex, vFace, vec4(vValue, 0.0, 0.0, 0.0));
+    }
+}
+
+void main() {
+    ivec2 coord = dispatchOrigin + ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gasSize.x || coord.y >= gasSize.y) {
+        return;
+    }
+    if (!overlapsBrush(coord)) {
+        return;
+    }
+
+    if (clearMode == 1) {
+        storeOwnedFaces(coord, vec2(0.0), true);
+        imageStore(gasCenterVelocityTex, coord, vec4(0.0));
+        imageStore(smokeDenTex, coord, vec4(0.0));
+        imageStore(temperatureTex, coord, vec4(0.0));
+        imageStore(fuelTex, coord, vec4(0.0));
+        imageStore(oxidizerTex, coord, vec4(0.0));
+        imageStore(reactionTex, coord, vec4(0.0));
+        return;
+    }
+
+    if (blockedBySolid == 1 && imageLoad(boundaryTex, coord).r != 0u) {
+        return;
+    }
+    if (blockedByWater == 1 && overlapsWater(coord)) {
+        return;
+    }
+
+    storeOwnedFaces(coord, gasVelocity, false);
+
+    float currentDensity = imageLoad(smokeDenTex, coord).x;
+    float currentTemperature = imageLoad(temperatureTex, coord).x;
+    float currentFuel = imageLoad(fuelTex, coord).x;
+    float currentOxidizer = imageLoad(oxidizerTex, coord).x;
+    vec2 reaction = imageLoad(reactionTex, coord).xy;
+    vec2 centerVelocity = imageLoad(gasCenterVelocityTex, coord).xy;
+
+    imageStore(smokeDenTex, coord, vec4(clamp(currentDensity + smokeDensity, 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(gasCenterVelocityTex, coord, vec4(clamp(centerVelocity + gasVelocity, vec2(-4.0), vec2(4.0)), 0.0, 0.0));
+    imageStore(temperatureTex, coord, vec4(clamp(currentTemperature + temperatureAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(fuelTex, coord, vec4(clamp(currentFuel + fuelAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(oxidizerTex, coord, vec4(clamp(currentOxidizer + oxidizerAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
+    reaction.x = 0.0;
+    reaction.y = clamp(reaction.y + reactionAdd, 0.0, 1.0);
+    imageStore(reactionTex, coord, vec4(reaction, 0.0, 0.0));
+}

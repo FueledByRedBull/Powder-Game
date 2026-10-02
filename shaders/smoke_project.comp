@@ -2,82 +2,64 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D smokeVelSrc;
-layout(r8, binding = 1) uniform readonly image2D smokeDenSrc;
-layout(r16f, binding = 2) uniform readonly image2D pressureTex;
+layout(r16f, binding = 0) uniform readonly image2D gasUSrc;
+layout(r16f, binding = 1) uniform readonly image2D gasVSrc;
+layout(r32f, binding = 2) uniform readonly image2D pressureTex;
+layout(r16f, binding = 3) uniform writeonly image2D gasUDst;
+layout(r16f, binding = 4) uniform writeonly image2D gasVDst;
+layout(r8ui, binding = 5) uniform readonly uimage2D boundaryTex;
 
-layout(rg16f, binding = 3) uniform writeonly image2D smokeVelDst;
-layout(r8, binding = 4) uniform writeonly image2D smokeDenDst;
-layout(r8ui, binding = 5) uniform readonly uimage2D tileActiveTex;
-
-layout(std430, binding = 12) readonly buffer ActiveTileList {
-    uint activeTiles[];
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
 };
 
-layout(std430, binding = 13) readonly buffer ActiveTileCounter {
-    uint activeTileCount;
-};
+uniform ivec2 gasSize;
 
-uniform ivec2 smokeSize;
-uniform ivec2 tileSize;
-
-ivec2 clampSmoke(ivec2 coord) {
-    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
-}
-
-float pressure(ivec2 coord) {
-    return imageLoad(pressureTex, clampSmoke(coord)).x;
-}
-
-bool tileActive(ivec2 coord) {
-    ivec2 full_coord = coord * 4 + ivec2(2);
-    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
-    return imageLoad(tileActiveTex, tile).r != 0u;
-}
-
-ivec2 dispatchCoord() {
-    uint group = gl_WorkGroupID.x;
-    if (group >= activeTileCount) {
-        return ivec2(-1);
+float pressureAt(ivec2 coord) {
+    coord = clamp(coord, ivec2(0), gasSize - ivec2(1));
+    if (imageLoad(boundaryTex, coord).r != 0u) {
+        return 0.0;
     }
-    uint packed_tile = activeTiles[group];
-    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
-    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
-        return ivec2(-1);
-    }
-    return coord;
+    return imageLoad(pressureTex, coord).x;
+}
+
+bool blockedCell(ivec2 coord) {
+    return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || imageLoad(boundaryTex, coord).r != 0u;
+}
+
+bool invalid(float value) {
+    return isnan(value) || isinf(value);
 }
 
 void main() {
-    ivec2 coord = dispatchCoord();
-    if (coord.x < 0) {
-        return;
-    }
-    if (!tileActive(coord)) {
-        imageStore(smokeVelDst, coord, imageLoad(smokeVelSrc, coord));
-        imageStore(smokeDenDst, coord, imageLoad(smokeDenSrc, coord));
-        return;
-    }
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 
-    vec2 velocity = imageLoad(smokeVelSrc, coord).xy;
-
-    float pL = pressure(coord + ivec2(-1, 0));
-    float pR = pressure(coord + ivec2(1, 0));
-    float pB = pressure(coord + ivec2(0, -1));
-    float pT = pressure(coord + ivec2(0, 1));
-
-    vec2 gradient = vec2(pR - pL, pT - pB) * 0.5;
-    vec2 projected_velocity = velocity - gradient;
-
-    if (coord.x == 0 || coord.x == smokeSize.x - 1) {
-        projected_velocity.x = 0.0;
-    }
-    if (coord.y == 0 || coord.y == smokeSize.y - 1) {
-        projected_velocity.y = 0.0;
+    if (coord.x <= gasSize.x && coord.y < gasSize.y) {
+        float value = 0.0;
+        if (coord.x > 0 && coord.x < gasSize.x && !blockedCell(ivec2(coord.x - 1, coord.y)) &&
+            !blockedCell(ivec2(coord.x, coord.y))) {
+            value = imageLoad(gasUSrc, coord).x - (pressureAt(ivec2(coord.x, coord.y)) - pressureAt(ivec2(coord.x - 1, coord.y)));
+            if (invalid(value)) {
+                atomicAdd(nanInfDetected, 1u);
+                value = 0.0;
+            }
+        }
+        imageStore(gasUDst, coord, vec4(value, 0.0, 0.0, 0.0));
     }
 
-    float density = imageLoad(smokeDenSrc, coord).x;
-    imageStore(smokeVelDst, coord, vec4(projected_velocity, 0.0, 0.0));
-    imageStore(smokeDenDst, coord, vec4(density, 0.0, 0.0, 0.0));
+    if (coord.x < gasSize.x && coord.y <= gasSize.y) {
+        float value = 0.0;
+        if (coord.y > 0 && coord.y < gasSize.y && !blockedCell(ivec2(coord.x, coord.y - 1)) &&
+            !blockedCell(ivec2(coord.x, coord.y))) {
+            value = imageLoad(gasVSrc, coord).x - (pressureAt(ivec2(coord.x, coord.y)) - pressureAt(ivec2(coord.x, coord.y - 1)));
+            if (invalid(value)) {
+                atomicAdd(nanInfDetected, 1u);
+                value = 0.0;
+            }
+        }
+        imageStore(gasVDst, coord, vec4(value, 0.0, 0.0, 0.0));
+    }
 }

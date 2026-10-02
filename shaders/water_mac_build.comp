@@ -1,0 +1,96 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform writeonly image2D waterUFaceTex;
+layout(r16f, binding = 1) uniform writeonly image2D waterVFaceTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+layout(std430, binding = 0) readonly buffer UFaceWeights {
+    uint uWeights[];
+};
+
+layout(std430, binding = 1) readonly buffer VFaceWeights {
+    uint vWeights[];
+};
+
+layout(std430, binding = 2) readonly buffer UFaceVelocitySums {
+    ivec2 uVelocitySums[];
+};
+
+layout(std430, binding = 3) readonly buffer VFaceVelocitySums {
+    ivec2 vVelocitySums[];
+};
+
+uniform ivec2 gridSize;
+uniform float weightScale;
+uniform float velocityScale;
+
+bool cellInBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool blocked(ivec2 coord) {
+    if (!cellInBounds(coord)) {
+        return true;
+    }
+    return imageLoad(boundaryTex, coord).r != 0u;
+}
+
+int uFaceIndex(ivec2 face) {
+    return face.y * (gridSize.x + 1) + face.x;
+}
+
+int vFaceIndex(ivec2 face) {
+    return face.y * gridSize.x + face.x;
+}
+
+float momentum(ivec2 value) {
+    return float(value.x) + 4294967296.0 * float(value.y);
+}
+
+float checkedHalf(float value) {
+    // Finite float values can still overflow binary16 without producing NaN/Inf.
+    if (isnan(value) || isinf(value) || abs(value) > 65504.0) {
+        atomicAdd(nanInfDetected, 1u);
+        return 0.0;
+    }
+    return value;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+
+    if (coord.x <= gridSize.x && coord.y < gridSize.y) {
+        float face_u = 0.0;
+        if (coord.x > 0 && coord.x < gridSize.x && !blocked(ivec2(coord.x - 1, coord.y)) && !blocked(ivec2(coord.x, coord.y))) {
+            int index = uFaceIndex(coord);
+            uint weight = uWeights[index];
+            if (weight > 0u) {
+                float face_weight = float(weight) / weightScale;
+                face_u = (momentum(uVelocitySums[index]) / velocityScale) / face_weight;
+            }
+        }
+        imageStore(waterUFaceTex, coord, vec4(checkedHalf(face_u), 0.0, 0.0, 0.0));
+    }
+
+    if (coord.x < gridSize.x && coord.y <= gridSize.y) {
+        float face_v = 0.0;
+        if (coord.y > 0 && coord.y < gridSize.y && !blocked(ivec2(coord.x, coord.y - 1)) && !blocked(ivec2(coord.x, coord.y))) {
+            int index = vFaceIndex(coord);
+            uint weight = vWeights[index];
+            if (weight > 0u) {
+                float face_weight = float(weight) / weightScale;
+                face_v = (momentum(vVelocitySums[index]) / velocityScale) / face_weight;
+            }
+        }
+        imageStore(waterVFaceTex, coord, vec4(checkedHalf(face_v), 0.0, 0.0, 0.0));
+    }
+}

@@ -2,64 +2,26 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D smokeVelTex;
-layout(r16f, binding = 1) uniform writeonly image2D divergenceTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D tileActiveTex;
+layout(r16f, binding = 0) uniform readonly image2D gasUTex;
+layout(r16f, binding = 1) uniform readonly image2D gasVTex;
+layout(r16f, binding = 2) uniform writeonly image2D divergenceTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
 
-layout(std430, binding = 12) readonly buffer ActiveTileList {
-    uint activeTiles[];
-};
-
-layout(std430, binding = 13) readonly buffer ActiveTileCounter {
-    uint activeTileCount;
-};
-
-uniform ivec2 smokeSize;
-uniform ivec2 tileSize;
-
-ivec2 clampSmoke(ivec2 coord) {
-    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
-}
-
-vec2 vel(ivec2 coord) {
-    return imageLoad(smokeVelTex, clampSmoke(coord)).xy;
-}
-
-bool tileActive(ivec2 coord) {
-    ivec2 full_coord = coord * 4 + ivec2(2);
-    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
-    return imageLoad(tileActiveTex, tile).r != 0u;
-}
-
-ivec2 dispatchCoord() {
-    uint group = gl_WorkGroupID.x;
-    if (group >= activeTileCount) {
-        return ivec2(-1);
-    }
-    uint packed_tile = activeTiles[group];
-    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
-    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
-        return ivec2(-1);
-    }
-    return coord;
-}
+uniform ivec2 gasSize;
 
 void main() {
-    ivec2 coord = dispatchCoord();
-    if (coord.x < 0) {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gasSize.x || coord.y >= gasSize.y) {
         return;
     }
-    if (!tileActive(coord)) {
+    if (imageLoad(boundaryTex, coord).r != 0u) {
         imageStore(divergenceTex, coord, vec4(0.0));
         return;
     }
 
-    vec2 left = vel(coord + ivec2(-1, 0));
-    vec2 right = vel(coord + ivec2(1, 0));
-    vec2 down = vel(coord + ivec2(0, -1));
-    vec2 up = vel(coord + ivec2(0, 1));
-
-    float divergence = 0.5 * ((right.x - left.x) + (up.y - down.y));
-    imageStore(divergenceTex, coord, vec4(divergence, 0.0, 0.0, 0.0));
+    float uL = imageLoad(gasUTex, ivec2(coord.x, coord.y)).x;
+    float uR = imageLoad(gasUTex, ivec2(coord.x + 1, coord.y)).x;
+    float vB = imageLoad(gasVTex, ivec2(coord.x, coord.y)).x;
+    float vT = imageLoad(gasVTex, ivec2(coord.x, coord.y + 1)).x;
+    imageStore(divergenceTex, coord, vec4((uR - uL) + (vT - vB), 0.0, 0.0, 0.0));
 }

@@ -16,6 +16,9 @@ cmake --build "$BUILD_DIR" -j
 
 mkdir -p "$DIST_DIR"
 cp "$BUILD_DIR/powder_game.exe" "$DIST_DIR/"
+while IFS= read -r library; do
+  if [[ -n "$library" ]]; then cp "$library" "$DIST_DIR/"; fi
+done < "$BUILD_DIR/runtime-dlls.txt"
 cp -r "$BUILD_DIR/shaders" "$DIST_DIR/"
 
 cat > "$DIST_DIR/README.txt" <<'TXT'

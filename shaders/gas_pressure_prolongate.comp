@@ -1,0 +1,82 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r32f, binding = 0) uniform readonly image2D coarsePressureTex;
+layout(r32f, binding = 1) uniform image2D finePressureTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+
+uniform ivec2 fineSize;
+uniform ivec2 coarseSize;
+uniform int boundaryScale;
+
+bool blockedCell(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= fineSize.x || coord.y >= fineSize.y) {
+        return true;
+    }
+    ivec2 fineMin = coord * boundaryScale;
+    ivec2 fineMax = fineMin + ivec2(boundaryScale);
+    if (any(greaterThan(fineMax, imageSize(boundaryTex)))) {
+        return true;
+    }
+    for (int y = fineMin.y; y < fineMax.y; ++y) {
+        for (int x = fineMin.x; x < fineMax.x; ++x) {
+            if (imageLoad(boundaryTex, ivec2(x, y)).r != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool blockedCoarse(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= coarseSize.x || coord.y >= coarseSize.y) {
+        return true;
+    }
+    ivec2 base = coord * 2;
+    return blockedCell(base) || blockedCell(base + ivec2(1, 0)) ||
+           blockedCell(base + ivec2(0, 1)) || blockedCell(base + ivec2(1, 1));
+}
+
+float sampleCoarse(vec2 position, ivec2 parent) {
+    ivec2 base = ivec2(floor(position));
+    vec2 frac = fract(position);
+    float pressure_sum = 0.0;
+    float weight_sum = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 donor = base + ivec2(x, y);
+            if (blockedCoarse(donor)) {
+                continue;
+            }
+            // A diagonal donor must not interpolate across a blocked corner.
+            if (donor.x != parent.x && donor.y != parent.y &&
+                (blockedCoarse(ivec2(donor.x, parent.y)) || blockedCoarse(ivec2(parent.x, donor.y)))) {
+                continue;
+            }
+            float weight = (x == 0 ? 1.0 - frac.x : frac.x) * (y == 0 ? 1.0 - frac.y : frac.y);
+            pressure_sum += weight * imageLoad(coarsePressureTex, donor).x;
+            weight_sum += weight;
+        }
+    }
+    return weight_sum > 0.0 ? pressure_sum / weight_sum : 0.0;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= fineSize.x || coord.y >= fineSize.y) {
+        return;
+    }
+    if (blockedCell(coord)) {
+        imageStore(finePressureTex, coord, vec4(0.0));
+        return;
+    }
+
+    vec2 coarsePos = (vec2(coord) + vec2(0.5)) * 0.5 - vec2(0.5);
+    float value = imageLoad(finePressureTex, coord).x;
+    ivec2 parent = coord / 2;
+    if (!blockedCoarse(parent)) {
+        value += sampleCoarse(coarsePos, parent);
+    }
+    imageStore(finePressureTex, coord, vec4(value, 0.0, 0.0, 0.0));
+}

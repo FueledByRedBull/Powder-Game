@@ -1,0 +1,52 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D divergenceTex;
+layout(r16f, binding = 1) uniform readonly image2D pressureSrc;
+layout(r16f, binding = 2) uniform writeonly image2D pressureDst;
+layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 4) uniform readonly image2D liquidPhiTex;
+
+uniform ivec2 gridSize;
+uniform float liquidPhiThreshold;
+
+bool blockedCell(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return true;
+    }
+    return imageLoad(boundaryTex, coord).r != 0u;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+    if (imageLoad(boundaryTex, coord).r != 0u || imageLoad(liquidPhiTex, coord).x >= liquidPhiThreshold) {
+        imageStore(pressureDst, coord, vec4(0.0));
+        return;
+    }
+
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float pressure_sum = 0.0;
+    float diagonal = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 neighbor = coord + offsets[i];
+        if (blockedCell(neighbor)) {
+            continue;
+        }
+        // Air fixes pressure to zero; solid faces contribute no pressure flux.
+        diagonal += 1.0;
+        if (imageLoad(liquidPhiTex, neighbor).x < liquidPhiThreshold) {
+            pressure_sum += imageLoad(pressureSrc, neighbor).x;
+        }
+    }
+
+    float divergence = imageLoad(divergenceTex, coord).x;
+    // Damping removes the checkerboard oscillation in closed liquid regions.
+    float next_pressure = diagonal > 0.0
+                              ? mix(imageLoad(pressureSrc, coord).x, (pressure_sum - divergence) / diagonal, 2.0 / 3.0)
+                              : 0.0;
+    imageStore(pressureDst, coord, vec4(next_pressure, 0.0, 0.0, 0.0));
+}

@@ -2,12 +2,13 @@
 
 #include <glad/glad.h>
 
+#include <filesystem>
 #include <string>
 
 namespace glutil {
 
-std::string ReadTextFile(const std::string& path);
-GLuint CreateProgramFromFiles(const std::string& vertex_path, const std::string& fragment_path);
-GLuint CreateComputeProgramFromFile(const std::string& compute_path);
+std::string ReadTextFile(const std::filesystem::path& path);
+GLuint CreateProgramFromFiles(const std::filesystem::path& vertex_path, const std::filesystem::path& fragment_path);
+GLuint CreateComputeProgramFromFile(const std::filesystem::path& compute_path);
 
 }  // namespace glutil

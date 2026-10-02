@@ -1,134 +1,134 @@
-# Powder Game Plan (C++20, OpenGL 4.3+ Compute)
+# Powder Game Architecture and Plan
 
-## Goals
-- 1000x1000 simulation window at 60 fps on a modern GPU.
-- Materials: sand, water, smoke, fire, heat.
-- GPU-first pipeline; CPU only orchestrates, spawns, and renders.
+The work and evidence ledger is `ROADMAP.md`; commands and measured results
+are in `VALIDATION.md`. This file describes the current architecture. Historical
+cellular sand milestones have been superseded by the particle implementation.
 
-## Constraints
-- C++20, OpenGL 4.3+ compute shaders.
-- No CPU-GPU readback in the frame loop.
-- Structure of Arrays (SoA) layout; pack only when fields are read together.
+## Goals and constraints
 
-## Grid Resolutions
-- Base grid: 1000x1000 (cells).
-- Water (LBM D2Q9): full res.
-- Fire reaction-diffusion: full res.
-- Heat/temperature: half res (500x500).
-- Smoke velocity/density: quarter res (250x250).
+- 1000x1000 simulation and rendering; 500x500 gas.
+- Sand, water, painted solids, smoke, fire, and temperature coupling.
+- C++20 and OpenGL 4.3 compute, subject to the resource limits in README.
+- GPU simulation. Small CPU pressure-convergence readbacks trade synchronization
+  for avoiding hundreds of unnecessary dispatches. Full-state readback is for tests.
+- Default fixed tick 1/60 second, elapsed-time accumulation, four-tick stall cap.
+- Reference acceptance: 60 FPS idle; 30 FPS with 100,000 water and 50,000 sand
+  particles plus smoke/fire, GPU frame p95 at most 50 ms. The preferred goal is
+  60 FPS combined. The earlier RX 7800 XT checkpoint reached 31.5 FPS; the native
+  input follow-up measures 29.71-29.83 FPS and misses the unchanged mean gate.
+  GPU p95 remains below 50 ms. Two ticks run per rendered frame; display latency is excluded.
 
-## Core Data Layout (SoA)
-Base grid textures:
-- material_id: R16UI (material in low bits; sleep/static/flags in high bits).
-- velocity: RG16F (shared for sand and general advection).
-- sand_stress: R16F.
+## State and ownership
 
-Water LBM (ping-pong):
-- lbm_a0: RGBA16F
-- lbm_a1: RGBA16F
-- lbm_a2: RG16F (or RGBA16F if alignment issues)
-- lbm_b0: RGBA16F
-- lbm_b1: RGBA16F
-- lbm_b2: RG16F
-- water_pressure: R16F (standalone)
+- Painted material is an R16UI cell grid. Sand and water are authoritative particle
+  SSBOs, each capped at 262,144 live particles; bounded reservations prevent wrap.
+- Material has one texture. Removed cellular velocity/stress and spare material
+  fields saved 14 MB; equivalent solid shading is derived from the material value.
+  Removing unused water/sand center outputs and water cell momentum saves another
+  28 MB of logical storage plus the accumulation and stores that fed those outputs.
+- Water records contain position, velocity, active flag, mass and affine velocity
+  in three vec4s (48 bytes). No particle reseeding creates mass from render fields.
+- Sand adds rest area and elastic deformation in four vec4s (64 bytes). The grid
+  transfer has a one-cell halo, retaining complete quadratic support at domain edges.
+- Integer particle transfers accumulate weights and signed momentum; low-word/carry
+  pairs prevent dense momentum from overflowing 32-bit sums.
+- Water faces and most derived/gas fields use half precision. Water/gas pressure
+  and water CG vectors use single precision because half precision stalled measured
+  solves. Live particle-grid velocity producers diagnose nonfinite or unrepresentable
+  half-float outputs through counter zero and neutralize only those failed values.
+- Full, static and gas masks preserve cell topology. Only static sand collision
+  needs a signed distance field, rebuilt by jump flooding when geometry changes.
+- Gas stores staggered velocity, smoke, fuel, oxidizer, temperature and reaction in
+  ping-pong textures. Scalar combustion fields are bounded dimensionless quantities.
 
-Smoke (quarter res, ping-pong):
-- smoke_vel_a: RG16F
-- smoke_vel_b: RG16F
-- smoke_den_a: R16F
-- smoke_den_b: R16F
+## Water
 
-Fire (full res, ping-pong):
-- fire_rd_a: RG16F (U,V in Gray-Scott)
-- fire_rd_b: RG16F
-- fire_temp_a: R16F (full-res temperature for blackbody color mapping)
+Mass-weighted quadratic particle-to-grid transfer uses wide fixed-point momentum
+sums; blocked or out-of-domain support is omitted. The raw
+pre-force velocity remains available for FLIP; gravity enters the projected grid.
+The pressure operator uses matching divergence/gradient coefficients, thresholded
+free-surface liquid classification and solid Neumann boundaries. GPU conjugate gradient uses an
+R32F warm start, active liquid bounds, a 16x16 block-Jacobi preconditioner,
+early convergence checks and a true final residual check. The preconditioner
+uses 32 fixed local weighted sweeps; fused partial reductions keep each global
+iteration to six dispatches. The default ceiling is 1024 iterations, with a
+true residual threshold of 0.12.
 
-Heat (half res, ping-pong):
-- heat_a: R16F
-- heat_b: R16F
+Particle velocity blends FLIP/PIC and recovers affine moments from the quadratic
+kernel. Both samples of RK2 transport obey the velocity cap. Damping scales with
+elapsed time. Swept cell traversal blocks thin walls, corners and domain exits;
+blocked normal velocity and affine rows are removed. Substeps enforce the configured
+CFL budget and reject impossible settings before simulation dispatch.
 
-Active tiles:
-- tile_active: R8UI (one texel per 16x16 tile).
-- tile_bounds: optional SSBO for compact active list (future optimization).
+## Sand
 
-## Sand (Verlet + Swept DDA)
-- Verlet integration with restitution and damping on collision.
-- Multi-step DDA along the parabolic arc each frame; cap max steps.
-- GPU conflict handling:
-  - Phase 1: compute desired target cell into SSBO (one per particle).
-  - Phase 2: resolve conflicts deterministically using atomics on a per-cell winner buffer.
-  - Phase 3: commit winners, losers keep residual velocity.
-- Angle of repose:
-  - Each sand cell stores stress; if local slope > threshold, relax with cellular rules.
+Particles carry elastic deformation and rest area. Quadratic APIC transfers feed
+Hencky elastic stress into grid momentum. Separating grid contact and Coulomb wall
+friction act before grid-to-particle transfer. The velocity gradient advances the
+elastic deformation, then principal logarithmic strains undergo Drucker-Prager
+plastic projection. Swept collision remains a geometric crossing guard.
 
-## Water (LBM D2Q9)
-- Collision step: relax toward equilibrium with tunable omega.
-- Streaming step: propagate to neighbors.
-- Boundary: bounce-back at solid material_id.
-- Pressure derived from density; stored in water_pressure.
-- Keep LBM full res.
+The implemented material uses a fixed yield cone, without hardening. Reference
+density is 2, shear modulus and first Lame parameter are 12000, friction alpha is
+0.5, and wall friction is 0.62. These are simulation units. Alpha was calibrated
+against measured pile support; this is not a validated physical sand material.
+Wave speed plus the particle velocity cap determines stable material substeps
+(default 18 per tick). Insufficient budgets are rejected before dispatch.
 
-## Smoke (Stable Fluids, quarter res)
-- Velocity advection (semi-Lagrangian).
-- Projection to enforce incompressibility.
-- Vorticity confinement for curl.
-- Density advection.
-- Up-sample to full res for rendering and coupling.
+## Gas and coupling
 
-## Fire (Reaction-Diffusion + Heat)
-- Gray-Scott model for flame front (full res).
-- Heat diffusion on half res; bilinear sampling into fire for color/ignition.
-- Color mapping via blackbody approximation in shader.
-- Optional embers: SSBO of particles with ballistic motion and cooling.
+Forward/reverse semi-Lagrangian transport uses a limited MacCormack correction.
+Traces stop at walls, bilinear donors must be reachable, and the limiter uses those
+same donors. Source and forward trace velocities obey the configured component
+cap; projection can exceed that cap without changing its divergence correction.
+Dissipation occurs after limiting and scales with elapsed time.
+Buoyancy precedes a solid-aware three-level multigrid pressure projection. Coarse
+cells omitted by mixed solid/fluid footprints impose zero correction; true physical
+walls remain Neumann. This distinction prevents an artificial coarse null mode.
+Pressure uses R32F storage: a captured evolving scene exceeded the tightened
+0.015 residual gate with half precision and passed with single precision. The
+24-cycle ceiling remains. Checks initially and every four cycles stop when the
+stored-operator residual maximum is at most min(configured threshold, 0.01) and
+RMS at most 0.001. An independent final maximum diagnostic always runs.
+Performance results and the current mean-frame-time shortfall are in VALIDATION.
 
-## Coupling (Cross-Material)
-- Sand-water: water flow applies drag to sand velocity; sand blocks LBM.
-- Fire-heat: heat drives ignition; fire adds heat.
-- Smoke buoyancy: heat field adds upward force in smoke velocity.
-- Water-fire: water dampens or extinguishes fire; optional steam generation.
-- All coupling done via explicit passes with resolution-aware sampling.
+Combustion, temperature diffusion and dissipation evolve after transport/projection.
+Reaction products use actual available fuel/oxidizer consumption. Temperature
+diffusion respects sealed corners and no-flux walls; its explicit timestep keeps
+nonnegative stencil weights or rejects an insufficient substep budget. Water suppresses heat/reaction with elapsed-time
+retention. Sand receives grid drag from water, and its rasterized occupancy blocks
+water/gas on the next tick. Rendering fields are derived, not authoritative mass.
 
-## Chunking on GPU
-- Tile size: 16x16.
-- tile_active updated by:
-  - input spawns
-  - any cell movement or solver output
-- Compute passes early-out if tile is inactive.
-- Optional future: compact active tiles into SSBO with atomic append to reduce dispatch cost.
+## Scheduling and rendering
 
-## Frame Pipeline (per frame)
-1. Update tile_active (input spawns, wake neighbors).
-2. Sand pass (Verlet + swept DDA + stress relaxation).
-3. Water LBM (collision + streaming).
-4. Smoke stable fluids (advect, project, vorticity, density).
-5. Fire RD + heat diffusion.
-6. Coupling passes (buoyancy, damping, ignition). Note: this introduces a one-frame lag for forces like buoyancy, which is acceptable and more stable.
-7. Render (materials + fire color + smoke density).
+Each tick runs spawn/erase, boundary masks, water, gas, sand, coupling and render
+extraction. Heavy solver work remains full-grid where globally coupled. Coupling
+runs directly over the gas grid: measured tile scheduling cost more than the work
+it skipped in idle, sparse and dense scenes, with identical resulting fields.
+The composite pass runs once per displayed frame.
+Bracket sizing uses native key press/repeat events rather than rendered-frame count.
+Brush/view selection and Escape use press callbacks, preserving short taps and
+event order. GLFW sticky mouse buttons retain a brief click until a simulation tick
+consumes it. Painting samples the current cursor; it does not reconstruct a path
+between samples.
+Uniform-location caches belong to the app and expire on program deletion.
+Unused cell-velocity outputs and their momentum accumulation are removed; FLIP,
+transport, drag and rendering consume the retained MAC-derived fields.
+Consumer-specific OpenGL barriers cover image, storage-buffer,
+texture sampling and CPU readback boundaries.
 
-## OpenGL Implementation Notes
-- Compute shaders with workgroup 16x16.
-- Ping-pong buffers per solver.
-- Use glMemoryBarrier after each pass:
-  - GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
-  - GL_SHADER_STORAGE_BARRIER_BIT as needed
-- Avoid CPU readbacks in the frame loop.
+## Verification and limitations
 
-## Performance Targets
-- Keep total passes minimal; no extra read/modify/write.
-- Prefer RG16F over RG32F unless precision issues appear.
-- Limit sand DDA steps per frame.
+Analytic GPU fixtures cover transfer moments, dense sums, pressure, walls, material
+stress/yield, integration, chemistry and lifecycle behavior. Replays require actual
+matter, conserved particle mass, ignition before extinction, obstacle contact and
+zero crossing. Count/mass repeat checks are separate from visual-field tolerance.
+GPU timestamps measure complete frames, including all simulation and rendering.
 
-## Milestones
-1. GPU infrastructure: textures, ping-pong, dispatch, render.
-2. Sand only (Verlet + DDA + stress).
-3. Water LBM full res.
-4. Smoke stable fluids at quarter res.
-5. Fire RD + heat diffusion.
-6. Coupling passes.
-7. Optimization pass: tile compaction, format tuning.
-
-## Risks
-- Bandwidth pressure from full-res LBM + full-res RD in same frame.
-- Conflict resolution cost for sand on GPU.
-- Parameter tuning for stability and look.
-- Gray-Scott F/k sensitivity: narrow stable region for flame-like patterns; budget tuning time before coupling to heat.
+The 44-test suite, repeated scenes and standalone shader-package checks pass.
+The follow-up benchmark narrowly misses 30 FPS; its correctness gates pass.
+Computer Use exercised brief input, brushes, erasing, diagnostic shortcuts,
+width resizing, close and relaunch after the original interactive waiver.
+Held-key timing, DPI transitions and sustained native stress remain unverified.
+Linux and MinGW packaging are build targets but have not been executed in
+this Windows validation environment. No release is published by this goal.

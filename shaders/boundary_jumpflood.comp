@@ -1,0 +1,52 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg32i, binding = 0) uniform readonly iimage2D srcSeedTex;
+layout(rg32i, binding = 1) uniform writeonly iimage2D dstSeedTex;
+
+uniform ivec2 gridSize;
+uniform int stepSize;
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool validSeed(ivec2 seed) {
+    return seed.x >= 0 && seed.y >= 0;
+}
+
+float seedDistanceSq(ivec2 coord, ivec2 seed) {
+    vec2 delta = vec2(coord - seed);
+    return dot(delta, delta);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    ivec2 best_seed = imageLoad(srcSeedTex, coord).xy;
+    float best_distance = validSeed(best_seed) ? seedDistanceSq(coord, best_seed) : 3.402823466e+38;
+
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 sample_coord = coord + ivec2(x, y) * stepSize;
+            if (!inBounds(sample_coord)) {
+                continue;
+            }
+            ivec2 candidate_seed = imageLoad(srcSeedTex, sample_coord).xy;
+            if (!validSeed(candidate_seed)) {
+                continue;
+            }
+            float candidate_distance = seedDistanceSq(coord, candidate_seed);
+            if (candidate_distance < best_distance) {
+                best_distance = candidate_distance;
+                best_seed = candidate_seed;
+            }
+        }
+    }
+
+    imageStore(dstSeedTex, coord, ivec4(best_seed, 0, 0));
+}

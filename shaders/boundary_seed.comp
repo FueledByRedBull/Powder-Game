@@ -1,0 +1,44 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
+layout(rg32i, binding = 1) uniform writeonly iimage2D boundarySeedTex;
+
+uniform ivec2 gridSize;
+
+bool inBounds(ivec2 coord) {
+    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+}
+
+bool occupied(ivec2 coord) {
+    return inBounds(coord) && imageLoad(boundaryMaskTex, coord).r != 0u;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (!inBounds(coord)) {
+        return;
+    }
+
+    bool inside = occupied(coord);
+    bool is_interface = false;
+    for (int y = -1; y <= 1 && !is_interface; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            ivec2 neighbor = coord + ivec2(x, y);
+            if (!inBounds(neighbor)) {
+                continue;
+            }
+            if (occupied(neighbor) != inside) {
+                is_interface = true;
+                break;
+            }
+        }
+    }
+
+    ivec2 seed = is_interface ? coord : ivec2(-1);
+    imageStore(boundarySeedTex, coord, ivec4(seed, 0, 0));
+}

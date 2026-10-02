@@ -1,0 +1,123 @@
+#version 430
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Vectors { vec4 vectors[]; };
+struct Partial { vec4 values; uvec4 bounds; };
+layout(std430, binding = 1) buffer Partials { Partial partials[]; };
+layout(std430, binding = 2) buffer Scalars {
+    float rho;
+    float alpha;
+    float beta;
+    float residualMax;
+    uint running;
+    uint invalidInput;
+    uint iterations;
+    uint padding;
+    uvec4 liquidBounds;
+};
+layout(std430, binding = 3) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform int cellCount;
+uniform int partialCount;
+uniform ivec2 gridSize;
+uniform ivec2 solveOrigin;
+uniform ivec2 solveSize;
+uniform float residualThreshold;
+// Initial partial/final (0/1), then final d*A*d (3), updated rho (5), block-initial rho (7).
+uniform int phase;
+shared vec4 totals[256];
+shared uvec4 bounds[256];
+
+bool invalid(float value) { return isnan(value) || isinf(value); }
+
+void main() {
+    if (phase >= 2 && running == 0u) return;
+    uint lane = gl_LocalInvocationID.x;
+    bool finalReduction = phase != 0;
+    vec4 total = vec4(0.0);
+    uvec4 extent = uvec4(uvec2(gridSize), uvec2(0));
+    if (finalReduction) {
+        for (uint i = lane; i < uint(partialCount); i += 256u) {
+            vec4 item = partials[i].values;
+            total.x += item.x;
+            total.yz = max(total.yz, item.yz);
+            if (phase == 1) {
+                extent.xy = min(extent.xy, partials[i].bounds.xy);
+                extent.zw = max(extent.zw, partials[i].bounds.zw);
+            }
+        }
+    } else {
+        uint invocation = gl_GlobalInvocationID.x;
+        if (invocation < uint(cellCount)) {
+            ivec2 cell = solveOrigin + ivec2(int(invocation) % solveSize.x, int(invocation) / solveSize.x);
+            uint index = uint(cell.y * gridSize.x + cell.x);
+            vec4 value = vectors[index];
+            if (any(isnan(value)) || any(isinf(value)) || value.w < 0.0) {
+                total.z = 1.0;
+            } else {
+                total.x = value.w > 0.0 ? value.x * value.z : 0.0;
+                total.y = abs(value.x);
+                if (phase == 0 && (value.w > 0.0 || value.x != 0.0)) extent = uvec4(cell, cell);
+            }
+        }
+    }
+    totals[lane] = total;
+    if (phase <= 1) bounds[lane] = extent;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            totals[lane].x += totals[lane + stride].x;
+            totals[lane].yz = max(totals[lane].yz, totals[lane + stride].yz);
+            if (phase <= 1) {
+                bounds[lane].xy = min(bounds[lane].xy, bounds[lane + stride].xy);
+                bounds[lane].zw = max(bounds[lane].zw, bounds[lane + stride].zw);
+            }
+        }
+        barrier();
+    }
+    if (lane != 0u) return;
+    total = totals[0];
+    if (!finalReduction) {
+        partials[gl_WorkGroupID.x].values = total;
+        if (phase == 0) partials[gl_WorkGroupID.x].bounds = bounds[0];
+        return;
+    }
+    if (phase == 1) {
+        rho = total.x;
+        alpha = beta = 0.0;
+        running = 1u;
+        invalidInput = iterations = padding = 0u;
+        liquidBounds = bounds[0];
+    }
+    if (phase == 7) rho = total.x;
+    bool nonfinite = total.z != 0.0 || invalid(total.x) || invalid(total.y);
+    if (phase == 5) ++iterations;
+    if (phase != 3) {
+        residualMax = total.y;
+        // Leave margin for the independent true-residual check after the solve.
+        if (!nonfinite && residualMax <= residualThreshold * 0.5) {
+            running = 0u;
+            return;
+        }
+    }
+    bool breakdown = nonfinite || total.x <= 0.0 || rho <= 0.0;
+    if (!breakdown && phase == 3) {
+        alpha = rho / total.x;
+        breakdown = invalid(alpha);
+    } else if (!breakdown && phase == 5) {
+        beta = total.x / rho;
+        rho = total.x;
+        breakdown = invalid(beta);
+    }
+    if (breakdown) {
+        running = 0u;
+        invalidInput = 1u;
+        atomicAdd(pressureNonconverged, 1u);
+        if (nonfinite || invalid(alpha) || invalid(beta)) atomicAdd(nanInfDetected, 1u);
+    }
+}

@@ -36,6 +36,9 @@ jobs:
           if (-not (Test-Path $shaderDir)) { throw "shaders directory not found next to executable" }
 
           Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
+          Get-Content (Join-Path $exe.Directory.FullName "runtime-dlls.txt") | Where-Object { $_ } | ForEach-Object {
+            Copy-Item -LiteralPath $_ -Destination $outDir -Force
+          }
           Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
 
           $readme = @(

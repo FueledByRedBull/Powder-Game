@@ -1,0 +1,176 @@
+#version 430
+
+layout(local_size_x = 256) in;
+layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 1) uniform image2D pressureTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
+
+// Per cell: residual, search direction, A*direction or preconditioned residual, diagonal of A=-L.
+layout(std430, binding = 0) buffer Vectors { vec4 vectors[]; };
+struct Partial { vec4 values; uvec4 bounds; };
+layout(std430, binding = 1) buffer Partials { Partial partials[]; };
+layout(std430, binding = 2) readonly buffer Scalars {
+    float rho;
+    float alpha;
+    float beta;
+    float residualMax;
+    uint running;
+    uint invalidInput;
+    uint iterations;
+    uint padding;
+    uvec4 liquidBounds;
+};
+
+uniform ivec2 gridSize;
+uniform ivec2 solveOrigin;
+uniform ivec2 solveSize;
+uniform float liquidPhiThreshold;
+uniform int phase;
+shared float work[768];
+
+bool invalid(float value) { return isnan(value) || isinf(value); }
+
+bool blocked(ivec2 cell) {
+    return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
+           imageLoad(boundaryTex, cell).r != 0u;
+}
+
+void reducePartial(vec4 total) {
+    uint lane = gl_LocalInvocationID.x;
+    work[lane] = total.x;
+    work[256u + lane] = total.y;
+    work[512u + lane] = total.z;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            work[lane] += work[lane + stride];
+            work[256u + lane] = max(work[256u + lane], work[256u + lane + stride]);
+            work[512u + lane] = max(work[512u + lane], work[512u + lane + stride]);
+        }
+        barrier();
+    }
+    if (lane == 0u) partials[gl_WorkGroupID.x].values = vec4(work[0], work[256], work[512], 0.0);
+}
+
+void precondition() {
+    uint lane = gl_LocalInvocationID.x;
+    uint tilesAcross = uint((solveSize.x + 15) / 16);
+    ivec2 tile = ivec2(int(gl_WorkGroupID.x % tilesAcross), int(gl_WorkGroupID.x / tilesAcross));
+    ivec2 localCell = ivec2(int(lane) % 16, int(lane) / 16);
+    ivec2 offset = tile * 16 + localCell;
+    ivec2 cell = solveOrigin + offset;
+    bool validCell = all(lessThan(offset, solveSize));
+    uint index = uint(cell.y * gridSize.x + cell.x);
+    vec4 value = validCell ? vectors[index] : vec4(0.0);
+    float inverseDiagonal = value.w > 0.0 ? 1.0 / value.w : 0.0;
+    float result = 0.0;
+    work[lane] = 0.0;
+    barrier();
+    // Fixed zero-initial sweeps keep this block inverse symmetric positive for PCG.
+    // Block edges impose zero correction; the global operator still connects the blocks.
+    for (int sweep = 0; sweep < 32; ++sweep) {
+        float neighbors = 0.0;
+        uint source = (sweep & 1) == 0 ? lane : 256u + lane;
+        if (localCell.x > 0) neighbors += work[source - 1u];
+        if (localCell.x < 15) neighbors += work[source + 1u];
+        if (localCell.y > 0) neighbors += work[source - 16u];
+        if (localCell.y < 15) neighbors += work[source + 16u];
+        result = result / 3.0 + (2.0 / 3.0) * inverseDiagonal * (value.x + neighbors);
+        work[(sweep & 1) == 0 ? 256u + lane : lane] = result;
+        barrier();
+    }
+    if (validCell) {
+        vectors[index].z = result;
+        if (phase == 5) vectors[index].y = result;
+    }
+    bool nonfinite = any(isnan(value)) || any(isinf(value)) || invalid(result) || value.w < 0.0;
+    reducePartial(nonfinite ? vec4(0.0, 0.0, 1.0, 0.0)
+                            : vec4(value.w > 0.0 ? value.x * result : 0.0, abs(value.x), 0.0, 0.0));
+}
+
+void main() {
+    if (phase >= 4) {
+        if (running != 0u) precondition();
+        return;
+    }
+    uint invocation = gl_GlobalInvocationID.x;
+    if (phase != 0 && running == 0u) return;
+    bool validCell = invocation < uint(solveSize.x * solveSize.y);
+    ivec2 cell = solveOrigin + ivec2(int(invocation) % solveSize.x, int(invocation) / solveSize.x);
+    uint index = uint(cell.y * gridSize.x + cell.x);
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+    if (phase == 1) {
+        vec4 value = validCell ? vectors[index] : vec4(0.0);
+        if (value.w > 0.0) {
+            float product = value.w * value.y;
+            for (int i = 0; i < 4; ++i) {
+                ivec2 neighbor = cell + offsets[i];
+                if (!blocked(neighbor)) product -= vectors[neighbor.y * gridSize.x + neighbor.x].y;
+            }
+            value.z = product;
+            vectors[index].z = product;
+        }
+        bool nonfinite = any(isnan(value)) || any(isinf(value)) || value.w < 0.0;
+        reducePartial(nonfinite ? vec4(0.0, 0.0, 1.0, 0.0)
+                                : vec4(value.y * value.z, abs(value.x), 0.0, 0.0));
+        return;
+    }
+    if (!validCell) return;
+    if (phase == 0) {
+        vectors[index] = vec4(0.0);
+        if (blocked(cell)) {
+            imageStore(pressureTex, cell, vec4(0.0));
+            return;
+        }
+        float phi = imageLoad(liquidPhiTex, cell).x;
+        if (invalid(phi)) {
+            imageStore(pressureTex, cell, vec4(0.0));
+            vectors[index].w = -1.0;
+            return;
+        }
+        if (phi >= liquidPhiThreshold) {
+            imageStore(pressureTex, cell, vec4(0.0));
+            return;
+        }
+        float rhs = -imageLoad(rhsTex, cell).x;
+        float pressure = imageLoad(pressureTex, cell).x;
+        if (invalid(rhs) || invalid(pressure)) {
+            imageStore(pressureTex, cell, vec4(0.0));
+            vectors[index].w = -1.0;
+            return;
+        }
+        float diagonal = 0.0;
+        float neighbor_sum = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 neighbor = cell + offsets[i];
+            if (blocked(neighbor)) continue;
+            diagonal += 1.0;
+            if (imageLoad(liquidPhiTex, neighbor).x < liquidPhiThreshold)
+                neighbor_sum += imageLoad(pressureTex, neighbor).x;
+        }
+        // Reuse the previous solution, but form b-Ap using today's liquid/solid mask.
+        float residual = rhs - (diagonal * pressure - neighbor_sum);
+        if (diagonal == 0.0) imageStore(pressureTex, cell, vec4(0.0));
+        float scaledResidual = diagonal > 0.0 ? residual / diagonal : 0.0;
+        vectors[index] = vec4(residual, scaledResidual, scaledResidual, diagonal);
+        return;
+    }
+
+    vec4 value = vectors[index];
+    if (value.w <= 0.0) return;
+    if (phase == 2) {
+        float pressure = imageLoad(pressureTex, cell).x + alpha * value.y;
+        float residual = value.x - alpha * value.z;
+        if (invalid(pressure) || invalid(residual)) {
+            // The reduction reports breakdown without allowing nonfinite pressure into projection.
+            vectors[index] = vec4(0.0, 0.0, 0.0, -1.0);
+            return;
+        }
+        imageStore(pressureTex, cell, vec4(pressure, 0.0, 0.0, 0.0));
+        vectors[index].x = residual;
+    } else {
+        vectors[index].y = value.z + beta * value.y;
+    }
+}

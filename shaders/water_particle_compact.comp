@@ -1,0 +1,41 @@
+#version 430
+
+layout(local_size_x = 256) in;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) readonly buffer WaterParticlesSrc {
+    WaterParticle srcParticles[];
+};
+
+layout(std430, binding = 1) buffer WaterParticlesDst {
+    WaterParticle dstParticles[];
+};
+
+layout(std430, binding = 2) buffer WaterSpawnCursor {
+    uint spawnCursor;
+};
+
+uniform int maxParticles;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+
+    WaterParticle particle = srcParticles[index];
+    if (particle.state1.x < 0.5) {
+        return;
+    }
+
+    uint dst_index = atomicAdd(spawnCursor, 1u);
+    if (dst_index >= uint(maxParticles)) {
+        return;
+    }
+    dstParticles[dst_index] = particle;
+}

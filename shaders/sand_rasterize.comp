@@ -1,0 +1,49 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform writeonly image2D sandOccupancyTex;
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+layout(std430, binding = 0) readonly buffer SandGridMass {
+    uint gridMass[];
+};
+
+uniform ivec2 gridSize;
+uniform float massScale;
+
+int linearIndex(ivec2 coord) {
+    return (coord.y + 1) * (gridSize.x + 2) + coord.x + 1;
+}
+
+bool invalid(float value) {
+    return isnan(value) || isinf(value);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+
+    int index = linearIndex(coord);
+    uint massAccum = gridMass[index];
+    if (massAccum == 0u) {
+        imageStore(sandOccupancyTex, coord, vec4(0.0));
+        return;
+    }
+
+    float occupancy = clamp(float(massAccum) / massScale, 0.0, 1.0);
+    if (invalid(occupancy)) {
+        atomicAdd(nanInfDetected, 1u);
+        occupancy = 0.0;
+    }
+
+    imageStore(sandOccupancyTex, coord, vec4(occupancy, 0.0, 0.0, 0.0));
+}

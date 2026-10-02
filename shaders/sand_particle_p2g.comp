@@ -1,0 +1,174 @@
+#version 430
+
+layout(local_size_x = 256) in;
+
+struct SandParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+    vec4 state3;
+};
+
+layout(std430, binding = 0) readonly buffer SandParticles {
+    SandParticle particles[];
+};
+
+layout(std430, binding = 1) buffer SandGridMass {
+    uint gridMass[];
+};
+
+layout(std430, binding = 2) buffer SandGridMomentumX {
+    ivec2 gridMomentumX[];
+};
+
+layout(std430, binding = 3) buffer SandGridMomentumY {
+    ivec2 gridMomentumY[];
+};
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform int maxParticles;
+uniform float massScale;
+uniform float velocityScale;
+uniform float dt;
+uniform float shearModulus;
+uniform float lameLambda;
+
+bool validCell(ivec2 coord) {
+    // Retain the full material stencil. Grid contact supplies the obstacle reaction.
+    return all(greaterThanEqual(coord, ivec2(-1))) && all(lessThanEqual(coord, gridSize));
+}
+
+int linearIndex(ivec2 coord) {
+    return (coord.y + 1) * (gridSize.x + 2) + coord.x + 1;
+}
+
+void quadraticWeights(float x, out vec3 w) {
+    float d0 = 1.5 - x;
+    float d1 = x - 1.0;
+    float d2 = x - 0.5;
+    w.x = 0.5 * d0 * d0;
+    w.y = 0.75 - d1 * d1;
+    w.z = 0.5 * d2 * d2;
+}
+
+bool invalid(vec2 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
+
+bool principalStretch(mat2 deformation, out mat2 left, out vec2 stretch) {
+    float volume = determinant(deformation);
+    vec2 rotation = vec2(deformation[0][0] + deformation[1][1], deformation[0][1] - deformation[1][0]);
+    float rotationLength = length(rotation);
+    if (!(volume > 0.0) || isinf(volume) || !(rotationLength > 0.0) || isinf(rotationLength)) return false;
+    rotation /= rotationLength;
+    mat2 polar = mat2(rotation, vec2(-rotation.y, rotation.x));
+    mat2 symmetric = transpose(polar) * deformation;
+    vec2 difference = vec2(symmetric[0][0] - symmetric[1][1], symmetric[0][1] + symmetric[1][0]);
+    float radius = length(difference);
+    float angle = radius > 0.0 ? 0.5 * atan(difference.y, difference.x) : 0.0;
+    vec2 axis = vec2(cos(angle), sin(angle));
+    left = polar * mat2(axis, vec2(-axis.y, axis.x));
+    stretch.x = 0.5 * (symmetric[0][0] + symmetric[1][1] + radius);
+    stretch.y = volume / stretch.x;
+    return !invalid(stretch) && all(greaterThan(stretch, vec2(0.0)));
+}
+
+int signedCarry(int previous, int delta) {
+    if (delta > 0 && previous > 2147483647 - delta) return 1;
+    if (delta < 0 && previous < (-2147483647 - 1) - delta) return -1;
+    return 0;
+}
+
+void depositCell(ivec2 cell, float weight, vec2 momentum, float mass) {
+    if (weight <= 0.0 || !validCell(cell)) {
+        return;
+    }
+
+    int index = linearIndex(cell);
+    float weightedMass = weight * mass;
+    uint count = uint(round(weightedMass * massScale));
+    if (atomicAdd(gridMass[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    ivec2 delta = ivec2(round(momentum * velocityScale));
+    int carryX = signedCarry(atomicAdd(gridMomentumX[index].x, delta.x), delta.x);
+    int carryY = signedCarry(atomicAdd(gridMomentumY[index].x, delta.y), delta.y);
+    if (carryX != 0) atomicAdd(gridMomentumX[index].y, carryX);
+    if (carryY != 0) atomicAdd(gridMomentumY[index].y, carryY);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+
+    SandParticle particle = particles[index];
+    if (isnan(particle.state1.x) || isinf(particle.state1.x)) {
+        atomicAdd(nanInfDetected, 1u);
+        return;
+    }
+    if (particle.state1.x < 0.5) {
+        return;
+    }
+
+    vec2 position = particle.state0.xy;
+    vec2 velocity = particle.state0.zw;
+    float mass = particle.state1.y;
+    mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
+    float restArea = particle.state2.z;
+    if (invalid(position) || invalid(velocity) || invalid(affine[0]) || invalid(affine[1]) ||
+        isnan(mass) || isinf(mass) || mass <= 0.0 ||
+        any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, vec2(gridSize)))) {
+        atomicAdd(nanInfDetected, 1u);
+        return;
+    }
+    mat2 stress = mat2(0.0);
+    if (dt > 0.0) {
+        mat2 left;
+        vec2 stretch;
+        mat2 deformation = mat2(particle.state3.xy, particle.state3.zw);
+        if (invalid(deformation[0]) || invalid(deformation[1]) || !(restArea > 0.0) || isinf(restArea) ||
+            !principalStretch(deformation, left, stretch)) {
+            atomicAdd(nanInfDetected, 1u);
+            return;
+        }
+        vec2 strain = log(stretch);
+        vec2 principalStress = 2.0 * shearModulus * strain + lameLambda * (strain.x + strain.y);
+        stress = left * mat2(principalStress.x, 0.0, 0.0, principalStress.y) * transpose(left);
+    }
+    vec2 maxMomentum = ((abs(velocity) + 1.5 * (abs(affine[0]) + abs(affine[1]))) * mass +
+                        dt * restArea * (abs(stress[0]) + abs(stress[1]))) * velocityScale;
+    if (invalid(maxMomentum) || any(greaterThan(maxMomentum, vec2(2147483520.0))) ||
+        mass * massScale > 4294967040.0) {
+        atomicAdd(particleOverflowBlocked, 1u);
+        return;
+    }
+
+    vec2 samplePos = position - vec2(0.5);
+    ivec2 base = ivec2(floor(samplePos - vec2(0.5)));
+    vec2 fx = samplePos - vec2(base);
+    vec3 wx;
+    vec3 wy;
+    quadraticWeights(fx.x, wx);
+    quadraticWeights(fx.y, wy);
+    vec3 dx = vec3(fx.x - 1.5, -2.0 * (fx.x - 1.0), fx.x - 0.5);
+    vec3 dy = vec3(fx.y - 1.5, -2.0 * (fx.y - 1.0), fx.y - 0.5);
+
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            ivec2 cell = base + ivec2(i, j);
+            vec2 cellCenter = vec2(cell) + vec2(0.5);
+            vec2 apicVelocity = velocity + affine * (cellCenter - position);
+            float weight = wx[i] * wy[j];
+            vec2 gradient = vec2(dx[i] * wy[j], wx[i] * dy[j]);
+            vec2 momentum = weight * mass * apicVelocity - dt * restArea * stress * gradient;
+            depositCell(cell, weight, momentum, mass);
+        }
+    }
+}

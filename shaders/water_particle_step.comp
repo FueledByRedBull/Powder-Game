@@ -1,0 +1,323 @@
+#version 430
+
+layout(local_size_x = 256) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
+layout(r16f, binding = 1) uniform readonly image2D waterUPrevTex;
+layout(r16f, binding = 2) uniform readonly image2D waterVPrevTex;
+layout(r16f, binding = 3) uniform readonly image2D waterUTex;
+layout(r16f, binding = 4) uniform readonly image2D waterVTex;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+layout(std430, binding = 1) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform float dt;
+uniform float velocityDamping;
+uniform float maxVelocity;
+uniform float flipBlend;
+uniform int maxParticles;
+
+bool blockedCell(ivec2 cell) {
+    return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
+           imageLoad(boundaryMaskTex, cell).x != 0u;
+}
+
+float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
+    float hitTime = 1.0;
+    hitNormal = vec2(0.0);
+    for (int axis = 0; axis < 2; ++axis) {
+        if (displacement[axis] == 0.0) {
+            continue;
+        }
+        float edge = displacement[axis] > 0.0 ? float(gridSize[axis]) - 0.5 : 0.5;
+        float time = (edge - position[axis]) / displacement[axis];
+        if (time <= hitTime) {
+            if (time < hitTime) {
+                hitNormal = vec2(0.0);
+            }
+            hitNormal[axis] = -sign(displacement[axis]);
+            hitTime = time;
+        }
+    }
+
+    ivec2 cell = ivec2(floor(position));
+    ivec2 direction = ivec2(sign(displacement));
+    vec2 nextCross = vec2(1e30);
+    for (int axis = 0; axis < 2; ++axis) {
+        if (direction[axis] != 0) {
+            float edge = float(cell[axis] + (direction[axis] > 0 ? 1 : 0));
+            nextCross[axis] = (edge - position[axis]) / displacement[axis];
+        }
+    }
+
+    // Traverse occupied cells directly; distance estimates are not a safe step length.
+    for (int crossing = 0; crossing < gridSize.x + gridSize.y + 2; ++crossing) {
+        float time = min(nextCross.x, nextCross.y);
+        if (time > hitTime) {
+            break;
+        }
+        bvec2 crossed = lessThanEqual(nextCross, nextCross.yx);
+        ivec2 target = cell + ivec2(crossed.x ? direction.x : 0, crossed.y ? direction.y : 0);
+        vec2 normal = vec2(0.0);
+        if (crossed.x && blockedCell(cell + ivec2(direction.x, 0))) {
+            normal.x = -float(direction.x);
+        }
+        if (crossed.y && blockedCell(cell + ivec2(0, direction.y))) {
+            normal.y = -float(direction.y);
+        }
+        if (all(equal(normal, vec2(0.0))) && blockedCell(target)) {
+            normal = vec2(crossed.x ? -float(direction.x) : 0.0,
+                          crossed.y ? -float(direction.y) : 0.0);
+        }
+        if (any(notEqual(normal, vec2(0.0)))) {
+            hitNormal = normal + (time == hitTime ? hitNormal : vec2(0.0));
+            return time;
+        }
+        cell = target;
+        // Refer to the original segment instead of accumulating roundoff over a long sweep.
+        for (int axis = 0; axis < 2; ++axis) {
+            if (crossed[axis]) {
+                float edge = float(cell[axis] + (direction[axis] > 0 ? 1 : 0));
+                nextCross[axis] = (edge - position[axis]) / displacement[axis];
+            }
+        }
+    }
+    return hitTime;
+}
+
+void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 affine,
+                        vec2 displacement, float bounce) {
+    position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
+    // A particle already inside painted geometry waits for the brush's explicit clearing.
+    if (blockedCell(ivec2(floor(position)))) {
+        velocity = vec2(0.0);
+        affine = mat2(0.0);
+        return;
+    }
+
+    // Each contact removes one inward displacement component; the remaining tangent is swept again.
+    for (int contact = 0; contact < 2; ++contact) {
+        vec2 normal;
+        float time = sweepGrid(position, displacement, normal);
+        position += displacement * time;
+        if (all(equal(normal, vec2(0.0)))) {
+            return;
+        }
+        position += normal * 0.0001;
+        displacement *= 1.0 - time;
+        for (int axis = 0; axis < 2; ++axis) {
+            if (normal[axis] != 0.0) {
+                displacement[axis] = 0.0;
+                if (velocity[axis] * normal[axis] < 0.0) {
+                    velocity[axis] *= -bounce;
+                }
+                affine[0][axis] = 0.0;
+                affine[1][axis] = 0.0;
+            }
+        }
+    }
+}
+
+float sampleUPrev(ivec2 coord) {
+    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x, gridSize.y - 1));
+    return imageLoad(waterUPrevTex, clamped).x;
+}
+
+float sampleVPrev(ivec2 coord) {
+    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x - 1, gridSize.y));
+    return imageLoad(waterVPrevTex, clamped).x;
+}
+
+float sampleUCurrent(ivec2 coord) {
+    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x, gridSize.y - 1));
+    return imageLoad(waterUTex, clamped).x;
+}
+
+float sampleVCurrent(ivec2 coord) {
+    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x - 1, gridSize.y));
+    return imageLoad(waterVTex, clamped).x;
+}
+
+float bilerpUCurrent(vec2 position) {
+    vec2 face_pos = clamp(vec2(position.x, position.y - 0.5), vec2(0.0), vec2(gridSize.x, gridSize.y - 1.0));
+    ivec2 base = ivec2(floor(face_pos));
+    vec2 frac = fract(face_pos);
+
+    float v00 = sampleUCurrent(base);
+    float v10 = sampleUCurrent(base + ivec2(1, 0));
+    float v01 = sampleUCurrent(base + ivec2(0, 1));
+    float v11 = sampleUCurrent(base + ivec2(1, 1));
+
+    float vx0 = mix(v00, v10, frac.x);
+    float vx1 = mix(v01, v11, frac.x);
+    return mix(vx0, vx1, frac.y);
+}
+
+float bilerpVCurrent(vec2 position) {
+    vec2 face_pos = clamp(vec2(position.x - 0.5, position.y), vec2(0.0), vec2(gridSize.x - 1.0, gridSize.y));
+    ivec2 base = ivec2(floor(face_pos));
+    vec2 frac = fract(face_pos);
+
+    float v00 = sampleVCurrent(base);
+    float v10 = sampleVCurrent(base + ivec2(1, 0));
+    float v01 = sampleVCurrent(base + ivec2(0, 1));
+    float v11 = sampleVCurrent(base + ivec2(1, 1));
+
+    float vx0 = mix(v00, v10, frac.x);
+    float vx1 = mix(v01, v11, frac.x);
+    return mix(vx0, vx1, frac.y);
+}
+
+vec2 sampleProjectedGridVelocity(vec2 position) {
+    return vec2(bilerpUCurrent(position), bilerpVCurrent(position));
+}
+
+void quadraticWeights(float x, out vec3 w) {
+    float d0 = 1.5 - x;
+    float d1 = x - 1.0;
+    float d2 = x - 0.5;
+    w.x = 0.5 * d0 * d0;
+    w.y = 0.75 - d1 * d1;
+    w.z = 0.5 * d2 * d2;
+}
+
+mat2 gatherGridVelocity(vec2 position, out vec2 currentVelocity, out vec2 previousVelocity) {
+    currentVelocity = vec2(0.0);
+    previousVelocity = vec2(0.0);
+    float cxx = 0.0;
+    float cxy = 0.0;
+    float cyx = 0.0;
+    float cyy = 0.0;
+
+    vec2 uSample = position - vec2(0.0, 0.5);
+    ivec2 uBase = ivec2(floor(uSample - vec2(0.5)));
+    vec2 uFx = uSample - vec2(uBase);
+    vec3 uWx;
+    vec3 uWy;
+    quadraticWeights(uFx.x, uWx);
+    quadraticWeights(uFx.y, uWy);
+    // Extend edge velocities by clamped sampling so the kernel keeps its full support.
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            ivec2 face = uBase + ivec2(i, j);
+            float weight = uWx[i] * uWy[j];
+            float value = sampleUCurrent(face);
+            currentVelocity.x += weight * value;
+            previousVelocity.x += weight * sampleUPrev(face);
+            vec2 facePos = vec2(float(face.x), float(face.y) + 0.5);
+            vec2 delta = facePos - position;
+            cxx += 4.0 * weight * value * delta.x;
+            cxy += 4.0 * weight * value * delta.y;
+        }
+    }
+
+    vec2 vSample = position - vec2(0.5, 0.0);
+    ivec2 vBase = ivec2(floor(vSample - vec2(0.5)));
+    vec2 vFx = vSample - vec2(vBase);
+    vec3 vWx;
+    vec3 vWy;
+    quadraticWeights(vFx.x, vWx);
+    quadraticWeights(vFx.y, vWy);
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            ivec2 face = vBase + ivec2(i, j);
+            float weight = vWx[i] * vWy[j];
+            float value = sampleVCurrent(face);
+            currentVelocity.y += weight * value;
+            previousVelocity.y += weight * sampleVPrev(face);
+            vec2 facePos = vec2(float(face.x) + 0.5, float(face.y));
+            vec2 delta = facePos - position;
+            cyx += 4.0 * weight * value * delta.x;
+            cyy += 4.0 * weight * value * delta.y;
+        }
+    }
+
+    return mat2(vec2(cxx, cyx), vec2(cxy, cyy));
+}
+
+bool invalidFloat(float value) {
+    return isnan(value) || isinf(value);
+}
+
+bool invalidVec2(vec2 value) {
+    return invalidFloat(value.x) || invalidFloat(value.y);
+}
+
+bool invalidMat2(mat2 value) {
+    return invalidVec2(value[0]) || invalidVec2(value[1]);
+}
+
+vec2 cappedVelocity(vec2 value) {
+    float speed = length(value);
+    return speed > maxVelocity && speed > 0.0 ? value * (maxVelocity / speed) : value;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+
+    WaterParticle particle = particles[index];
+    if (particle.state1.x < 0.5) {
+        return;
+    }
+
+    vec2 position = particle.state0.xy;
+    vec2 velocity = particle.state0.zw;
+    mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
+    if (invalidVec2(position) || invalidVec2(velocity) || invalidMat2(affine)) {
+        atomicAdd(nanInfDetected, 1u);
+        particle.state1.x = 0.0;
+        particles[index] = particle;
+        return;
+    }
+    vec2 pic_velocity;
+    vec2 prev_grid_velocity;
+    affine = gatherGridVelocity(position, pic_velocity, prev_grid_velocity);
+    vec2 flip_velocity = velocity + (pic_velocity - prev_grid_velocity);
+    velocity = mix(pic_velocity, flip_velocity, clamp(flipBlend, 0.0, 1.0));
+
+    // The configured factor is per 1/120 second, matching the original default substep.
+    velocity = cappedVelocity(velocity * pow(velocityDamping, 120.0 * dt));
+
+    if (invalidVec2(velocity) || invalidMat2(affine)) {
+        atomicAdd(nanInfDetected, 1u);
+        particle.state1.x = 0.0;
+        particles[index] = particle;
+        return;
+    }
+
+    vec2 advect_v0 = cappedVelocity(sampleProjectedGridVelocity(position));
+    vec2 mid_position = position + advect_v0 * (0.5 * dt);
+    vec2 advect_v1 = cappedVelocity(sampleProjectedGridVelocity(mid_position));
+    vec2 next_position = position + advect_v1 * dt;
+    if (invalidVec2(next_position) || invalidVec2(advect_v0) || invalidVec2(advect_v1)) {
+        atomicAdd(nanInfDetected, 1u);
+        particle.state1.x = 0.0;
+        particles[index] = particle;
+        return;
+    }
+
+    moveWithCollisions(position, velocity, affine, next_position - position, 0.0);
+
+    particle.state0 = vec4(position, velocity);
+    particle.state1.zw = vec2(affine[0][0], affine[0][1]);
+    particle.state2.xy = vec2(affine[1][0], affine[1][1]);
+    particles[index] = particle;
+}

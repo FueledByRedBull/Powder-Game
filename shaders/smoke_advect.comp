@@ -2,123 +2,170 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D smokeVelSrc;
-layout(r8, binding = 1) uniform readonly image2D smokeDenSrc;
-layout(r16f, binding = 2) uniform readonly image2D heatTex;
+layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;
+layout(r16f, binding = 1) uniform readonly image2D smokeDenSrc;
+layout(r16f, binding = 2) uniform readonly image2D temperatureSrc;
+layout(r16f, binding = 3) uniform readonly image2D fuelSrc;
+layout(r16f, binding = 4) uniform readonly image2D oxidizerSrc;
+layout(rg16f, binding = 5) uniform readonly image2D reactionSrc;
+layout(r16f, binding = 6) uniform writeonly image2D smokeDenDst;
+layout(r16f, binding = 7) uniform writeonly image2D temperatureDst;
+layout(r16f, binding = 8) uniform writeonly image2D fuelDst;
+layout(r16f, binding = 9) uniform writeonly image2D oxidizerDst;
+layout(rg16f, binding = 10) uniform writeonly image2D reactionDst;
+layout(r8ui, binding = 11) uniform readonly uimage2D boundaryTex;
 
-layout(rg16f, binding = 3) uniform writeonly image2D smokeVelDst;
-layout(r8, binding = 4) uniform writeonly image2D smokeDenDst;
-layout(r8ui, binding = 5) uniform readonly uimage2D tileActiveTex;
-
-layout(std430, binding = 12) readonly buffer ActiveTileList {
-    uint activeTiles[];
-};
-
-layout(std430, binding = 13) readonly buffer ActiveTileCounter {
-    uint activeTileCount;
-};
-
-uniform ivec2 smokeSize;
-uniform ivec2 heatSize;
-uniform ivec2 tileSize;
+uniform ivec2 gasSize;
 uniform float dt;
-uniform float velocityDissipation;
-uniform float densityDissipation;
-uniform float buoyancy;
+uniform float maxVelocity;
 
-ivec2 clampSmoke(ivec2 coord) {
-    return clamp(coord, ivec2(0), smokeSize - ivec2(1));
+ivec2 clampCoord(ivec2 coord) {
+    return clamp(coord, ivec2(0), gasSize - ivec2(1));
 }
 
-ivec2 clampHeat(ivec2 coord) {
-    return clamp(coord, ivec2(0), heatSize - ivec2(1));
+bool blocked(ivec2 coord) {
+    return imageLoad(boundaryTex, clampCoord(coord)).r != 0u;
 }
 
-vec2 sampleVel(ivec2 coord) {
-    return imageLoad(smokeVelSrc, clampSmoke(coord)).xy;
+bool blockedCell(ivec2 cell) {
+    return cell.x < 0 || cell.y < 0 || cell.x >= gasSize.x || cell.y >= gasSize.y ||
+           imageLoad(boundaryTex, cell).r != 0u;
 }
 
-float sampleDen(ivec2 coord) {
-    return imageLoad(smokeDenSrc, clampSmoke(coord)).x;
-}
+struct TransportStencil {
+    ivec2 cells[4];
+    vec4 weights;
+};
 
-vec2 bilerpVel(vec2 position) {
-    vec2 cell = clamp(position - vec2(0.5), vec2(0.0), vec2(smokeSize) - vec2(1.0));
-    ivec2 p0 = ivec2(floor(cell));
-    ivec2 p1 = clampSmoke(p0 + ivec2(1, 0));
-    ivec2 p2 = clampSmoke(p0 + ivec2(0, 1));
-    ivec2 p3 = clampSmoke(p0 + ivec2(1, 1));
-
-    vec2 t = fract(cell);
-    vec2 a = mix(sampleVel(p0), sampleVel(p1), t.x);
-    vec2 b = mix(sampleVel(p2), sampleVel(p3), t.x);
-    return mix(a, b, t.y);
-}
-
-float bilerpDen(vec2 position) {
-    vec2 cell = clamp(position - vec2(0.5), vec2(0.0), vec2(smokeSize) - vec2(1.0));
-    ivec2 p0 = ivec2(floor(cell));
-    ivec2 p1 = clampSmoke(p0 + ivec2(1, 0));
-    ivec2 p2 = clampSmoke(p0 + ivec2(0, 1));
-    ivec2 p3 = clampSmoke(p0 + ivec2(1, 1));
-
-    vec2 t = fract(cell);
-    float a = mix(sampleDen(p0), sampleDen(p1), t.x);
-    float b = mix(sampleDen(p2), sampleDen(p3), t.x);
-    return mix(a, b, t.y);
-}
-
-float sampleHeat(vec2 smokeUv) {
-    ivec2 heat_coord = clampHeat(ivec2(smokeUv * vec2(heatSize)));
-    return imageLoad(heatTex, heat_coord).x;
-}
-
-bool tileActive(ivec2 coord) {
-    ivec2 full_coord = coord * 4 + ivec2(2);
-    ivec2 tile = clamp(full_coord / 16, ivec2(0), tileSize - ivec2(1));
-    return imageLoad(tileActiveTex, tile).r != 0u;
-}
-
-ivec2 dispatchCoord() {
-    uint group = gl_WorkGroupID.x;
-    if (group >= activeTileCount) {
-        return ivec2(-1);
+// Traverse crossed cells, stopping before a solid face or a sealed diagonal corner.
+vec2 clipTrace(vec2 start, vec2 end) {
+    vec2 delta = end - start;
+    ivec2 cell = ivec2(floor(start));
+    ivec2 direction = ivec2(sign(delta));
+    vec2 interval = 1.0 / max(abs(delta), vec2(1e-20));
+    vec2 nextEdge = vec2(delta.x >= 0.0 ? float(cell.x + 1) - start.x : start.x - float(cell.x),
+                         delta.y >= 0.0 ? float(cell.y + 1) - start.y : start.y - float(cell.y)) * interval;
+    for (int crossing = 0; crossing < gasSize.x + gasSize.y + 2; ++crossing) {
+        float t = min(nextEdge.x, nextEdge.y);
+        if (t > 1.0) return end;
+        bool crossX = nextEdge.x <= nextEdge.y;
+        bool crossY = nextEdge.y <= nextEdge.x;
+        ivec2 nextCell = cell + ivec2(crossX ? direction.x : 0, crossY ? direction.y : 0);
+        if ((crossX && blockedCell(cell + ivec2(direction.x, 0))) ||
+            (crossY && blockedCell(cell + ivec2(0, direction.y))) || blockedCell(nextCell)) {
+            float margin = 0.001 / max(max(abs(delta.x), abs(delta.y)), 1.0);
+            return start + delta * max(0.0, t - margin);
+        }
+        cell = nextCell;
+        nextEdge += vec2(crossX ? interval.x : 0.0, crossY ? interval.y : 0.0);
     }
-    uint packed_tile = activeTiles[group];
-    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
-    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (coord.x >= smokeSize.x || coord.y >= smokeSize.y) {
-        return ivec2(-1);
+    return start;
+}
+
+bool donorOpen(ivec2 cell, int component) {
+    if (blockedCell(cell)) return false;
+    if (component == 0) return !blockedCell(cell - ivec2(1, 0));
+    if (component == 1) return !blockedCell(cell - ivec2(0, 1));
+    return true;
+}
+
+TransportStencil transportStencil(vec2 start, vec2 end, vec2 offset, ivec2 maximum, int component) {
+    vec2 point = clipTrace(start, end);
+    vec2 samplePoint = clamp(point - offset, vec2(0.0), vec2(maximum));
+    ivec2 base = ivec2(floor(samplePoint));
+    vec2 fraction = fract(samplePoint);
+    TransportStencil stencil;
+    stencil.weights = vec4((1.0 - fraction.x) * (1.0 - fraction.y), fraction.x * (1.0 - fraction.y),
+                           (1.0 - fraction.x) * fraction.y, fraction.x * fraction.y);
+    for (int i = 0; i < 4; ++i) {
+        stencil.cells[i] = clamp(base + ivec2(i & 1, i >> 1), ivec2(0), maximum);
+        vec2 donor = vec2(stencil.cells[i]) + offset;
+        if (stencil.weights[i] > 0.0 &&
+            (!donorOpen(stencil.cells[i], component) || any(notEqual(clipTrace(point, donor), donor)))) {
+            stencil.weights[i] = 0.0;
+        }
     }
-    return coord;
+    float total = dot(stencil.weights, vec4(1.0));
+    if (total > 0.0) {
+        stencil.weights /= total;
+    } else {
+        // A clipped characteristic with no admissible donor retains its local source value.
+        for (int i = 0; i < 4; ++i) stencil.cells[i] = clamp(ivec2(start - offset), ivec2(0), maximum);
+        stencil.weights = vec4(1.0, 0.0, 0.0, 0.0);
+    }
+    return stencil;
+}
+
+vec2 sampleVelocity(vec2 position) {
+    vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
+    ivec2 base = ivec2(floor(p));
+    vec2 frac = fract(p);
+    vec2 v00 = imageLoad(gasVelocityTex, base).xy;
+    vec2 v10 = imageLoad(gasVelocityTex, clampCoord(base + ivec2(1, 0))).xy;
+    vec2 v01 = imageLoad(gasVelocityTex, clampCoord(base + ivec2(0, 1))).xy;
+    vec2 v11 = imageLoad(gasVelocityTex, clampCoord(base + ivec2(1, 1))).xy;
+    return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
+}
+
+float sampleSmoke(TransportStencil stencil) {
+    vec4 values;
+    for (int i = 0; i < 4; ++i) values[i] = imageLoad(smokeDenSrc, stencil.cells[i]).x;
+    return dot(stencil.weights, values);
+}
+
+float sampleTemperature(TransportStencil stencil) {
+    vec4 values;
+    for (int i = 0; i < 4; ++i) values[i] = imageLoad(temperatureSrc, stencil.cells[i]).x;
+    return dot(stencil.weights, values);
+}
+
+float sampleFuel(TransportStencil stencil) {
+    vec4 values;
+    for (int i = 0; i < 4; ++i) values[i] = imageLoad(fuelSrc, stencil.cells[i]).x;
+    return dot(stencil.weights, values);
+}
+
+float sampleOxidizer(TransportStencil stencil) {
+    vec4 values;
+    for (int i = 0; i < 4; ++i) values[i] = imageLoad(oxidizerSrc, stencil.cells[i]).x;
+    return dot(stencil.weights, values);
+}
+
+vec2 sampleReaction(TransportStencil stencil) {
+    vec2 value = vec2(0.0);
+    for (int i = 0; i < 4; ++i) value += stencil.weights[i] * imageLoad(reactionSrc, stencil.cells[i]).xy;
+    return value;
 }
 
 void main() {
-    ivec2 coord = dispatchCoord();
-    if (coord.x < 0) {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gasSize.x || coord.y >= gasSize.y) {
         return;
     }
-    if (!tileActive(coord)) {
-        imageStore(smokeVelDst, coord, imageLoad(smokeVelSrc, coord));
-        imageStore(smokeDenDst, coord, imageLoad(smokeDenSrc, coord));
+    if (blocked(coord)) {
+        imageStore(smokeDenDst, coord, vec4(0.0));
+        imageStore(temperatureDst, coord, vec4(0.0));
+        imageStore(fuelDst, coord, vec4(0.0));
+        imageStore(oxidizerDst, coord, vec4(0.0));
+        imageStore(reactionDst, coord, vec4(0.0));
         return;
     }
 
     vec2 center = vec2(coord) + vec2(0.5);
-    vec2 velocity = imageLoad(smokeVelSrc, coord).xy;
-    vec2 backtrace = center - velocity * dt;
-    backtrace = clamp(backtrace, vec2(0.5), vec2(smokeSize) - vec2(0.5));
+    vec2 backtrace = clamp(center - sampleVelocity(center) * dt, vec2(0.5), vec2(gasSize) - vec2(0.5));
 
-    vec2 advected_velocity = bilerpVel(backtrace);
-    float advected_density = bilerpDen(backtrace);
+    TransportStencil backStencil = transportStencil(center, backtrace, vec2(0.5), gasSize - ivec2(1), -1);
 
-    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(smokeSize);
-    float local_heat = sampleHeat(uv);
-
-    advected_velocity.y += buoyancy * max(local_heat - 0.1, 0.0) * dt;
-    advected_velocity *= velocityDissipation;
-    advected_density = clamp(advected_density * densityDissipation, 0.0, 1.0);
-
-    imageStore(smokeVelDst, coord, vec4(advected_velocity, 0.0, 0.0));
-    imageStore(smokeDenDst, coord, vec4(advected_density, 0.0, 0.0, 0.0));
+    imageStore(smokeDenDst, coord, vec4(clamp(sampleSmoke(backStencil), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(temperatureDst,
+               coord,
+               vec4(clamp(sampleTemperature(backStencil), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(fuelDst, coord, vec4(clamp(sampleFuel(backStencil), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(oxidizerDst,
+               coord,
+               vec4(clamp(sampleOxidizer(backStencil), 0.0, 1.0), 0.0, 0.0, 0.0));
+    vec2 reaction = sampleReaction(backStencil);
+    reaction.x = 0.0;
+    reaction.y = clamp(reaction.y, 0.0, 1.0);
+    imageStore(reactionDst, coord, vec4(reaction, 0.0, 0.0));
 }

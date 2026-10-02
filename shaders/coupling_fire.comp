@@ -2,80 +2,48 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
-layout(r16f, binding = 1) uniform readonly image2D waterPressureTex;
-layout(r16f, binding = 2) uniform readonly image2D heatTex;
-layout(rg16f, binding = 3) uniform image2D fireTex;
-layout(r8ui, binding = 4) uniform readonly uimage2D tileActiveTex;
-
-layout(std430, binding = 12) readonly buffer ActiveTileList {
-    uint activeTiles[];
-};
-
-layout(std430, binding = 13) readonly buffer ActiveTileCounter {
-    uint activeTileCount;
-};
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 1) uniform readonly image2D waterAmountTex;
+layout(r16f, binding = 2) uniform readonly image2D temperatureTex;
+layout(rg16f, binding = 3) uniform image2D combustionTex;
+layout(r16f, binding = 4) uniform image2D oxidizerTex;
+layout(r16f, binding = 5) uniform image2D fuelTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 heatSize;
-uniform ivec2 tileSize;
 uniform float dt;
+uniform float waterCooling;
 
-float sampleHeat(ivec2 full_coord) {
-    vec2 uv = (vec2(full_coord) + vec2(0.5)) / vec2(gridSize);
-    ivec2 heat_coord = clamp(ivec2(uv * vec2(heatSize)), ivec2(0), heatSize - ivec2(1));
-    return imageLoad(heatTex, heat_coord).x;
-}
-
-bool tileActive(ivec2 coord) {
-    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
-    return imageLoad(tileActiveTex, tile).r != 0u;
-}
-
-ivec2 dispatchCoord() {
-    uint group = gl_WorkGroupID.x;
-    if (group >= activeTileCount) {
-        return ivec2(-1);
-    }
-    uint packed_tile = activeTiles[group];
-    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
-    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
-        return ivec2(-1);
-    }
-    return coord;
+float sampleWater(ivec2 gas_coord) {
+    ivec2 full = clamp(gas_coord * 2, ivec2(0), gridSize - ivec2(2));
+    return 0.25 * (imageLoad(waterAmountTex, full).x + imageLoad(waterAmountTex, full + ivec2(1, 0)).x +
+                   imageLoad(waterAmountTex, full + ivec2(0, 1)).x + imageLoad(waterAmountTex, full + ivec2(1, 1)).x);
 }
 
 void main() {
-    ivec2 coord = dispatchCoord();
-    if (coord.x < 0) {
-        return;
-    }
-    if (!tileActive(coord)) {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, heatSize))) {
         return;
     }
 
-    uint material = imageLoad(materialTex, coord).r;
-    float water = abs(imageLoad(waterPressureTex, coord).x);
-    float heat = sampleHeat(coord);
+    float water = sampleWater(coord);
+    vec2 combustion = imageLoad(combustionTex, coord).xy;
+    float oxidizer = imageLoad(oxidizerTex, coord).x;
+    float fuel = imageLoad(fuelTex, coord).x;
 
-    vec2 fire = imageLoad(fireTex, coord).xy;
-
-    float ignition = smoothstep(0.42, 0.78, heat);
-    if (material == 2u) {
-        ignition *= 0.2;
-    } else if (material == 0u) {
-        ignition *= 0.6;
+    if (imageLoad(boundaryTex, coord).r != 0u) {
+        imageStore(combustionTex, coord, vec4(0.0));
+        imageStore(oxidizerTex, coord, vec4(0.0));
+        imageStore(fuelTex, coord, vec4(0.0));
+        return;
     }
 
-    float burn_rate = (material == 1u) ? 0.38 : 0.20;
-    float recharge = (material == 1u) ? 0.025 : 0.08;
+    float suppression = clamp(water * waterCooling, 0.0, 1.0);
+    combustion.y *= pow(max(1.0 - suppression * 2.2, 0.0), dt * 60.0);
+    fuel = clamp(fuel * pow(1.0 - suppression * 0.85, dt * 60.0), 0.0, 1.0);
+    oxidizer = clamp(oxidizer * pow(max(1.0 - suppression * 1.2, 0.0), dt * 60.0), 0.0, 1.0);
 
-    fire.y = clamp(fire.y + (ignition * fire.x - burn_rate * fire.y) * dt, 0.0, 1.0);
-    fire.x = clamp(fire.x + (recharge * (1.0 - fire.x) - fire.y * 0.30) * dt, 0.0, 1.0);
-
-    float damp = 1.0 - clamp(water * 0.7, 0.0, 0.85);
-    fire.y *= damp;
-
-    imageStore(fireTex, coord, vec4(fire, 0.0, 0.0));
+    imageStore(combustionTex, coord, vec4(combustion, 0.0, 0.0));
+    imageStore(fuelTex, coord, vec4(fuel, 0.0, 0.0, 0.0));
+    imageStore(oxidizerTex, coord, vec4(oxidizer, 0.0, 0.0, 0.0));
 }

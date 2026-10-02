@@ -1,0 +1,76 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D rhsFineTex;
+layout(r32f, binding = 1) uniform readonly image2D pressureFineTex;
+layout(r16f, binding = 2) uniform writeonly image2D rhsCoarseTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+
+uniform ivec2 fineSize;
+uniform ivec2 coarseSize;
+uniform int boundaryScale;
+
+// Match the relaxation operator, including zero correction at mixed footprints.
+int cellKind(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= fineSize.x || coord.y >= fineSize.y) {
+        return 1;
+    }
+    ivec2 fineMin = coord * boundaryScale;
+    ivec2 fineMax = fineMin + ivec2(boundaryScale);
+    if (any(greaterThan(fineMax, imageSize(boundaryTex)))) {
+        return 1;
+    }
+    bool solid = false;
+    bool fluid = false;
+    for (int y = fineMin.y; y < fineMax.y; ++y) {
+        for (int x = fineMin.x; x < fineMax.x; ++x) {
+            bool occupied = imageLoad(boundaryTex, ivec2(x, y)).r != 0u;
+            solid = solid || occupied;
+            fluid = fluid || !occupied;
+        }
+    }
+    return solid ? (fluid ? 2 : 1) : 0;
+}
+
+float residualAt(ivec2 coord) {
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float pressure_sum = 0.0;
+    float diagonal = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 neighbor = coord + offsets[i];
+        int kind = cellKind(neighbor);
+        if (kind == 0) {
+            pressure_sum += imageLoad(pressureFineTex, neighbor).x;
+        }
+        if (kind != 1) {
+            diagonal += 1.0;
+        }
+    }
+    float pC = imageLoad(pressureFineTex, coord).x;
+    float h = float(boundaryScale);
+    float lap = (pressure_sum - diagonal * pC) / (h * h);
+    return imageLoad(rhsFineTex, coord).x - lap;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= coarseSize.x || coord.y >= coarseSize.y) {
+        return;
+    }
+
+    ivec2 base = coord * 2;
+    float residual_sum = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 fine = base + ivec2(x, y);
+            // A correction cell is usable only when its entire footprint is fluid.
+            if (cellKind(fine) != 0) {
+                imageStore(rhsCoarseTex, coord, vec4(0.0));
+                return;
+            }
+            residual_sum += residualAt(fine);
+        }
+    }
+    imageStore(rhsCoarseTex, coord, vec4(residual_sum * 0.25, 0.0, 0.0, 0.0));
+}

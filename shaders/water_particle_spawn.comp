@@ -1,0 +1,72 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+layout(std430, binding = 1) buffer WaterSpawnCursor {
+    uint spawnCursor;
+};
+
+layout(std430, binding = 2) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform ivec2 dispatchOrigin;
+uniform ivec2 brushCenter;
+uniform int brushRadius;
+uniform vec2 spawnVelocity;
+uniform int spawnCountPerCell;
+uniform float particleMass;
+uniform int maxParticles;
+
+bool insideBrush(ivec2 coord) {
+    vec2 cell_center = vec2(coord) + vec2(0.5);
+    vec2 brush_center = vec2(brushCenter) + vec2(0.5);
+    vec2 delta = cell_center - brush_center;
+    return dot(delta, delta) <= float(brushRadius * brushRadius);
+}
+
+void main() {
+    ivec2 coord = dispatchOrigin + ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return;
+    }
+    if (!insideBrush(coord) || imageLoad(boundaryTex, coord).r != 0u) {
+        return;
+    }
+
+    int count = max(spawnCountPerCell, 1);
+    for (int i = 0; i < count; ++i) {
+        vec2 jitter = vec2(float(i & 1), float((i >> 1) & 1)) * 0.24 - vec2(0.12);
+        uint slot = atomicAdd(spawnCursor, 0u);
+        while (slot < uint(maxParticles)) {
+            uint observed = atomicCompSwap(spawnCursor, slot, slot + 1u);
+            if (observed == slot) {
+                break;
+            }
+            slot = observed;
+        }
+        if (slot >= uint(maxParticles)) {
+            atomicAdd(particleOverflowBlocked, 1u);
+            return;
+        }
+        particles[slot].state0 = vec4(vec2(coord) + vec2(0.5) + jitter, spawnVelocity);
+        particles[slot].state1 = vec4(1.0, particleMass, 0.0, 0.0);
+        particles[slot].state2 = vec4(0.0);
+    }
+}

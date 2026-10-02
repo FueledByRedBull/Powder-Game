@@ -1,0 +1,114 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+uniform sampler2D pressureTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
+
+layout(std430, binding = 0) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+layout(std430, binding = 1) writeonly buffer ResidualPartials {
+    vec4 partials[];
+};
+shared vec4 groupStats[256];
+
+uniform ivec2 gridSize;
+uniform int boundaryScale;
+uniform float residualThreshold;
+uniform int useLiquidMask;
+uniform float liquidPhiThreshold;
+uniform int collectStats;
+
+bool blockedCell(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x || coord.y >= gridSize.y) {
+        return true;
+    }
+    ivec2 fineMin = coord * boundaryScale;
+    ivec2 fineMax = fineMin + ivec2(boundaryScale);
+    for (int y = fineMin.y; y < fineMax.y; ++y) {
+        for (int x = fineMin.x; x < fineMax.x; ++x) {
+            if (imageLoad(boundaryTex, ivec2(x, y)).r != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool invalid(float value) {
+    return isnan(value) || isinf(value);
+}
+
+// Sum of squares, maximum magnitude, active cell count, invalid flag.
+vec4 residualStats(ivec2 coord) {
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y || blockedCell(coord)) {
+        return vec4(0.0);
+    }
+    if (useLiquidMask != 0) {
+        float phi = imageLoad(liquidPhiTex, coord).x;
+        if (invalid(phi)) {
+            return vec4(0.0, 0.0, 1.0, 1.0);
+        }
+        if (phi >= liquidPhiThreshold) {
+            return vec4(0.0);
+        }
+    }
+
+    float rhs = imageLoad(rhsTex, coord).x;
+    float pressure = texelFetch(pressureTex, coord, 0).x;
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float pressure_sum = 0.0;
+    float diagonal = 0.0;
+    bool invalid_input = invalid(rhs) || invalid(pressure);
+    for (int i = 0; i < 4; ++i) {
+        ivec2 neighbor = coord + offsets[i];
+        if (blockedCell(neighbor)) {
+            continue;
+        }
+        diagonal += 1.0;
+        if (useLiquidMask != 0) {
+            float phi = imageLoad(liquidPhiTex, neighbor).x;
+            invalid_input = invalid_input || invalid(phi);
+            if (phi >= liquidPhiThreshold) {
+                continue;
+            }
+        }
+        pressure_sum += texelFetch(pressureTex, neighbor, 0).x;
+    }
+    float residual = rhs - (pressure_sum - diagonal * pressure);
+    if (invalid_input || invalid(residual)) {
+        return vec4(0.0, 0.0, 1.0, 1.0);
+    }
+    float square = collectStats != 0 ? residual * residual : 0.0;
+    return vec4(invalid(square) ? 0.0 : square, abs(residual), 1.0, invalid(square) ? 1.0 : 0.0);
+}
+
+void main() {
+    vec4 stats = residualStats(ivec2(gl_GlobalInvocationID.xy));
+    if (collectStats != 0) {
+        uint lane = gl_LocalInvocationIndex;
+        groupStats[lane] = stats;
+        barrier();
+        // Padded and masked lanes contribute zeros, but must participate in every barrier.
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                vec4 other = groupStats[lane + stride];
+                groupStats[lane] += vec4(other.x, 0.0, other.z, 0.0);
+                groupStats[lane].yw = max(groupStats[lane].yw, other.yw);
+            }
+            barrier();
+        }
+        if (lane == 0u) partials[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] = groupStats[0];
+    } else if (stats.w != 0.0) {
+        atomicAdd(nanInfDetected, 1u);
+        atomicAdd(pressureNonconverged, 1u);
+    } else if (stats.y > residualThreshold) {
+        atomicAdd(pressureNonconverged, 1u);
+    }
+}

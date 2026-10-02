@@ -2,103 +2,128 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D fireSrc;
-layout(r16f, binding = 1) uniform readonly image2D heatTex;
-layout(rg16f, binding = 2) uniform writeonly image2D fireDst;
-layout(r8ui, binding = 3) uniform readonly uimage2D tileActiveTex;
+layout(r16f, binding = 0) uniform readonly image2D fuelSrc;
+layout(r16f, binding = 1) uniform readonly image2D oxidizerSrc;
+layout(r16f, binding = 2) uniform readonly image2D temperatureSrc;
+layout(r16f, binding = 3) uniform readonly image2D smokeSrc;
+layout(r8ui, binding = 4) uniform readonly uimage2D boundaryTex;
+layout(rg16f, binding = 5) uniform readonly image2D reactionSrc;
+layout(r16f, binding = 6) uniform writeonly image2D fuelDst;
+layout(r16f, binding = 7) uniform writeonly image2D oxidizerDst;
+layout(r16f, binding = 8) uniform writeonly image2D temperatureDst;
+layout(rg16f, binding = 9) uniform writeonly image2D reactionDst;
+layout(r16f, binding = 10) uniform writeonly image2D smokeDst;
 
-layout(std430, binding = 12) readonly buffer ActiveTileList {
-    uint activeTiles[];
-};
-
-layout(std430, binding = 13) readonly buffer ActiveTileCounter {
-    uint activeTileCount;
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
 };
 
 uniform ivec2 gridSize;
-uniform ivec2 heatSize;
-uniform ivec2 tileSize;
 uniform float dt;
-uniform float diffusionU;
-uniform float diffusionV;
-uniform float feed;
-uniform float kill;
+uniform float combustionRate;
+uniform float oxidizerConsumption;
+uniform float reactionDecay;
+uniform float temperatureDiffusion;
+uniform float temperatureCooling;
+uniform float heatRelease;
+uniform float smokeYield;
+uniform float smokeDissipation;
 
 ivec2 clampGrid(ivec2 coord) {
     return clamp(coord, ivec2(0), gridSize - ivec2(1));
 }
 
-vec2 fireAt(ivec2 coord) {
-    return imageLoad(fireSrc, clampGrid(coord)).xy;
+float fuelAt(ivec2 coord) {
+    return imageLoad(fuelSrc, clampGrid(coord)).x;
 }
 
-float localHeat(ivec2 coord) {
-    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(gridSize);
-    ivec2 heat_coord = clamp(ivec2(uv * vec2(heatSize)), ivec2(0), heatSize - ivec2(1));
-    return imageLoad(heatTex, heat_coord).x;
+float oxidizerAt(ivec2 coord) {
+    return imageLoad(oxidizerSrc, clampGrid(coord)).x;
 }
 
-vec2 laplacian(ivec2 coord) {
-    vec2 c = fireAt(coord);
-
-    vec2 n = fireAt(coord + ivec2(0, 1));
-    vec2 s = fireAt(coord + ivec2(0, -1));
-    vec2 e = fireAt(coord + ivec2(1, 0));
-    vec2 w = fireAt(coord + ivec2(-1, 0));
-
-    vec2 ne = fireAt(coord + ivec2(1, 1));
-    vec2 nw = fireAt(coord + ivec2(-1, 1));
-    vec2 se = fireAt(coord + ivec2(1, -1));
-    vec2 sw = fireAt(coord + ivec2(-1, -1));
-
-    return (n + s + e + w) * 0.2 + (ne + nw + se + sw) * 0.05 - c;
+float temperatureAt(ivec2 coord) {
+    return imageLoad(temperatureSrc, clampGrid(coord)).x;
 }
 
-bool tileActive(ivec2 coord) {
-    ivec2 tile = clamp(coord / 16, ivec2(0), tileSize - ivec2(1));
-    return imageLoad(tileActiveTex, tile).r != 0u;
+float smokeAt(ivec2 coord) {
+    return imageLoad(smokeSrc, clampGrid(coord)).x;
 }
 
-ivec2 dispatchCoord() {
-    uint group = gl_WorkGroupID.x;
-    if (group >= activeTileCount) {
-        return ivec2(-1);
+vec2 reactionAt(ivec2 coord) {
+    return imageLoad(reactionSrc, clampGrid(coord)).xy;
+}
+
+bool invalid(float value) {
+    return isnan(value) || isinf(value);
+}
+
+bool fluidAt(ivec2 coord) {
+    return all(greaterThanEqual(coord, ivec2(0))) && all(lessThan(coord, gridSize)) &&
+           imageLoad(boundaryTex, coord).r == 0u;
+}
+
+float laplacianTemperature(ivec2 coord, float center) {
+    float laplacian = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if ((x == 0 && y == 0) || !fluidAt(coord + ivec2(x, y))) continue;
+            bool diagonal = x != 0 && y != 0;
+            // No flux through solids, including a diagonal between sealed corners.
+            if (diagonal && (!fluidAt(coord + ivec2(x, 0)) || !fluidAt(coord + ivec2(0, y)))) continue;
+            laplacian += (diagonal ? 0.05 : 0.2) * (temperatureAt(coord + ivec2(x, y)) - center);
+        }
     }
-    uint packed_tile = activeTiles[group];
-    ivec2 tile = ivec2(int(packed_tile & 0xFFFFu), int(packed_tile >> 16u));
-    ivec2 coord = tile * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
-        return ivec2(-1);
-    }
-    return coord;
+    return laplacian;
 }
 
 void main() {
-    ivec2 coord = dispatchCoord();
-    if (coord.x < 0) {
-        return;
-    }
-    if (!tileActive(coord)) {
-        imageStore(fireDst, coord, imageLoad(fireSrc, coord));
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
         return;
     }
 
-    vec2 state = fireAt(coord);
-    float u = state.x;
-    float v = state.y;
+    if (imageLoad(boundaryTex, coord).r != 0u) {
+        imageStore(reactionDst, coord, vec4(0.0));
+        imageStore(fuelDst, coord, vec4(0.0));
+        imageStore(oxidizerDst, coord, vec4(0.0));
+        imageStore(temperatureDst, coord, vec4(0.0));
+        imageStore(smokeDst, coord, vec4(0.0));
+        return;
+    }
 
-    vec2 lap = laplacian(coord);
-    float heat = localHeat(coord);
+    float fuel = fuelAt(coord);
+    float oxidizer = oxidizerAt(coord);
+    float temperature = temperatureAt(coord);
+    float smokeDensity = smokeAt(coord);
+    float reaction = reactionAt(coord).y;
+    float ignition = smoothstep(0.18, 0.55, max(temperature, reaction));
+    float consumed = min(combustionRate * dt * fuel * oxidizer * ignition, fuel);
+    if (oxidizerConsumption > 0.0) consumed = min(consumed, oxidizer / oxidizerConsumption);
+    float lapTemperature = laplacianTemperature(coord, temperature);
 
-    float local_feed = feed + heat * 0.015;
-    float local_kill = max(0.005, kill - heat * 0.012);
+    fuel = clamp(fuel - consumed, 0.0, 1.0);
+    oxidizer = clamp(oxidizer - consumed * oxidizerConsumption, 0.0, 1.0);
+    reaction = clamp(reaction + consumed - reactionDecay * reaction * dt, 0.0, 1.0);
+    temperature = clamp(temperature + consumed * heatRelease +
+                            (temperatureDiffusion * lapTemperature - temperatureCooling * temperature) * dt,
+                        0.0,
+                        1.0);
+    smokeDensity = clamp(smokeDensity + consumed * smokeYield - smokeDissipation * smokeDensity * dt, 0.0, 1.0);
+    if (invalid(fuel) || invalid(oxidizer) || invalid(temperature) || invalid(reaction) || invalid(smokeDensity)) {
+        atomicAdd(nanInfDetected, 1u);
+        fuel = 0.0;
+        oxidizer = 0.0;
+        temperature = 0.0;
+        reaction = 0.0;
+        smokeDensity = 0.0;
+    }
 
-    float reaction = u * v * v;
-    float du = diffusionU * lap.x - reaction + local_feed * (1.0 - u);
-    float dv = diffusionV * lap.y + reaction - (local_kill + local_feed) * v;
-
-    u = clamp(u + du * dt, 0.0, 1.0);
-    v = clamp(v + dv * dt + heat * 0.03 * dt, 0.0, 1.0);
-
-    imageStore(fireDst, coord, vec4(u, v, 0.0, 0.0));
+    imageStore(fuelDst, coord, vec4(fuel, 0.0, 0.0, 0.0));
+    imageStore(oxidizerDst, coord, vec4(oxidizer, 0.0, 0.0, 0.0));
+    imageStore(temperatureDst, coord, vec4(temperature, 0.0, 0.0, 0.0));
+    imageStore(reactionDst, coord, vec4(0.0, reaction, 0.0, 0.0));
+    imageStore(smokeDst, coord, vec4(smokeDensity, 0.0, 0.0, 0.0));
 }
