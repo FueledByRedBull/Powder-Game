@@ -38,6 +38,10 @@ if(NOT TARGET glad AND NOT TARGET glad::glad)
         GIT_REPOSITORY https://github.com/Dav1dde/glad.git
         GIT_TAG v0.1.36
     )
+    # GLAD 0.1.36 declares CMake 3.0; CMake 4 requires at least 3.5 policies.
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    endif()
     FetchContent_MakeAvailable(glad_src)
 endif()
 

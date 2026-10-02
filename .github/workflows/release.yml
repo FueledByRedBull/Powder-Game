@@ -12,6 +12,8 @@ jobs:
   windows-release:
     name: Build Windows Release Bundle
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout
@@ -40,9 +42,15 @@ jobs:
             Copy-Item -LiteralPath $_ -Destination $outDir -Force
           }
           Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
+          Copy-Item LICENSE $outDir
+          $licenseDir = Join-Path $outDir "licenses"
+          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+          Copy-Item build/_deps/glfw-src/LICENSE.md (Join-Path $licenseDir "GLFW-LICENSE.md")
+          Copy-Item build/_deps/glad_src-src/LICENSE (Join-Path $licenseDir "GLAD-LICENSE") -Recurse
+          Copy-Item build/_deps/glad_src-src/glad/files/khrplatform.h $licenseDir
 
           $readme = @(
-            "Powder Game (Windows 11 x64)",
+            "Powder Game $env:GITHUB_REF_NAME (Windows 11 x64)",
             "",
             "Run:",
             "- Double-click powder_game.exe",
@@ -59,16 +67,30 @@ jobs:
             "- Esc: quit",
             "",
             "Notes:",
-            "- Keep the shaders/ folder next to powder_game.exe.",
-            "- Requires a GPU/driver with OpenGL 4.3+ support."
+            "- Keep the shaders/ folder and DLLs next to powder_game.exe.",
+            "- Requires OpenGL 4.3+ and the resource limits listed in the source README.",
+            "- See the release notes and source VALIDATION.md for measured limitations."
           )
           $readme | Set-Content -Path (Join-Path $outDir "README.txt")
 
           New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
-          Compress-Archive -Path "$outDir/*" -DestinationPath "dist/win11/PowderGame-win11-x64.zip" -Force
+          $binaryZip = "dist/win11/PowderGame-$env:GITHUB_REF_NAME-win11-x64.zip"
+          $sourceZip = "dist/win11/PowderGame-$env:GITHUB_REF_NAME-source.zip"
+          Compress-Archive -Path "$outDir/*" -DestinationPath $binaryZip -Force
+          git archive --format=zip --output=$sourceZip HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Source archive failed with exit $LASTEXITCODE" }
+          @($binaryZip, $sourceZip) | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $_)"
+          } | Set-Content -Encoding utf8NoBOM "dist/win11/SHA256SUMS.txt"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/win11/PowderGame-win11-x64.zip
+          draft: true
+          files: |
+            dist/win11/PowderGame-${{ github.ref_name }}-win11-x64.zip
+            dist/win11/PowderGame-${{ github.ref_name }}-source.zip
+            dist/win11/SHA256SUMS.txt
+          fail_on_unmatched_files: true
           generate_release_notes: true
