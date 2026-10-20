@@ -61,8 +61,8 @@ $`(i + 0.5,\ j + 0.5)`$. Particle positions live in $`[0, N)`$ on each axis.
   $`\mu`$ and $`\lambda`$ the Lame moduli, $`\eta`$ the viscosity, $`\rho`$ the reference density, $`\alpha`$ the
   Drucker-Prager friction slope, $`\varphi`$ a friction angle and $`q`$ the hardening state. The friction
   coefficients of the $`\mu(I)`$ rheology carry subscripts ($`\mu_s`$, $`\mu_2`$).
-- $`\operatorname{clamp}(x)`$ with one argument clamps to $`[0, 1]`$; $`\operatorname{mix}(a, b, t) = a + (b - a)\,t`$
-  and $`\operatorname{smoothstep}(e_0, e_1, x)`$ are the GLSL functions.
+- $`\mathrm{clamp}(x)`$ with one argument clamps to $`[0, 1]`$; $`\mathrm{mix}(a, b, t) = a + (b - a)\,t`$
+  and $`\mathrm{smoothstep}(e_0, e_1, x)`$ are the GLSL functions.
 
 ### 1.2 Grids and staggering
 
@@ -359,8 +359,8 @@ Bins of 4, 16 and 32 cells were tried: 16 and 32 spill workgroups past P2G's sha
 3. Face momentum (quadratic B-spline, APIC): for each of the 3 x 3 u faces and 3 x 3 v faces, weight
    $`w = m\,N(\mathbf{x}_f - \mathbf{x}_p)`$, value $`\mathbf{v}_p + \mathbf{C}_p(\mathbf{x}_f - \mathbf{x}_p)`$. Faces
    on the domain edge or with a blocked cell on either side get nothing.
-4. Fixed point: weights are $`\tilde{w} = \operatorname{round}(4096\,w)`$ (u32). Momentum is
-   $`\operatorname{round}(\text{value} \times \tilde{w})`$ in units of 1/4096 (cells/s x mass), stored as a signed low
+4. Fixed point: weights are $`\tilde{w} = \mathrm{round}(4096\,w)`$ (u32). Momentum is
+   $`\mathrm{round}(\text{value} \times \tilde{w})`$ in units of 1/4096 (cells/s x mass), stored as a signed low
    word plus a wrap counter (`ivec2`, `signedCarry`), so dense momentum cannot overflow. Momentum uses the quantized
    weight, so a face average stays a convex mix of particle velocities even where edge-of-support weights round to
    zero; with the unrounded weight a face once read 26,000 cells/s from 2400 cells/s particles
@@ -394,11 +394,11 @@ Each substep builds this into `mac_u_prev`/`mac_v_prev` (the pre-force field, FL
 
 - local volume $`V_{\text{local}} = 0.04 \times \text{particle-equivalents}`$; smooth volume $`V_{\text{smooth}}`$ = a
   4-2-1 tent filter over 3 x 3 cells, times 0.96; liquid volume
-  $`V = \operatorname{clamp}\big(\max(V_{\text{local}}, \operatorname{mix}(V_{\text{local}}, V_{\text{smooth}}, 0.45)), 0, 1\big)`$.
+  $`V = \mathrm{clamp}\,\big(\max(V_{\text{local}}, \mathrm{mix}(V_{\text{local}}, V_{\text{smooth}}, 0.45)), 0, 1\big)`$.
   A cell at rest reads 0.16.
-- $`\phi = \operatorname{clamp}(0.46 - 1.18\,V, -1, 1)`$; a cell is liquid when $`\phi < 0.42`$
+- $`\phi = \mathrm{clamp}(0.46 - 1.18\,V, -1, 1)`$; a cell is liquid when $`\phi < 0.42`$
   (`water_liquid_phi_threshold`), that is above about 0.85 particle-equivalents.
-- amount $`= \operatorname{mix}\big(V,\ 1 - \operatorname{smoothstep}(0.06, 0.42, \phi),\ 0.28\big)`$, the render and
+- amount $`= \mathrm{mix}\,\big(V,\ 1 - \mathrm{smoothstep}(0.06, 0.42, \phi),\ 0.28\big)`$, the render and
   coupling field.
 - Blocked cells get volume 0, $`\phi = -1`$; empty cells $`\phi = 1`$.
 
@@ -566,14 +566,14 @@ velocity for particles whose kernel crosses the surface. Overflowing faces count
    the kernel reads the nearest live face toward the particle instead (up to three steps). Painted walls are then
    free-slip like the domain edge and the kernel keeps its full support; sand's one-sided faces keep their velocity.
 3. FLIP/PIC blend:
-   $`\mathbf{v} = \operatorname{mix}\big(\mathbf{v}_{\text{pic}},\ \mathbf{v}_p + (\mathbf{v}_{\text{pic}} - \mathbf{v}_{\text{prev}}),\ 0.97\big)`$
+   $`\mathbf{v} = \mathrm{mix}\,\big(\mathbf{v}_{\text{pic}},\ \mathbf{v}_p + (\mathbf{v}_{\text{pic}} - \mathbf{v}_{\text{prev}}),\ 0.97\big)`$
    (Zhu and Bridson 2005 use 0.95-0.99; 0.99 left visible noise).
 4. Support: the pressure acceleration
    $`\mathbf{a} = (\mathbf{v}_{\text{pic}} - \mathbf{v}_{\text{prev}}) / \Delta t - \mathbf{g}`$; support
-   $`s = \operatorname{clamp}(\lVert\mathbf{a}\rVert / g, 0, 1)`$. It is 0 in free fall and open air and about 1 in a
+   $`s = \mathrm{clamp}(\lVert\mathbf{a}\rVert / g, 0, 1)`$. It is 0 in free fall and open air and about 1 in a
    resting pool or on a ramp.
 5. Sand drag:
-   $`\mathbf{v} \leftarrow \operatorname{mix}\big(\mathbf{v}, \mathbf{v}_{\text{sand}}, 1 - e^{-120\,\phi_s \Delta t}\big)`$
+   $`\mathbf{v} \leftarrow \mathrm{mix}\,\big(\mathbf{v}, \mathbf{v}_{\text{sand}}, 1 - e^{-120\,\phi_s \Delta t}\big)`$
    with $`\phi_s`$ the bilinear sand occupancy and $`\mathbf{v}_{\text{sand}}`$ its grid velocity (section 7).
 6. Oil correction (section 5).
 7. Bulk damping: $`\mathbf{v} \leftarrow \mathbf{v}\, e^{-1.0\, s\, \Delta t}`$. Only pressure-supported water loses
@@ -581,7 +581,7 @@ velocity for particles whose kernel crosses the surface. Overflowing faces count
 8. `water_velocity_damping` (1.0, none; defined per 1/120 s) and the speed cap 2400 cells/s; any cut sets the clamp
    diagnostic.
 9. Swept advection:
-   $`\text{moves} = \operatorname{clamp}\big(\lceil \max(\lVert\mathbf{v}\rVert, \lVert\mathbf{v}_{\text{grid}}\rVert)\,\Delta t / 2 \rceil, 1, 64\big)`$
+   $`\text{moves} = \mathrm{clamp}\,\big(\lceil \max(\lVert\mathbf{v}\rVert, \lVert\mathbf{v}_{\text{grid}}\rVert)\,\Delta t / 2 \rceil, 1, 64\big)`$
    sub-moves of at most `water_advection_cfl` = 2 cells. Each sub-move is RK2 through the projected field where the
    cell holds liquid volume, else on the record's own velocity (a droplet that left its deposit flies ballistically); a
    midpoint inside a wall reuses the first stage. `moveWithCollisions` traverses the crossed cells exactly (a DDA over
@@ -617,7 +617,7 @@ up used to clump the dam break until the record tag fixed that.
 After compaction the host reads the fastest speed (start of the tick) and sets
 
 ```math
-\text{substeps} = \operatorname{clamp}\left(\left\lceil \frac{\min(v_{\text{fastest}}, 2400)\,\Delta t}{16} \right\rceil, 1, 6\right)
+\text{substeps} = \mathrm{clamp}\,\left(\left\lceil \frac{\min(v_{\text{fastest}}, 2400)\,\Delta t}{16} \right\rceil, 1, 6\right)
 ```
 
 one pressure solve per substep, 16 cells per solve (`water_cfl_limit`). At the cap that is 3 solves; up to 1920 cells/s
@@ -728,7 +728,7 @@ parts run only once oil (or a heat source, for the phase passes) has been painte
    $`\mathbf{a} = 0`$, so oil falls at $`g`$ and drips off ceilings like water.
 3. In-cell drift: after advection, oil records step up and water records down by $`20\,\mathrm{cells/s} \times \Delta t`$,
    scaled by
-   $`\text{drive} = \operatorname{clamp}\big(2 \times \text{(other liquid volume in this cell or the one it moves into)} / \text{rest volume}, 0, 1\big) \times s`$
+   $`\text{drive} = \mathrm{clamp}\,\big(2 \times \text{(other liquid volume in this cell or the one it moves into)} / \text{rest volume}, 0, 1\big) \times s`$
    (support), as a swept position-only move. Nothing separates in free fall.
 4. Ignition and burning (section 10.3): exposed oil under hot gas is lit, feeds its gas cell fuel vapour every tick
    and is consumed at 2/s per lit record.
@@ -828,7 +828,7 @@ cells/s, $`\mathbf{F} = \mathbf{I}`$, no volume correction, a random friction tr
    $`(F_{00} + F_{11},\ F_{01} - F_{10})`$, then the symmetric part's eigen-decomposition), log strain
    $`\boldsymbol{\epsilon} = \ln\boldsymbol{\sigma}`$.
 2. Hencky (St. Venant-Kirchhoff in log strain) Kirchhoff stress, principal
-   $`\boldsymbol{\tau} = 2\mu\,\boldsymbol{\epsilon} + \lambda \operatorname{tr}(\boldsymbol{\epsilon})`$, rotated back
+   $`\boldsymbol{\tau} = 2\mu\,\boldsymbol{\epsilon} + \lambda \mathrm{tr}(\boldsymbol{\epsilon})`$, rotated back
    with the left singular vectors.
 3. Kelvin-Voigt viscosity for confined grains:
    $`\boldsymbol{\tau} \leftarrow \boldsymbol{\tau} + J\, \chi_{\text{conf}}\, \eta\, (\mathbf{C} + \mathbf{C}^{\mathsf T})`$,
@@ -851,7 +851,7 @@ except on the last substep, which leaves the velocity field whole for other pass
 2. Water around the node (3 x 3 cells of the liquid volume): submersion $`\sigma_w`$ = fullest cell / 0.16, flow
    $`\mathbf{u}_w`$ = volume-weighted water velocity.
 3. Gravity with buoyancy: $`v_y \leftarrow v_y - g\,\Delta t\,(1 - \sigma_w / 2.65)`$.
-4. Drag: $`\mathbf{v} \leftarrow \operatorname{mix}\big(\mathbf{v}, \mathbf{u}_w, 1 - e^{-60\,\sigma_w \Delta t}\big)`$,
+4. Drag: $`\mathbf{v} \leftarrow \mathrm{mix}\,\big(\mathbf{v}, \mathbf{u}_w, 1 - e^{-60\,\sigma_w \Delta t}\big)`$,
    stable at any $`\Delta t`$.
 5. `sand_damping` (1.0, none; per 1/60 s).
 6. Packed reaction (`packedImpulse`): packed cells around the node push like the frozen grains they hold, with the
@@ -862,7 +862,7 @@ except on the last substep, which leaves the velocity field whole for other pass
    $`\min(\text{grip}, \lVert\mathbf{v}_t\rVert)`$ with $`\text{grip} = 0.62 \times \text{reaction} + \text{bond}`$,
    where the bond of damp packed cells is
 
-   $`\displaystyle \text{bond} = \sqrt{2}\, \alpha\, (\lambda + \mu) \times \text{cohesion} \times \operatorname{capillary}(\text{moisture}) \times e^{-q / \text{softening}} \times \text{volume} \times \lVert\nabla w\rVert`$
+   $`\displaystyle \text{bond} = \sqrt{2}\, \alpha\, (\lambda + \mu) \times \text{cohesion} \times \mathrm{capillary}(\text{moisture}) \times e^{-q / \text{softening}} \times \text{volume} \times \lVert\nabla w\rVert`$
 
 7. Walls with Coulomb friction (`separate`: remove the inward normal component, scale the tangent by
    $`\max\big(0,\ 1 - 0.62\, \lVert\mathbf{v}_n\rVert / \lVert\mathbf{v}_t\rVert\big)`$): the halo nodes are the
@@ -878,13 +878,13 @@ except on the last substep, which leaves the velocity field whole for other pass
    and the velocity gradient $`\nabla\mathbf{v} = \sum \mathbf{v}_i\, (\nabla w)^{\mathsf T}`$ from the nodes, zeroing
    each stencil node's mass for the next substep.
 2. Contact damping: $`\mathbf{v}`$ and $`\mathbf{C}`$ are multiplied by $`e^{-6\, \chi_{\text{conf}}\, \Delta t}`$,
-   $`\chi_{\text{conf}} = \max\big(\text{ramp of } J \text{ from } 0.95 \text{ to } 0.85,\ \operatorname{capillary}(\text{moisture})\big)`$
+   $`\chi_{\text{conf}} = \max\big(\text{ramp of } J \text{ from } 0.95 \text{ to } 0.85,\ \mathrm{capillary}(\text{moisture})\big)`$
    (liquid bridges dissipate, Herminghaus 2005); speed cap 2400.
 3. Moisture, once per tick (first substep): relax toward the fullest water cell in the 3 x 3 around the grain
    (saturation = fill / 0.16) at 4 /s when wetting, 0.02 /s when drying; capped at 0.999.
 4. Trial deformation $`\mathbf{F}^* = \exp(\Delta t\, \nabla\mathbf{v})\, \mathbf{F}`$. The matrix exponential (closed
    form for 2 x 2 via the traceless part) keeps
-   $`\det\mathbf{F}^* = \exp(\Delta t \operatorname{tr}\nabla\mathbf{v}) \det\mathbf{F} > 0`$; forward Euler
+   $`\det\mathbf{F}^* = \exp(\Delta t \mathrm{tr}\,\nabla\mathbf{v}) \det\mathbf{F} > 0`$; forward Euler
    $`\mathbf{I} + \Delta t\, \nabla\mathbf{v}`$ inverted when a grain at 1500 cells/s met resting sand
    ($`\Delta t\, \lVert\nabla\mathbf{v}\rVert = 1.09`$; `sand-impact`).
 5. Friction slope $`\alpha = 0.5\, (1 + 0.2\, \text{trait} / 31)\, h(q)`$, with the Klar hardening
@@ -898,13 +898,13 @@ except on the last substep, which leaves the velocity field whole for other pass
      $`q \mathrel{+}= \lVert\boldsymbol{\epsilon}\rVert`$.
    - Otherwise $`c_v = 0`$. Pressure $`p = (\lambda + \mu) \max(-e_v, 0)`$; inertial number
      $`I = \dot\gamma\, d / \sqrt{p / \rho}`$ with
-     $`\dot\gamma = \sqrt{2}\, \lVert\operatorname{dev}(\operatorname{sym}\nabla\mathbf{v})\rVert`$ and $`d = 0.08`$
+     $`\dot\gamma = \sqrt{2}\, \lVert\mathrm{dev}(\mathrm{sym}\,\nabla\mathbf{v})\rVert`$ and $`d = 0.08`$
      cells; slope $`= \alpha\, \big(1 + 0.68\, I / (0.279 + I)\big)`$ ($`\mu(I)`$).
-   - $`\delta = \lVert\operatorname{dev}\boldsymbol{\epsilon}\rVert + \dfrac{\lambda + \mu}{\mu}\, \text{slope}\, (e_v - \text{bond})`$,
-     $`\text{bond} = 0.15 \operatorname{capillary}(\text{moisture})\, e^{-q / 0.5}`$.
+   - $`\delta = \lVert\mathrm{dev}\,\boldsymbol{\epsilon}\rVert + \dfrac{\lambda + \mu}{\mu}\, \text{slope}\, (e_v - \text{bond})`$,
+     $`\text{bond} = 0.15 \mathrm{capillary}(\text{moisture})\, e^{-q / 0.5}`$.
      If $`\delta \le 0`$ (inside the cone) $`\mathbf{F}`$ stays; else the deviator shrinks by
-     $`(1 - \delta / \lVert\operatorname{dev}\boldsymbol{\epsilon}\rVert)`$ (clamped at the cone tip),
-     $`q \mathrel{+}= \min\big(\max(\delta, 0), \lVert\operatorname{dev}\boldsymbol{\epsilon}\rVert\big)`$.
+     $`(1 - \delta / \lVert\mathrm{dev}\,\boldsymbol{\epsilon}\rVert)`$ (clamped at the cone tip),
+     $`q \mathrel{+}= \min\big(\max(\delta, 0), \lVert\mathrm{dev}\,\boldsymbol{\epsilon}\rVert\big)`$.
    In 2D the cone is $`\sin\varphi = \sqrt{2}\,\alpha`$. The bond widens the cone by that much compression
    (Mohr-Coulomb shear strength at zero pressure) with tension still separating. A deformation that cannot be projected
    counts, resets $`\mathbf{F}`$ to its rotation and keeps the grain moving.
@@ -914,7 +914,7 @@ except on the last substep, which leaves the velocity field whole for other pass
    (the domain edge is the outer face of the edge cells), the same exact traversal and last-open-cell clamp as water.
 
 ```math
-\operatorname{capillary}(m) = \operatorname{clamp}(10\, m, 0, 1) \times \operatorname{clamp}\big(10\,(1 - m), 0, 1\big)
+\mathrm{capillary}(m) = \mathrm{clamp}(10\, m, 0, 1) \times \mathrm{clamp}\,\big(10\,(1 - m), 0, 1\big)
 ```
 
 none dry, full from 10% to 90% moisture, gone at saturation where the liquid bridges merge (Mitarai and Nori 2006).
@@ -949,7 +949,7 @@ none dry, full from 10% to 90% moisture, gone at saturation where the liquid bri
 
 The last P2G ($`\Delta t = 0`$) deposits mass and moisture-weighted mass only. `sand_rasterize.comp` adds packed cells
 as grains spread over their cell (quadratic kernel averaged, $`\tfrac16, \tfrac23, \tfrac16`$ per axis) and writes
-occupancy $`= \operatorname{clamp}(\text{mass} / 2, 0, 1)`$ (R16F) and mean moisture (R8). A cell at rest density
+occupancy $`= \mathrm{clamp}(\text{mass} / 2, 0, 1)`$ (R16F) and mean moisture (R8). A cell at rest density
 reads 1; a poured pile 0.4-1; a lone grain peaks at 0.28. Occupancy feeds the masks (section 3), water drag and
 coupling, the spawn limit and rendering.
 
@@ -1146,7 +1146,7 @@ Per transport substep (`RunSmokePass`):
 2. `gas_face_to_center.comp` on the scratch faces.
 3. `smoke_advect.comp`: forward trace of the five scalars into the scratch fields.
 4. `smoke_correct.comp`: MacCormack correction
-   $`\psi = \psi_{\text{fwd}} + \tfrac{1}{2}\big(\psi^n - \operatorname{reverse}(\psi_{\text{fwd}})\big)`$, the reverse
+   $`\psi = \psi_{\text{fwd}} + \tfrac{1}{2}\big(\psi^n - \mathrm{reverse}(\psi_{\text{fwd}})\big)`$, the reverse
    trace following $`\mathbf{u}^n`$; clamped to the min/max of the forward trace's admissible donors (the limiter);
    then dissipation.
 5. `gas_velocity_correct.comp`: the same correction and limiter on the faces, then velocity dissipation, vorticity
@@ -1232,19 +1232,19 @@ rounding.
 
 `fire_rd.comp` per open gas cell, every transport substep:
 
-1. $`\text{ignition} = \operatorname{smoothstep}\big(0.18, 0.55, \max(T, \text{flame})\big)`$.
+1. $`\text{ignition} = \mathrm{smoothstep}\,\big(0.18, 0.55, \max(T, \text{flame})\big)`$.
 2. $`\text{consumed} = \min\big(10\, \Delta t \times \text{fuel} \times \text{oxidizer} \times \text{ignition},\ \text{fuel},\ \text{oxidizer} / 1.5\big)`$.
 3. $`\text{fuel} \mathrel{-}= \text{consumed}`$; $`\text{oxidizer} \mathrel{-}= 1.5\, \text{consumed}`$, then relaxes toward
    1 by $`1 - e^{-3\Delta t}`$ (entrained air).
-4. $`\text{flame} = \operatorname{clamp}\big(\text{flame}\, e^{-8\Delta t} + \text{consumed}\big)`$;
+4. $`\text{flame} = \mathrm{clamp}\,\big(\text{flame}\, e^{-8\Delta t} + \text{consumed}\big)`$;
    $`r_x = \text{consumed} / \Delta t`$ (`reaction.x`).
-5. $`T = \operatorname{clamp}\big(T + 1.6\, \text{consumed} + (10 \operatorname{lap}(T) - 2.5\, T)\, \Delta t\big)`$;
-   $`\operatorname{lap}`$ is a nine-point stencil (edges 0.2, diagonals 0.05, weights summing to 1) with no flux
+5. $`T = \mathrm{clamp}\,\big(T + 1.6\, \text{consumed} + (10 \mathrm{lap}(T) - 2.5\, T)\, \Delta t\big)`$;
+   $`\mathrm{lap}`$ is a nine-point stencil (edges 0.2, diagonals 0.05, weights summing to 1) with no flux
    through walls or between sealed corners. Its effective diffusivity is
    $`0.3 \times 10 = 3\,\mathrm{gas\ cells^2/s}`$ (hot air about
    $`2 \times 10^{-4}\,\mathrm{m^2/s} = 2\,\mathrm{gas\ cells^2/s}`$). The preflight keeps
    $`(D + \text{cooling})\,\Delta t \le 1`$ so the centre weight stays nonnegative.
-6. $`\text{smoke} = \operatorname{clamp}\big(\text{smoke} + 0.35\, \text{consumed} - 0.08\, \text{smoke}\, \Delta t\big)`$.
+6. $`\text{smoke} = \mathrm{clamp}\,\big(\text{smoke} + 0.35\, \text{consumed} - 0.08\, \text{smoke}\, \Delta t\big)`$.
 
 The fire brush adds fuel only (no oxygen), so burning starves the core and the flame sits on its edges. A released
 fire is out within about 0.5 s (`app-fire-dynamics`: under 5% at 1 s; a held fire rises 139 cells above its source
@@ -1257,12 +1257,12 @@ within 0.5 s of release).
   still meets the hot gas (`app-gas-water`).
 - `coupling_fire.comp` per gas cell, every tick: water $`W`$ = 2 x 2 mean of liquid volume $`\times (1 - \text{oil share})`$;
   sand $`S`$ = 2 x 2 mean occupancy; suppression
-  $`s = \max\big(\operatorname{clamp}(2.4\, W), \operatorname{clamp}(S / 0.35)\big)`$;
+  $`s = \max\big(\mathrm{clamp}(2.4\, W), \mathrm{clamp}(S / 0.35)\big)`$;
 
   $`\displaystyle \text{flame} \leftarrow \text{flame} \max(1 - 2.2\, s, 0)^{60\Delta t}, \qquad \text{fuel} \leftarrow \text{fuel}\, (1 - 0.85\, s)^{60\Delta t}, \qquad \text{oxidizer} \leftarrow \text{oxidizer} \max(1 - 1.2\, s, 0)^{60\Delta t}`$
 
   Sand at 0.35 mean occupancy smothers a cell like a fully wet one.
-- `coupling_heat.comp`: $`T \leftarrow T\, \big(1 - \operatorname{clamp}(1.68\, W)\big)^{60\Delta t}`$.
+- `coupling_heat.comp`: $`T \leftarrow T\, \big(1 - \mathrm{clamp}(1.68\, W)\big)^{60\Delta t}`$.
 
 ### 8.8 Smoke and fire brushes
 
@@ -1379,7 +1379,7 @@ per evaporated record in the cell, clamped to 1. It is drawn white and does not 
 
 `phase_particles.comp`, per water record: a record is exposed when the cell above or beside it is open air (not a wall,
 liquid volume below 0.3 of rest). Exposed water under heat evaporates at
-$`2\,\mathrm{s^{-1}} \times \operatorname{smoothstep}(0.25, 0.7, \text{hot})`$, where hot is the hottest temperature or
+$`2\,\mathrm{s^{-1}} \times \mathrm{smoothstep}(0.25, 0.7, \text{hot})`$, where hot is the hottest temperature or
 flame within four gas cells above. Removal is stochastic per record: a hash of the record's own state (never its slot,
 which compaction reorders) below $`1 - e^{-\text{rate}\,\Delta t}`$. The record is deactivated, counted in the
 evaporated sink and added to its gas cell's steam source.
@@ -1425,7 +1425,7 @@ Source-free particle mass drift above 0.5%, unexpected creation or loss and nonz
 
 | Constant | Value | Basis |
 | --- | --- | --- |
-| `kWaterEvaporateRate` | $`2\,\mathrm{s^{-1}} \times \operatorname{smoothstep}(0.25, 0.7, \text{heat})`$ | a thin film per second under full flame |
+| `kWaterEvaporateRate` | $`2\,\mathrm{s^{-1}} \times \mathrm{smoothstep}(0.25, 0.7, \text{heat})`$ | a thin film per second under full flame |
 | `kWaterFlashRate` | 30 /s | mean life 1/30 s |
 | `kSteamRise` | 100 gas cells/s | 1 m/s |
 | `kSteamCondense` | 0.8 /s | gone within about 1.5 s |
@@ -1449,7 +1449,7 @@ wrapped at an hour), used only in lit frames, so a frame is a function of the si
 
 `render_extract.comp` (per tick, full resolution): bilinear upsampling of the gas fields, with smoke, temperature and
 flame raised to the mean of a 3 x 3 ring of taps 0.55 gas cells apart where that is larger (softens the 2x upsample);
-emissive fire $`= \operatorname{clamp}\big(\text{flame}\, (0.66 + 0.20\, T) + 0.11\, T\big)`$; smoke
+emissive fire $`= \mathrm{clamp}\,\big(\text{flame}\, (0.66 + 0.20\, T) + 0.11\, T\big)`$; smoke
 $`\times 0.9`$.
 
 ### 11.2 Emitted light and lantern
@@ -1465,7 +1465,7 @@ Cursor lantern: only letterboxed frames with the cursor over the simulation get 
 
 ```math
 R = (130 + 1.5\, r_{\text{brush}})\,(1 + 0.12\, e_{\text{paint}})\ \text{cells}, \qquad
-f = 1 - \operatorname{smoothstep}(0, 1, d / R), \qquad
+f = 1 - \mathrm{smoothstep}(0, 1, d / R), \qquad
 \text{glow} \mathrel{+}= (1.0, 0.46, 0.16) \times 2.4\, f^2
 ```
 
@@ -1485,7 +1485,7 @@ builds an albedo in this order:
    per-cell threshold, so it breaks up like dithered pixel art.
 3. Wood: brown planks with grain and plank lines that char toward grey ash with burnt fraction; burning cells get an
    ember glow.
-4. Sand: coverage $`\operatorname{smoothstep}(0.04, 0.11, \cdot)`$ of the filtered occupancy (sampled at twice the
+4. Sand: coverage $`\mathrm{smoothstep}(0.04, 0.11, \cdot)`$ of the filtered occupancy (sampled at twice the
    occupancy, saturated, which keeps the look tuned on the earlier half-density occupancy); ochre that darkens with
    occupancy, per-cell shade and light and dark specks, darkening by up to 45% with moisture (water in the pores
    scatters less, Lekner and Dorf 1988), a pale rim on exposed tops.
@@ -1502,7 +1502,7 @@ builds an albedo in this order:
 8. Steam: a white plume over everything.
 9. Lighting (lit frames): light = ambient $`(0.18, 0.205, 0.30) \times`$ vignette + glow + lantern, summed in linear
    units and applied as its square root (albedo times light in gamma-2 space). The vignette is
-   $`1 - 0.82\, \operatorname{smoothstep}(0.3, 1, d_{\text{centre}})`$ with $`d_{\text{centre}}`$ the distance from
+   $`1 - 0.82\, \mathrm{smoothstep}(0.3, 1, d_{\text{centre}})`$ with $`d_{\text{centre}}`$ the distance from
    centre. The back wall gets half the glow and lantern light. Warm light desaturates the colour by up to 40% of the
    warm share, so lit stone reads orange-brown. Water and oil glints and a little steam self-light are added after the
    light.
