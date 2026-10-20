@@ -34,10 +34,25 @@ uniform int brushRadius;
 uniform vec2 spawnVelocity;
 uniform int spawnCountPerCell;
 uniform float particleMass;
-uniform float referenceDensity;
 uniform int maxParticles;
 uniform int blockedBySolid;
 uniform float occupancyLimit;
+uniform int skipActive;
+uniform ivec2 skipCenter;
+uniform uint spawnSeed;
+uniform float velocitySpread;
+
+// PCG-style integer hash: per-particle jitter that varies with the cell, the particle and the tick (spawnSeed).
+uint hashBits(uvec3 v) {
+    uint h = v.x * 1664525u + v.y * 22695477u + v.z * 2654435761u + spawnSeed * 2246822519u;
+    h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+    return h;
+}
+
+vec2 uniform2(uvec3 v) {
+    uint h = hashBits(v);
+    return vec2(float(h & 65535u), float(h >> 16)) / 65536.0;  // [0, 1): stays inside the cell
+}
 
 bool insideBrush(ivec2 coord) {
     vec2 cellCenter = vec2(coord) + vec2(0.5);
@@ -46,22 +61,22 @@ bool insideBrush(ivec2 coord) {
     return dot(delta, delta) <= float(brushRadius * brushRadius);
 }
 
-vec2 spawnOffset(ivec2 coord, int index) {
-    uint hash = uint(coord.x * 73856093) ^ uint(coord.y * 19349663) ^ uint(index * 83492791);
-    float jx = float(hash & 255u) / 255.0 - 0.5;
-    float jy = float((hash >> 8) & 255u) / 255.0 - 0.5;
-    return vec2(jx, jy) * 0.32;
+// The previous stamp of the same stroke tick already emitted into its own disc.
+bool alreadyStamped(ivec2 coord) {
+    vec2 delta = vec2(coord - skipCenter);
+    return skipActive == 1 && dot(delta, delta) <= float(brushRadius * brushRadius);
 }
+
 
 void main() {
     ivec2 coord = dispatchOrigin + ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
         return;
     }
-    if (!insideBrush(coord)) {
+    if (!insideBrush(coord) || alreadyStamped(coord)) {
         return;
     }
-    if (blockedBySolid == 1 && imageLoad(materialTex, coord).r == 2u) {
+    if (blockedBySolid == 1 && imageLoad(materialTex, coord).r >= 2u) {
         return;
     }
     if (imageLoad(sandOccupancyTex, coord).x >= occupancyLimit) {
@@ -83,10 +98,13 @@ void main() {
             return;
         }
 
-        vec2 position = vec2(coord) + vec2(0.5) + spawnOffset(coord, i);
-        particles[slot].state0 = vec4(position, spawnVelocity);
+        vec2 position = vec2(coord) + uniform2(uvec3(coord, uint(3 * i)));
+        vec2 spread = (uniform2(uvec3(coord, uint(3 * i + 1))) * 2.0 - vec2(1.0)) * velocitySpread;
+        particles[slot].state0 = vec4(position, spawnVelocity + spread);
         particles[slot].state1 = vec4(1.0, particleMass, 0.0, 0.0);
-        particles[slot].state2 = vec4(0.0, 0.0, particleMass / referenceDensity, 0.0);
+        // state2.z: no volume correction. state2.w: the grain's friction trait, an integer in [-31, 31], so no two piles
+        // are alike, plus its moisture (0, dry) in the fraction (sand_particle_step).
+        particles[slot].state2 = vec4(0.0, 0.0, 0.0, floor(uniform2(uvec3(coord, uint(3 * i + 2))).x * 63.0) - 31.0);
         particles[slot].state3 = vec4(1.0, 0.0, 0.0, 1.0);
     }
 }

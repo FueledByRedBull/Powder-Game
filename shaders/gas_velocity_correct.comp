@@ -27,6 +27,8 @@ uniform float velocityDissipation;
 uniform float buoyancyTemperature;
 uniform float buoyancySmoke;
 uniform float maxVelocity;
+// Vorticity confinement strength (1/s): puts back the small swirls that interpolation smooths away.
+uniform float vorticity;
 
 ivec2 clampCell(ivec2 coord) {
     return clamp(coord, ivec2(0), gasSize - ivec2(1));
@@ -112,16 +114,6 @@ vec2 sampleCenterVelocitySrc(vec2 position) {
     return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
 }
 
-vec2 sampleCenterVelocityFwd(vec2 position) {
-    vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
-    ivec2 base = ivec2(floor(p));
-    vec2 frac = fract(p);
-    vec2 v00 = imageLoad(gasCenterVelocityFwd, base).xy;
-    vec2 v10 = imageLoad(gasCenterVelocityFwd, clampCell(base + ivec2(1, 0))).xy;
-    vec2 v01 = imageLoad(gasCenterVelocityFwd, clampCell(base + ivec2(0, 1))).xy;
-    vec2 v11 = imageLoad(gasCenterVelocityFwd, clampCell(base + ivec2(1, 1))).xy;
-    return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
-}
 
 
 
@@ -171,6 +163,27 @@ float sampleSmoke(ivec2 coord) {
     return imageLoad(smokeDensityTex, clampCell(coord)).x;
 }
 
+// Curl of the centred velocity at a cell; walls and the domain edge contribute none.
+float curlAt(ivec2 c) {
+    if (blockedCell(c)) return 0.0;
+    vec2 l = imageLoad(gasCenterVelocitySrc, clampCell(c - ivec2(1, 0))).xy;
+    vec2 r = imageLoad(gasCenterVelocitySrc, clampCell(c + ivec2(1, 0))).xy;
+    vec2 b = imageLoad(gasCenterVelocitySrc, clampCell(c - ivec2(0, 1))).xy;
+    vec2 t = imageLoad(gasCenterVelocitySrc, clampCell(c + ivec2(0, 1))).xy;
+    return 0.5 * ((r.y - l.y) - (t.x - b.x));
+}
+
+// Fedkiw et al. 2001: f = epsilon (N x omega), N the unit gradient of |omega|.
+vec2 confinementAt(ivec2 c) {
+    if (vorticity <= 0.0 || blockedCell(c)) return vec2(0.0);
+    vec2 gradient = 0.5 * vec2(abs(curlAt(c + ivec2(1, 0))) - abs(curlAt(c - ivec2(1, 0))),
+                               abs(curlAt(c + ivec2(0, 1))) - abs(curlAt(c - ivec2(0, 1))));
+    float len = length(gradient);
+    if (len < 1e-4) return vec2(0.0);
+    vec2 n = gradient / len;
+    return vorticity * curlAt(c) * vec2(n.y, -n.x);
+}
+
 bool invalid(float value) {
     return isnan(value) || isinf(value);
 }
@@ -186,13 +199,14 @@ void main() {
             vec2 backtrace = clamp(facePos - sampleCenterVelocitySrc(facePos) * dt,
                                    vec2(0.0, 0.5),
                                    vec2(gasSize.x, gasSize.y - 0.5));
-            vec2 reverseTrace = clamp(facePos + sampleCenterVelocityFwd(facePos) * dt,
+            vec2 reverseTrace = clamp(facePos + sampleCenterVelocitySrc(facePos) * dt,
                                       vec2(0.0, 0.5),
                                       vec2(gasSize.x, gasSize.y - 0.5));
             TransportStencil backStencil = transportStencil(facePos, backtrace, vec2(0.0, 0.5), ivec2(gasSize.x, gasSize.y - 1), 0);
             TransportStencil reverseStencil = transportStencil(facePos, reverseTrace, vec2(0.0, 0.5), ivec2(gasSize.x, gasSize.y - 1), 0);
             value = imageLoad(gasUFwd, coord).x + 0.5 * (imageLoad(gasUSrc, coord).x - sampleUFwd(reverseStencil));
             value = clampLocalU(backStencil, value) * velocityDissipation;
+            value += 0.5 * (confinementAt(ivec2(coord.x - 1, coord.y)).x + confinementAt(coord).x) * dt;
             value = clamp(value, -maxVelocity, maxVelocity);
             if (invalid(value)) {
                 atomicAdd(nanInfDetected, 1u);
@@ -210,7 +224,7 @@ void main() {
             vec2 backtrace = clamp(facePos - sampleCenterVelocitySrc(facePos) * dt,
                                    vec2(0.5, 0.0),
                                    vec2(gasSize.x - 0.5, gasSize.y));
-            vec2 reverseTrace = clamp(facePos + sampleCenterVelocityFwd(facePos) * dt,
+            vec2 reverseTrace = clamp(facePos + sampleCenterVelocitySrc(facePos) * dt,
                                       vec2(0.5, 0.0),
                                       vec2(gasSize.x - 0.5, gasSize.y));
             TransportStencil backStencil = transportStencil(facePos, backtrace, vec2(0.5, 0.0), ivec2(gasSize.x - 1, gasSize.y), 1);
@@ -221,7 +235,8 @@ void main() {
             float temperature =
                 0.5 * (sampleTemperature(ivec2(coord.x, coord.y - 1)) + sampleTemperature(ivec2(coord.x, coord.y)));
             float smoke = 0.5 * (sampleSmoke(ivec2(coord.x, coord.y - 1)) + sampleSmoke(ivec2(coord.x, coord.y)));
-            value += (buoyancyTemperature * max(temperature - 0.08, 0.0) - buoyancySmoke * smoke) * dt;
+            value += (buoyancyTemperature * temperature - buoyancySmoke * smoke +
+                      0.5 * (confinementAt(ivec2(coord.x, coord.y - 1)).y + confinementAt(coord).y)) * dt;
             value = clamp(value, -maxVelocity, maxVelocity);
             if (invalid(value)) {
                 atomicAdd(nanInfDetected, 1u);

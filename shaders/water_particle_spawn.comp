@@ -3,6 +3,7 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 1) uniform readonly image2D liquidVolumeTex;
 
 struct WaterParticle {
     vec4 state0;
@@ -33,6 +34,26 @@ uniform vec2 spawnVelocity;
 uniform int spawnCountPerCell;
 uniform float particleMass;
 uniform int maxParticles;
+uniform float densityLimit;
+uniform int skipActive;
+uniform ivec2 skipCenter;
+uniform uint spawnSeed;
+// Half-width (cells/s) of the uniform random spread added to each spawned particle's velocity.
+uniform float velocitySpread;
+// 1 tags the records as oil (state2.z), which floats on water and burns (phase_particles.comp).
+uniform float oilFlag;
+
+// PCG-style integer hash: per-particle jitter that varies with the cell, the particle and the tick (spawnSeed).
+uint hashBits(uvec3 v) {
+    uint h = v.x * 1664525u + v.y * 22695477u + v.z * 2654435761u + spawnSeed * 2246822519u;
+    h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+    return h;
+}
+
+vec2 uniform2(uvec3 v) {
+    uint h = hashBits(v);
+    return vec2(float(h & 65535u), float(h >> 16)) / 65536.0;  // [0, 1): stays inside the cell
+}
 
 bool insideBrush(ivec2 coord) {
     vec2 cell_center = vec2(coord) + vec2(0.5);
@@ -41,18 +62,31 @@ bool insideBrush(ivec2 coord) {
     return dot(delta, delta) <= float(brushRadius * brushRadius);
 }
 
+// The previous stamp of the same stroke tick already emitted into its own disc.
+bool alreadyStamped(ivec2 coord) {
+    vec2 delta = vec2(coord - skipCenter);
+    return skipActive == 1 && dot(delta, delta) <= float(brushRadius * brushRadius);
+}
+
 void main() {
     ivec2 coord = dispatchOrigin + ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
         return;
     }
-    if (!insideBrush(coord) || imageLoad(boundaryTex, coord).r != 0u) {
+    if (!insideBrush(coord) || alreadyStamped(coord) || imageLoad(boundaryTex, coord).r != 0u) {
+        return;
+    }
+    // A held brush must not keep stacking particles into a cell already as dense as the brush emits.
+    // A zero limit keeps the exact per-cell emission of scripted brushes.
+    if (densityLimit > 0.0 && imageLoad(liquidVolumeTex, coord).x >= densityLimit) {
         return;
     }
 
     int count = max(spawnCountPerCell, 1);
     for (int i = 0; i < count; ++i) {
-        vec2 jitter = vec2(float(i & 1), float((i >> 1) & 1)) * 0.24 - vec2(0.12);
+        // Anywhere in the cell, not a 2x2 lattice: a lattice falls as rigid rows and stacks into teeth.
+        vec2 jitter = uniform2(uvec3(coord, uint(2 * i))) - vec2(0.5);
+        vec2 spread = (uniform2(uvec3(coord, uint(2 * i + 1))) * 2.0 - vec2(1.0)) * velocitySpread;
         uint slot = atomicAdd(spawnCursor, 0u);
         while (slot < uint(maxParticles)) {
             uint observed = atomicCompSwap(spawnCursor, slot, slot + 1u);
@@ -65,8 +99,8 @@ void main() {
             atomicAdd(particleOverflowBlocked, 1u);
             return;
         }
-        particles[slot].state0 = vec4(vec2(coord) + vec2(0.5) + jitter, spawnVelocity);
+        particles[slot].state0 = vec4(vec2(coord) + vec2(0.5) + jitter, spawnVelocity + spread);
         particles[slot].state1 = vec4(1.0, particleMass, 0.0, 0.0);
-        particles[slot].state2 = vec4(0.0);
+        particles[slot].state2 = vec4(0.0, 0.0, oilFlag, 0.0);
     }
 }

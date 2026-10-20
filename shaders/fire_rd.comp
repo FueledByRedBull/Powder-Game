@@ -31,6 +31,8 @@ uniform float temperatureCooling;
 uniform float heatRelease;
 uniform float smokeYield;
 uniform float smokeDissipation;
+// Oxygen relaxes toward fresh air (oxidizer 1) at this rate (1/s): the flame entrains surrounding air.
+uniform float oxygenRate;
 
 ivec2 clampGrid(ivec2 coord) {
     return clamp(coord, ivec2(0), gridSize - ivec2(1));
@@ -106,7 +108,9 @@ void main() {
 
     fuel = clamp(fuel - consumed, 0.0, 1.0);
     oxidizer = clamp(oxidizer - consumed * oxidizerConsumption, 0.0, 1.0);
-    reaction = clamp(reaction + consumed - reactionDecay * reaction * dt, 0.0, 1.0);
+    oxidizer += (1.0 - oxidizer) * (1.0 - exp(-oxygenRate * dt));
+    // The flame (y) follows the burn and fades within about 1/reactionDecay once the fuel is gone.
+    reaction = clamp(reaction * exp(-reactionDecay * dt) + consumed, 0.0, 1.0);
     temperature = clamp(temperature + consumed * heatRelease +
                             (temperatureDiffusion * lapTemperature - temperatureCooling * temperature) * dt,
                         0.0,
@@ -124,6 +128,7 @@ void main() {
     imageStore(fuelDst, coord, vec4(fuel, 0.0, 0.0, 0.0));
     imageStore(oxidizerDst, coord, vec4(oxidizer, 0.0, 0.0, 0.0));
     imageStore(temperatureDst, coord, vec4(temperature, 0.0, 0.0, 0.0));
-    imageStore(reactionDst, coord, vec4(0.0, reaction, 0.0, 0.0));
+    // x: fuel burned per second, the source of combustion expansion in smoke_divergence.comp.
+    imageStore(reactionDst, coord, vec4(dt > 0.0 ? consumed / dt : 0.0, reaction, 0.0, 0.0));
     imageStore(smokeDst, coord, vec4(smokeDensity, 0.0, 0.0, 0.0));
 }

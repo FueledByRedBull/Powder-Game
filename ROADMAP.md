@@ -1,5 +1,159 @@
 # Powder Game Completion Roadmap
 
+## Current handoff - v0.5.0, 2026-10-20
+
+This section is the current handoff. Everything below it is history, kept as written;
+where an older section says "current", read it as the state on the date in its title.
+
+State: `main` at `3f7055d` plus the working tree that is to be committed and tagged
+`v0.5.0` (the tag workflow then builds a draft release). Measured results, hashes and
+exit codes are in VALIDATION, "Current status"; raw logs are in the ignored
+`build/goal-baseline/2026-10-20-v0.5.0-final/`.
+
+What the release contains (design in PLAN):
+
+- Eight materials on keys 1-8: sand, water, solid, erase, smoke, fire, wood and oil.
+  Fire burns in ambient oxygen and rises at real speed; water boils to steam where it
+  meets flame; oil floats on water and burns as a slick; wood catches, chars and
+  crumbles; sand smothers fire. H toggles the help panel, F1 the composite view, F2-F10
+  the debug views, Esc quits.
+- Real scale: 5 mm cells, g = 9.81 m/s^2, no artificial velocity damping except the
+  supported-water bulk term, speed caps 2400 cells/s. Water is APIC/FLIP with an MGPCG
+  pressure solve; sand is MPM-style with plastic yield, mu(I), volume correction and wet
+  cohesion; the 500x500 gas grid has an MGPCG projection.
+- Pools of 2,097,152 water and 1,048,576 sand records. Settled sand sleeps as per-cell
+  grain counts and calm deep water packs the same way, so neither stays in the moving
+  pool; both wake when disturbed.
+- Dark cave composite with fire light (`light_build.comp`) and a cursor lantern, and an
+  interactive-only HUD (`hud.frag`, `HudFont.hpp`) in the letterbox margin.
+
+Verified on 2026-10-20 (Windows 11, RX 7800 XT, Unity editor sharing the GPU): Release
+build exit 0, CTest 80/80, `POWDER_REPLAY=all` exit 0, a 5 s launch with empty output.
+
+Open items:
+
+1. `benchmark-realtime` exits 1. Its timing gates now pass (combined GPU mean 21.4-22.9 ms,
+   p95 26.5-28.3 ms) but `pressure_nonconverged` is 2 from frame 13 on both runs. Find
+   which solve misses its gate there and fix it without weakening the residual gate;
+   `POWDER_PRESSURE_AUDIT` currently fails to capture the system. Then rerun on an idle
+   GPU. The preferred 60 FPS combined target (about 44-47 FPS here) is unmet.
+2. Native interactive checks: live mouse painting and fast strokes, the H key and help
+   timeout, HiDPI and DPI transitions, temporal flicker on a real monitor.
+3. Fast strokes on Windows: `WM_MOUSEMOVE` is coalesced to about one event per poll, and a
+   radius 1-3 brush faster than about 64 cells per tick still leaves beaded gaps.
+4. Sand feel: measured repose 26.6-30.7 degrees against a target near 32; a packed pile
+   has a lower, flatter top than a moving one (not gated).
+5. Not run here: Linux and MinGW builds, other GPUs, the hosted CI and release workflows.
+   Verify the draft release's ZIPs and `SHA256SUMS.txt` before publishing it.
+6. Packaging hygiene: CMake's `copy_directory` keeps deleted shaders in an existing build
+   tree; package from a clean build directory.
+
+## Earlier handoff - 2026-10-19 (historical)
+
+This was the handoff on 2026-10-19; the items it lists as open are superseded by the
+section above.
+
+State: `main` at `3f7055d` plus uncommitted changes. Modified: `CMakeLists.txt`,
+`shaders/composite.frag`, `shaders/sand_particle_clear.comp`,
+`shaders/spawn_smoke.comp`, `shaders/water_particle_clear.comp`,
+`shaders/water_particle_spawn.comp`, `src/PowderApp.cpp`, `src/PowderApp.hpp`,
+`tests/AppLifecycleTests.cpp`, `tests/GpuTests.cpp`. New: `shaders/hud.frag`,
+`shaders/light_build.comp`, `src/HudFont.hpp`, `docs/screenshot.png`. The documentation files and the packaged
+README text in `build-win11.sh` and both workflows were updated to match. No branches, commits or
+publication.
+
+Done in this working tree:
+
+- In-game HUD, interactive only: a compact inventory (six pixel-art material slots
+  numbered 1-6, the selected slot outlined, its name and the brush radius) and a help
+  panel under it at the top left, in the letterbox margin when it is wide enough;
+  the help panel is shown at launch, hides itself after about 8 seconds and toggles with
+  `H` (an "H HELP" hint remains when hidden); an anti-aliased brush ring drawn in grid
+  space. The window title is
+  refreshed about twice a second with brush, radius and FPS. `Render()` stays
+  HUD-free so replays and pixel tests are unchanged; only `DrawHud()` draws it.
+- Letterboxed, aspect-correct simulation viewport in the interactive window
+  (`Render(true)`). Cursor mapping handles the margins and DPI scaling, and painting
+  needs the cursor over the simulation with the window hovered.
+- New composite look. Water is a cohesive blue body: the "water barely shows up" bug
+  came from composite thresholds calibrated above typical free-surface water amounts,
+  and thin one- or two-particle water now reads, with depth shading, a surface rim and
+  foam only for fast flow (about 35 cells/s and up). Also a background gradient with
+  dither, sand grain with a soft edge and top light, a solid bevel, a fire temperature
+  glow with soft tonemapping, and a warm smoke tint. The render-modes CPU oracle
+  mirrors the new math.
+- Dark cave look pass, presentation only (no simulation, particle, solver, spawn or
+  replay change; it replaces the earlier cozy toybox direction): a near-black textured
+  cave wall that `composite.frag` also paints into the letterbox margin; textured cool
+  stone with moss patches and crusty rims; ochre sand; murky teal water with a thin
+  surface line; dark smoke; fire as the hero light. The scene is albedo times light
+  (dim moonlit ambient with a strong vignette, a wide warm glow built from the fire's
+  render fields in `light_build.comp` and a mip chain, and a cursor lantern in interactive
+  frames) plus emissive flames and embers. `lighting_enabled_` switches the light off for
+  the CPU oracle and the HUD pixel tests; the new `app-lighting` case checks the light.
+  The HUD is dark low-opacity pixel-art plates with a warm one-unit edge, a brush ring that
+  is thin and reddish for erase, and eased motion (about 150 ms, `HudMotion`, advanced by
+  `DrawHud(now)`). Measured cost and verification are in VALIDATION.
+- Bug fixes. Erase no longer deletes water particles in sand-covered cells across the
+  whole map (`water_particle_clear` was culling every "blocked" cell). The solid brush
+  removes sand and water particles inside the painted disc. Held strokes are
+  interpolated along the cursor events collected since the last tick, from the press
+  (spacing at most max(1, radius/2), at most 64 stamps per tick), so fast strokes leave
+  no gaps and curves are followed; sand and water stamps skip the previous stamp's disc,
+  so a swept cell gets one held tick of particles. Smoke erase clears the shared right and top velocity
+  faces. The interactive water brush has a density gate; scripted and replay brushes
+  keep exact emission.
+- Sand and sand-water pass (PLAN "Sand and water", VALIDATION): occupancy is mass over
+  rest density; sand walls off water above 0.25 and gas above 0.75 (mask values 2 and
+  3); sand is a moving, slightly porous wall for the water pressure solve; water caught
+  in sand is carried out instead of freezing; submerged sand is buoyed and dragged and
+  water feels the equal drag; the sand grid velocity is RG32F; stiffness doubled (20
+  material substeps); failed deformations are repaired; thin walls remove only inward
+  motion. Friction alpha stays 0.5 (about 30 degree piles measured).
+
+Verified in this session (details and the new test coverage are in VALIDATION): Release
+build exit 0; ctest 52/52 passed (45 before the sand pass); `POWDER_REPLAY=all` exit 0
+with all 12 scene passes.
+`benchmark-realtime` **failed** the 30 FPS combined gate: combined GPU mean about
+33.4-33.6 ms against the 33.33 ms budget, GPU p95 about 46-47 ms under the 50 ms limit.
+A/B runs with the original shaders on the same machine were in the same 31.4-33.7 ms
+band while a VirtualBox VM was running, so the gate is borderline and unmet, not
+passed, and the preferred 60 FPS combined target is also unmet. After the sand pass the
+combined GPU mean is about 35.0 ms, 1.5 ms above the baseline measured alternately the same
+session. Static review, GPU
+fixtures and offscreen frames cover the HUD and composite; no native interactive
+observation was made.
+
+Open items:
+
+1. Re-run `benchmark-realtime` on a quiet machine with no VM, then copy the raw logs
+   (and this session's) into `build/goal-baseline/` with source, shader and binary
+   hashes. Do not claim the 30 FPS gate until it passes there.
+2. Native interactive checks: live mouse painting including fast strokes, the `H` key
+   in a live window, HiDPI and DPI transitions, and visual temporal flicker of the
+   dither and sand grain.
+3. Fast strokes (offscreen replay of a 600-cell sweep, all brushes): overlapping water
+   and sand stamps emitted 2.7-3.2x the held-tick particles and a radius-24 water
+   stroke exhausted the 262,144-particle pool (about 22,000 blocked spawns, the last
+   fifth of the stroke missing); stamps now skip the previous stamp's disc, so cells get
+   2 sand or 4 water particles and no spawn is blocked. Still open: Windows coalesces
+   `WM_MOUSEMOVE` to about one cursor event per `glfwPollEvents`, so the callback
+   trail is frame-rate dense there (sub-frame curve detail needs `GetMouseMovePointsEx`
+   or raw input), and a radius 1-3 brush faster than about 64 cells per tick still
+   leaves beaded gaps because the 64-stamp bound spreads the stamps.
+4. Native look-and-feel checks for the dark cave pass: motion feel at the real refresh
+   rate (slot selection, help fade and timeout, painting pulse and lantern swell), the
+   lantern and glow on a real monitor and at other brightness settings, the HUD at HiDPI
+   scales and in a narrow-margin window. `docs/screenshot.png` still shows the cozy look.
+5. Sand pass leftovers. The gas pressure solve sits near its 0.015 gate beside small sand
+   obstacles on the floor (the `combined` replay hit 0.0157 at every sand threshold below
+   0.6 before the shipped ones; 1 of 10 sand-brush offsets still does): the gas worker
+   should look at wedge geometry. The water solver has no particle density constraint, so
+   water moved by escape or drag stays displaced. Only the surface of a dense sand body is
+   dragged and buoyed. The domain-wall half-cell (sand particles stop 0.5 cell inside the
+   domain while painted walls stop at the face) was left: fixing it needs the grid wall
+   normals, the support stencil and about ten test expectations to change together.
+
 ## Completed goal and native follow-up - 2026-10-02
 
 This execution record supersedes the historical status claims below. Ponytail full

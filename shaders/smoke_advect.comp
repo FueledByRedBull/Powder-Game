@@ -165,7 +165,8 @@ void main() {
                coord,
                vec4(clamp(sampleOxidizer(backStencil), 0.0, 1.0), 0.0, 0.0, 0.0));
     vec2 reaction = sampleReaction(backStencil);
-    reaction.x = 0.0;
+    // x is the burn rate that drives combustion expansion; it travels with the gas.
+    reaction.x = max(reaction.x, 0.0);
     reaction.y = clamp(reaction.y, 0.0, 1.0);
     imageStore(reactionDst, coord, vec4(reaction, 0.0, 0.0));
 }

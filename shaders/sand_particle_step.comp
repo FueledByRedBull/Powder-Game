@@ -3,7 +3,10 @@
 layout(local_size_x = 256) in;
 
 layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
-layout(rg16f, binding = 1) uniform readonly image2D sandVelocityTex;
+layout(rg32f, binding = 1) uniform readonly image2D sandVelocityTex;
+// Sleeping grains per cell (sand_pack.comp): moving grains collide with packed cells like with walls.
+layout(r8ui, binding = 2) uniform readonly uimage2D packedTex;
+layout(r16f, binding = 3) uniform readonly image2D waterAmountTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -31,13 +34,33 @@ uniform int maxParticles;
 uniform float shearModulus;
 uniform float lameLambda;
 uniform float frictionAlpha;
+// Relative spread of the per-grain friction: alpha * (1 + frictionVariation * trait), trait in [-1, 1] (state2.w).
+uniform float frictionVariation;
+// Contact damping rate (1/s) of confined sand: full below volume ratio J 0.85, none above 0.95.
+uniform float contactDamping;
+// mu(I) rheology (Jop et al. 2006): alpha (1 + frictionRateGain I / (inertialI0 + I)), with the inertial number
+// I = shear rate * grainDiameter / sqrt(pressure / referenceDensity).
+uniform float frictionRateGain;
+uniform float inertialI0;
+uniform float grainDiameter;
+uniform float referenceDensity;
+// Wet-sand cohesion: the log volume strain of compression the cone widens by at full capillary strength.
+uniform float cohesion;
+// Largest remembered dilation (log volume): dense over loose random packing.
+uniform float maxDilation;
+// Moisture relaxes up toward the water fill around the grain at wettingRate and dries at dryingRate (1/s). moistureDt is
+// the tick's dt on its first substep and 0 on the others: moisture advances once per tick, above the float rounding.
+uniform float wettingRate;
+uniform float dryingRate;
+uniform float moistureDt;
+uniform float waterFullVolume;
 
 bool blockedCell(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
-           imageLoad(boundarySdfTex, cell).x <= 0.0;
+           imageLoad(boundarySdfTex, cell).x <= 0.0 || imageLoad(packedTex, cell).r > 0u;
 }
 
-float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
+float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 lastCell) {
     float hitTime = 1.0;
     hitNormal = vec2(0.0);
     for (int axis = 0; axis < 2; ++axis) {
@@ -56,6 +79,7 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
     }
 
     ivec2 cell = ivec2(floor(position));
+    lastCell = cell;
     ivec2 direction = ivec2(sign(displacement));
     vec2 nextCross = vec2(1e30);
     for (int axis = 0; axis < 2; ++axis) {
@@ -89,6 +113,7 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
             return time;
         }
         cell = target;
+        lastCell = cell;
         // Refer to the original segment instead of accumulating roundoff over a long sweep.
         for (int axis = 0; axis < 2; ++axis) {
             if (crossed[axis]) {
@@ -113,12 +138,18 @@ void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 aff
     // Each contact removes one inward displacement component; the remaining tangent is swept again.
     for (int contact = 0; contact < 2; ++contact) {
         vec2 normal;
-        float time = sweepGrid(position, displacement, normal);
+        ivec2 openCell;
+        float time = sweepGrid(position, displacement, normal, openCell);
         position += displacement * time;
+        position += normal * 0.0001;
+        // Rounding in the hit point can land a contact (or an edge-grazing move) a few ulps inside the next cell,
+        // which may be a wall, where the grain would stick. Keep it in the last open cell the sweep traversed.
+        if (any(notEqual(ivec2(floor(position)), openCell))) {
+            position = clamp(position, vec2(openCell), vec2(openCell + ivec2(1)) - vec2(1.0 / 256.0));
+        }
         if (all(equal(normal, vec2(0.0)))) {
             return;
         }
-        position += normal * 0.0001;
         displacement *= 1.0 - time;
         for (int axis = 0; axis < 2; ++axis) {
             if (normal[axis] != 0.0) {
@@ -177,7 +208,46 @@ bool invalid(float value) {
     return isnan(value) || isinf(value);
 }
 
-bool projectDeformation(mat2 deformation, out mat2 projected) {
+// Nearest rotation of a degenerate deformation; identity when none can be extracted.
+mat2 rotationOf(mat2 deformation) {
+    vec2 rotation = vec2(deformation[0][0] + deformation[1][1], deformation[0][1] - deformation[1][0]);
+    float length2 = dot(rotation, rotation);
+    if (!(length2 > 1e-12) || isinf(length2)) return mat2(1.0);
+    rotation *= inversesqrt(length2);
+    return mat2(rotation, vec2(-rotation.y, rotation.x));
+}
+
+// exp(a) for a 2x2 matrix. dF/dt = grad(v) F integrated over a substep is exp(dt grad(v)) F, whose determinant
+// exp(dt trace) stays positive; the forward-Euler I + dt grad(v) inverts once an impact makes dt |grad(v)| ~ 1.
+mat2 matrixExp(mat2 a) {
+    float half_trace = 0.5 * (a[0][0] + a[1][1]);
+    mat2 b = a - mat2(half_trace);
+    // b is traceless, so b * b = -det(b) I.
+    float d = -determinant(b);
+    float r = sqrt(abs(d));
+    float c;
+    float s;
+    if (d > 0.0) {
+        c = cosh(r);
+        s = sinh(r) / r;
+    } else if (d < 0.0) {
+        c = cos(r);
+        s = sin(r) / r;
+    } else {
+        c = 1.0;
+        s = 1.0;
+    }
+    return exp(half_trace) * (mat2(c) + s * b);
+}
+
+// Drucker-Prager return mapping in log strain with volume correction (Klar et al. 2016). volumeCorrection is the
+// dilation (log volume) a tip projection dropped: the grain must recover it before it bears load again, so loose sand
+// compacts instead of forgetting that it expanded. cohesion >= 0 (a log volume strain) widens the cone by that much
+// compression: Mohr-Coulomb shear strength at zero pressure with a tension cut-off, a simplified Tampubolon et al. 2017
+// (2 grains per cell cannot carry the tensile stress of a shifted apex: it fractured and flattened damp columns).
+// 0 is cohesion-free dry sand. alpha rises with the inertial number (mu(I), Jop et al. 2006).
+bool projectDeformation(mat2 deformation, float alpha, float shearRate, float cohesion, inout float volumeCorrection,
+                        out mat2 projected) {
     float volume = determinant(deformation);
     vec2 rotation = vec2(deformation[0][0] + deformation[1][1], deformation[0][1] - deformation[1][0]);
     float rotationLength = length(rotation);
@@ -195,24 +265,41 @@ bool projectDeformation(mat2 deformation, out mat2 projected) {
     stretch.y = volume / stretch.x;
     if (any(lessThanEqual(stretch, vec2(0.0))) || invalid(stretch.x) || invalid(stretch.y)) return false;
     vec2 strain = log(stretch);
-    float trace = strain.x + strain.y;
+    float spent = volumeCorrection;
+    // The grain's log volume change since rest: elastic part plus the remembered dilation.
+    float trace = strain.x + strain.y + spent;
     if (trace > 0.0) {
+        // Separated: stress-free (liquid bridges break too); the grain remembers the dilation up to the dilatancy
+        // limit. Past loose packing the grains are apart, and a deeper memory let MPM's volume drift overpack poured
+        // piles fourfold.
+        volumeCorrection = min(trace, maxDilation);
         projected = polar;
         return true;
     }
-    vec2 deviator = strain - 0.5 * trace;
+    volumeCorrection = 0.0;
+    vec2 deviator = strain - 0.5 * (strain.x + strain.y);
     float norm = length(deviator);
-    float delta = norm + (lameLambda + shearModulus) / shearModulus * frictionAlpha * trace;
+    // Kirchhoff pressure of the 2D Hencky model, (lambda + mu) times the compressive volume strain.
+    float pressure = max(-(lameLambda + shearModulus) * trace, 0.0);
+    float rate = shearRate * grainDiameter;
+    float inertial = rate > 0.0 ? rate / (rate + inertialI0 * sqrt(pressure / referenceDensity)) : 0.0;  // I / (I0 + I)
+    float slope = alpha * (1.0 + frictionRateGain * inertial);
+    float delta = norm + (lameLambda + shearModulus) / shearModulus * slope * (trace - cohesion);
     // Keep compressed states inside the cone, including zero deviatoric strain.
-    if (delta <= 0.0) {
+    if (delta <= 0.0 && spent == 0.0) {
         projected = deformation;
         return true;
     }
-    // ponytail: fixed cone slope; hardening can be added if calibrated material history needs it.
-    vec2 projectedStretch = norm == 0.0 ? vec2(1.0) : exp(strain - delta * deviator / norm);
+    vec2 projectedStretch = exp(0.5 * trace + (norm == 0.0 ? vec2(0.0) : deviator * (1.0 - max(delta, 0.0) / norm)));
     projected = polar * right * mat2(projectedStretch.x, 0.0, 0.0, projectedStretch.y) * transpose(right);
     return !invalid(projected[0][0]) && !invalid(projected[0][1]) &&
            !invalid(projected[1][0]) && !invalid(projected[1][1]) && determinant(projected) > 0.0;
+}
+
+// Capillary cohesion of a moisture fraction: none dry, full from 10% moisture on, gone again at saturation where the
+// liquid bridges merge (Mitarai and Nori 2006).
+float capillary(float moisture) {
+    return clamp(10.0 * moisture, 0.0, 1.0) * clamp(10.0 * (1.0 - moisture), 0.0, 1.0);
 }
 
 void main() {
@@ -228,11 +315,23 @@ void main() {
 
     vec2 position = particle.state0.xy;
     vec2 velocity = particle.state0.zw;
+    float volumeCorrection = particle.state2.z;
 
     vec2 gridVelocity;
     mat2 velocityGradient;
     mat2 affine = gatherGridVelocity(position, gridVelocity, velocityGradient);
     velocity = gridVelocity;
+    // Compressed grains are in enduring contact with their neighbours; the contacts dissipate their motion.
+    float volume = determinant(mat2(particle.state3.xy, particle.state3.zw));
+    float confined = volume < 0.95 ? min((0.95 - volume) / 0.1, 1.0) : 0.0;  // NaN F: undamped (repaired below)
+    // state2.w: the friction trait as an integer in [-31, 31] plus the moisture in the fraction [0, 1).
+    float trait = floor(particle.state2.w);
+    float moisture = particle.state2.w - trait;
+    // Liquid bridges dissipate as they stretch and break (Herminghaus 2005): damp grains are damped like confined ones.
+    confined = max(confined, capillary(moisture));
+    float retained = exp(-contactDamping * confined * dt);
+    velocity *= retained;
+    affine *= retained;
     float speed = length(velocity);
     if (speed > maxVelocity && speed > 0.0) {
         velocity *= maxVelocity / speed;
@@ -240,24 +339,45 @@ void main() {
 
     vec2 displacement = velocity * dt;
     if (invalid(position.x) || invalid(position.y) || invalid(velocity.x) || invalid(velocity.y) ||
-        invalid(displacement.x) || invalid(displacement.y) ||
+        invalid(displacement.x) || invalid(displacement.y) || !(volumeCorrection >= 0.0) || invalid(volumeCorrection) ||
         invalid(affine[0][0]) || invalid(affine[0][1]) || invalid(affine[1][0]) || invalid(affine[1][1])) {
         atomicAdd(nanInfDetected, 1u);
         particle.state1.x = 0.0;
         particles[index] = particle;
         return;
     }
+
+    if (moistureDt > 0.0) {
+        // A dense body's own cells hold no liquid, so the wettest cell around the grain sets its saturation.
+        ivec2 cell = ivec2(floor(position));
+        float fill = 0.0;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                fill = max(fill, imageLoad(waterAmountTex, clamp(cell + ivec2(i, j), ivec2(0), gridSize - ivec2(1))).x);
+            }
+        }
+        float saturation = clamp(fill / waterFullVolume, 0.0, 1.0);
+        float rate = saturation > moisture ? wettingRate : dryingRate;
+        moisture = min(mix(saturation, moisture, exp(-rate * moistureDt)), 0.999);
+    }
+
+    mat2 strainRate = 0.5 * (velocityGradient + transpose(velocityGradient));
+    mat2 shear = strainRate - mat2(0.5 * (strainRate[0][0] + strainRate[1][1]));
+    float shearRate = sqrt(2.0) * length(vec4(shear[0], shear[1]));  // gamma-dot: the rate of simple shear
     mat2 deformation;
-    mat2 trial = (mat2(1.0) + dt * velocityGradient) * mat2(particle.state3.xy, particle.state3.zw);
-    if (!projectDeformation(trial, deformation)) {
+    mat2 trial = matrixExp(dt * velocityGradient) * mat2(particle.state3.xy, particle.state3.zw);
+    float alpha = frictionAlpha * (1.0 + frictionVariation * clamp(trait / 31.0, -1.0, 1.0));
+    if (!projectDeformation(trial, alpha, shearRate, cohesion * capillary(moisture), volumeCorrection, deformation)) {
+        // Non-finite (the exponential cannot invert): count it, reset the elastic state to its rotation and keep moving.
         atomicAdd(nanInfDetected, 1u);
-        return;
+        deformation = rotationOf(trial);
+        volumeCorrection = 0.0;
     }
     moveWithCollisions(position, velocity, affine, displacement, restitution);
 
     particle.state0 = vec4(position, velocity);
     particle.state1.zw = vec2(affine[0][0], affine[0][1]);
-    particle.state2.xy = vec2(affine[1][0], affine[1][1]);
+    particle.state2 = vec4(affine[1][0], affine[1][1], volumeCorrection, trait + moisture);
     particle.state3 = vec4(deformation[0], deformation[1]);
     particles[index] = particle;
 }

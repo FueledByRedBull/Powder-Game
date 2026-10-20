@@ -96,7 +96,7 @@ int signedCarry(int previous, int delta) {
 }
 
 void depositCell(ivec2 cell, float weight) {
-    if (weight <= 0.0 || blockedCell(cell)) {
+    if (weight <= 0.0) {
         return;
     }
 
@@ -121,7 +121,9 @@ void depositU(ivec2 face, float weight, float value) {
     int index = uFaceIndex(face);
     uint count = uint(round(weight * weightScale));
     if (atomicAdd(uWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
-    int delta = int(round(value * weight * velocityScale));
+    // Momentum uses the quantized weight, so a face average stays a convex mix of particle velocities even where
+    // edge-of-support weights round to zero (a rounded-away weight with full momentum amplified sparse faces).
+    int delta = int(round(value * float(count) * (velocityScale / weightScale)));
     int carry = signedCarry(atomicAdd(uVelocitySums[index].x, delta), delta);
     if (carry != 0) atomicAdd(uVelocitySums[index].y, carry);
 }
@@ -142,7 +144,8 @@ void depositV(ivec2 face, float weight, float value) {
     int index = vFaceIndex(face);
     uint count = uint(round(weight * weightScale));
     if (atomicAdd(vWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
-    int delta = int(round(value * weight * velocityScale));
+    // Quantized-weight momentum, as in depositU.
+    int delta = int(round(value * float(count) * (velocityScale / weightScale)));
     int carry = signedCarry(atomicAdd(vVelocitySums[index].x, delta), delta);
     if (carry != 0) atomicAdd(vVelocitySums[index].y, carry);
 }
@@ -171,6 +174,11 @@ void main() {
         atomicAdd(nanInfDetected, 1u);
         return;
     }
+    // A particle caught inside sand or a wall waits for the step to free it; its zero-momentum weight would
+    // brake the water around it.
+    if (blockedCell(ivec2(floor(position)))) {
+        return;
+    }
     vec2 maxMomentum = (abs(velocity) + 1.5 * (abs(affine[0]) + abs(affine[1]))) * mass * velocityScale;
     if (invalidVec2(maxMomentum) || any(greaterThan(maxMomentum, vec2(2147483520.0))) ||
         mass * weightScale > 4294967040.0) {
@@ -181,10 +189,20 @@ void main() {
     vec2 cellSample = position - vec2(0.5);
     ivec2 cellBase = ivec2(floor(cellSample));
     vec2 cellFrac = fract(cellSample);
-    depositCell(cellBase, mass * (1.0 - cellFrac.x) * (1.0 - cellFrac.y));
-    depositCell(cellBase + ivec2(1, 0), mass * cellFrac.x * (1.0 - cellFrac.y));
-    depositCell(cellBase + ivec2(0, 1), mass * (1.0 - cellFrac.x) * cellFrac.y);
-    depositCell(cellBase + ivec2(1, 1), mass * cellFrac.x * cellFrac.y);
+    // Bilinear weight that lands in a wall cell goes to the particle's own cell, so a film against a wall keeps its density.
+    float displaced = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 cell = cellBase + ivec2(i, j);
+            float weight = mass * (i == 1 ? cellFrac.x : 1.0 - cellFrac.x) * (j == 1 ? cellFrac.y : 1.0 - cellFrac.y);
+            if (blockedCell(cell)) {
+                displaced += weight;
+            } else {
+                depositCell(cell, weight);
+            }
+        }
+    }
+    depositCell(ivec2(floor(position)), displaced);
 
     vec2 uSample = position - vec2(0.0, 0.5);
     ivec2 uBase = ivec2(floor(uSample - vec2(0.5)));

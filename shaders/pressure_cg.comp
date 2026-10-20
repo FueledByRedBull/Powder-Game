@@ -8,9 +8,9 @@ layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
 
 // Per cell: residual, search direction, A*direction or preconditioned residual, diagonal of A=-L.
 layout(std430, binding = 0) buffer Vectors { vec4 vectors[]; };
-struct Partial { vec4 values; uvec4 bounds; };
-layout(std430, binding = 1) buffer Partials { Partial partials[]; };
-layout(std430, binding = 2) readonly buffer Scalars {
+// Per cell: the direction and A*direction phase 1 forms for phase 2 (the reduction partials, unused while iterating).
+layout(std430, binding = 1) buffer Scratch { vec2 scratch[]; };
+layout(std430, binding = 2) buffer Scalars {
     float rho;
     float alpha;
     float beta;
@@ -20,14 +20,46 @@ layout(std430, binding = 2) readonly buffer Scalars {
     uint iterations;
     uint padding;
     uvec4 liquidBounds;
+    // r.z of the two most recent preconditioner applications by sum slot (the first and odd iterations fill index 1), so a
+    // phase reads the previous one without a second global sum and without racing the first workgroup's write.
+    float rhoBySlot[2];
 };
+layout(std430, binding = 3) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+// Phases 8 and 9 list, in grid order, the 16x16 tiles holding cells of the solve; every tile phase runs one
+// workgroup per listed tile through an indirect dispatch whose group count is zeroed once the solve stops.
+layout(std430, binding = 4) buffer Tiles {
+    uvec4 tileDispatch;
+    uvec4 tileInfo;  // x: tiles listed by this solve
+    uint tiles[];    // phase 8 leaves a flag per grid tile here, which phase 9 compacts into the list
+};
+// Three sums per listed tile: d.Ad of phase 1, then r.z, max |r| and a nonfinite flag of the two most recent
+// preconditioner applications (pressure_mg.comp), alternating by iteration parity.
+layout(std430, binding = 5) buffer TileSums { vec4 tileSums[]; };
+// The multigrid preconditioner's indirect arguments (pressure_mg.comp), emptied with the tile dispatch.
+layout(std430, binding = 6) buffer Levels { uvec4 levelDispatch[8]; };
 
 uniform ivec2 gridSize;
 uniform ivec2 solveOrigin;
 uniform ivec2 solveSize;
 uniform float liquidPhiThreshold;
+// Conductance of a sand-blocked face: sand is porous, which also keeps a pocket of water sealed in
+// sand from being a singular system.
+uniform float sandLeak;
+uniform float residualThreshold;
+// 0: initial residual over the solve rectangle (pressure_cg_reduce.comp then forms the initial residual and starts
+// the solve); 8, 9: tile list. pressure_mg.comp then forms z = d = M^-1 r and phase 1 (first iteration) A*d. Each
+// iteration runs 2: alpha, the stored d and the p and r update; pressure_mg.comp's z = M^-1 r; 1: the convergence test,
+// beta, the next d = z + beta*d and A*d.
 uniform int phase;
+uniform int parity;          // iteration number & 1, from the host
+uniform int firstIteration;  // 1 on the first iteration, which tests the initial preconditioned residual
 shared float work[768];
+shared uint chunkCounts[256];
 
 bool invalid(float value) { return isnan(value) || isinf(value); }
 
@@ -36,7 +68,64 @@ bool blocked(ivec2 cell) {
            imageLoad(boundaryTex, cell).r != 0u;
 }
 
-void reducePartial(vec4 total) {
+bool sandWall(ivec2 cell) {
+    return cell.x >= 0 && cell.y >= 0 && cell.x < gridSize.x && cell.y < gridSize.y &&
+           imageLoad(boundaryTex, cell).r >= 2u;
+}
+
+uint tileSlots() { return uint(((gridSize.x + 15) / 16) * ((gridSize.y + 15) / 16)); }
+
+ivec2 tileCell(uint tile) {
+    uint across = uint((gridSize.x + 15) / 16);
+    ivec2 local = ivec2(int(gl_LocalInvocationID.x) % 16, int(gl_LocalInvocationID.x) / 16);
+    return ivec2(int(tile % across), int(tile / across)) * 16 + local;
+}
+
+void flagTile() {
+    uint tile = gl_WorkGroupID.x;
+    ivec2 cell = tileCell(tile);
+    if (gl_LocalInvocationID.x == 0u) chunkCounts[0] = 0u;
+    barrier();
+    if (all(lessThan(cell, gridSize))) {
+        vec4 value = vectors[cell.y * gridSize.x + cell.x];
+        // Every cell the solve or its sums read: liquid (w > 0), invalid input (w < 0), or a stray residual.
+        if (value.w != 0.0 || value.x != 0.0) atomicOr(chunkCounts[0], 1u);
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) tiles[tile] = chunkCounts[0];
+}
+
+// One workgroup turns the flags into the list in grid order, so every sum over the list repeats bit for bit.
+void compactTiles() {
+    uint lane = gl_LocalInvocationID.x;
+    uint slots = tileSlots();
+    uint per = (slots + 255u) / 256u;
+    uint first = lane * per;
+    uint flags[16];  // per <= 16 for grids up to 1024x1024
+    uint count = 0u;
+    for (uint i = 0u; i < per; ++i) {
+        flags[i] = first + i < slots ? tiles[first + i] : 0u;
+        count += flags[i];
+    }
+    chunkCounts[lane] = count;
+    barrier();
+    uint offset = 0u;
+    for (uint i = 0u; i < lane; ++i) offset += chunkCounts[i];
+    uint total = 0u;
+    for (uint i = 0u; i < 256u; ++i) total += chunkCounts[i];
+    barrier();  // every flag is read before the list overwrites them
+    for (uint i = 0u; i < per; ++i) {
+        if (flags[i] != 0u) tiles[offset++] = first + i;
+    }
+    if (lane == 0u) {
+        uint listed = running != 0u ? total : 0u;
+        tileDispatch = uvec4(listed, 1u, 1u, 0u);
+        tileInfo = uvec4(listed, 0u, 0u, 0u);
+    }
+}
+
+// Sum of x, maxima of y and z over the workgroup.
+vec3 reduceWorkgroup(vec3 total) {
     uint lane = gl_LocalInvocationID.x;
     work[lane] = total.x;
     work[256u + lane] = total.y;
@@ -50,127 +139,205 @@ void reducePartial(vec4 total) {
         }
         barrier();
     }
-    if (lane == 0u) partials[gl_WorkGroupID.x].values = vec4(work[0], work[256], work[512], 0.0);
+    vec3 result = vec3(work[0], work[256], work[512]);
+    barrier();  // work is free again
+    return result;
 }
 
-void precondition() {
-    uint lane = gl_LocalInvocationID.x;
-    uint tilesAcross = uint((solveSize.x + 15) / 16);
-    ivec2 tile = ivec2(int(gl_WorkGroupID.x % tilesAcross), int(gl_WorkGroupID.x / tilesAcross));
-    ivec2 localCell = ivec2(int(lane) % 16, int(lane) / 16);
-    ivec2 offset = tile * 16 + localCell;
-    ivec2 cell = solveOrigin + offset;
-    bool validCell = all(lessThan(offset, solveSize));
+void storeSum(uint slot, vec3 total) {
+    vec3 sum = reduceWorkgroup(total);
+    if (gl_LocalInvocationID.x == 0u) tileSums[gl_WorkGroupID.x * 3u + slot] = vec4(sum, 0.0);
+}
+
+// Every workgroup forms the same global sums from the listed tiles in list order, so all of them take the same
+// decision and none waits for a separate reduction dispatch.
+vec3 globalSum(uint slot) {
+    vec3 total = vec3(0.0);
+    for (uint k = gl_LocalInvocationID.x; k < tileInfo.x; k += 256u) {
+        vec3 item = tileSums[k * 3u + slot].xyz;
+        total.x += item.x;
+        total.yz = max(total.yz, item.yz);
+    }
+    return reduceWorkgroup(total);
+}
+
+// Recorded once, by the first workgroup; the others reach the same decision and stop working on their own.
+void stop(bool failed, bool nonfinite) {
+    if (gl_WorkGroupID.x != 0u || gl_LocalInvocationID.x != 0u) return;
+    running = 0u;
+    tileDispatch.x = 0u;
+    for (int i = 0; i < 8; ++i) levelDispatch[i].x = 0u;
+    if (!failed) return;
+    invalidInput = 1u;
+    atomicAdd(pressureNonconverged, 1u);
+    if (nonfinite) atomicAdd(nanInfDetected, 1u);
+}
+
+bool converged(vec3 sums) {
+    // Leave margin for the independent true-residual check after the solve.
+    return sums.z == 0.0 && !invalid(sums.x) && !invalid(sums.y) && sums.y <= residualThreshold * 0.5;
+}
+
+const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+void initialize() {
+    uint invocation = gl_GlobalInvocationID.x;
+    if (invocation >= uint(solveSize.x * solveSize.y)) return;
+    ivec2 cell = solveOrigin + ivec2(int(invocation) % solveSize.x, int(invocation) / solveSize.x);
     uint index = uint(cell.y * gridSize.x + cell.x);
-    vec4 value = validCell ? vectors[index] : vec4(0.0);
-    float inverseDiagonal = value.w > 0.0 ? 1.0 / value.w : 0.0;
-    float result = 0.0;
-    work[lane] = 0.0;
-    barrier();
-    // Fixed zero-initial sweeps keep this block inverse symmetric positive for PCG.
-    // Block edges impose zero correction; the global operator still connects the blocks.
-    for (int sweep = 0; sweep < 32; ++sweep) {
-        float neighbors = 0.0;
-        uint source = (sweep & 1) == 0 ? lane : 256u + lane;
-        if (localCell.x > 0) neighbors += work[source - 1u];
-        if (localCell.x < 15) neighbors += work[source + 1u];
-        if (localCell.y > 0) neighbors += work[source - 16u];
-        if (localCell.y < 15) neighbors += work[source + 16u];
-        result = result / 3.0 + (2.0 / 3.0) * inverseDiagonal * (value.x + neighbors);
-        work[(sweep & 1) == 0 ? 256u + lane : lane] = result;
-        barrier();
+    vectors[index] = vec4(0.0);
+    if (blocked(cell)) {
+        imageStore(pressureTex, cell, vec4(0.0));
+        return;
     }
-    if (validCell) {
-        vectors[index].z = result;
-        if (phase == 5) vectors[index].y = result;
+    float phi = imageLoad(liquidPhiTex, cell).x;
+    if (invalid(phi)) {
+        imageStore(pressureTex, cell, vec4(0.0));
+        vectors[index].w = -1.0;
+        return;
     }
-    bool nonfinite = any(isnan(value)) || any(isinf(value)) || invalid(result) || value.w < 0.0;
-    reducePartial(nonfinite ? vec4(0.0, 0.0, 1.0, 0.0)
-                            : vec4(value.w > 0.0 ? value.x * result : 0.0, abs(value.x), 0.0, 0.0));
+    if (phi >= liquidPhiThreshold) {
+        imageStore(pressureTex, cell, vec4(0.0));
+        return;
+    }
+    float rhs = -imageLoad(rhsTex, cell).x;
+    float pressure = imageLoad(pressureTex, cell).x;
+    if (invalid(rhs) || invalid(pressure)) {
+        imageStore(pressureTex, cell, vec4(0.0));
+        vectors[index].w = -1.0;
+        return;
+    }
+    float diagonal = 0.0;
+    float neighbor_sum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 neighbor = cell + offsets[i];
+        if (blocked(neighbor)) {
+            if (sandWall(neighbor)) diagonal += sandLeak;
+            continue;
+        }
+        diagonal += 1.0;
+        if (imageLoad(liquidPhiTex, neighbor).x < liquidPhiThreshold)
+            neighbor_sum += imageLoad(pressureTex, neighbor).x;
+    }
+    // Reuse the previous solution, but form b-Ap using today's liquid/solid mask.
+    float residual = rhs - (diagonal * pressure - neighbor_sum);
+    if (diagonal == 0.0) imageStore(pressureTex, cell, vec4(0.0));
+    float scaledResidual = diagonal > 0.0 ? residual / diagonal : 0.0;
+    vectors[index] = vec4(residual, scaledResidual, scaledResidual, diagonal);
 }
 
 void main() {
-    if (phase >= 4) {
-        if (running != 0u) precondition();
+    if (phase == 0) {
+        initialize();
         return;
     }
-    uint invocation = gl_GlobalInvocationID.x;
-    if (phase != 0 && running == 0u) return;
-    bool validCell = invocation < uint(solveSize.x * solveSize.y);
-    ivec2 cell = solveOrigin + ivec2(int(invocation) % solveSize.x, int(invocation) / solveSize.x);
+    if (phase == 8) {
+        flagTile();
+        return;
+    }
+    if (phase == 9) {
+        compactTiles();
+        return;
+    }
+    if (running == 0u) return;
+    // Sum slots: 0 holds d.Ad, 1 + parity this iteration's r.z, 2 - parity the previous one (the first z fills slot 2).
+    uint current = 1u + uint(parity);
+    uint previous = 2u - uint(parity);
+    uint tile = tiles[gl_WorkGroupID.x];
+    ivec2 cell = tileCell(tile);
+    bool validCell = all(lessThan(cell, gridSize));
     uint index = uint(cell.y * gridSize.x + cell.x);
-    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    vec4 value = validCell ? vectors[index] : vec4(0.0);
 
     if (phase == 1) {
-        vec4 value = validCell ? vectors[index] : vec4(0.0);
+        // beta of the next direction d = z + beta d; 0 for the first, whose d is z already.
+        float ratio = 0.0;
+        if (firstIteration != 0) {
+            vec3 initial = globalSum(2u);
+            bool nonfinite = initial.z != 0.0 || invalid(initial.x) || invalid(initial.y);
+            if (gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x == 0u) {
+                rho = rhoBySlot[1] = initial.x;
+                residualMax = initial.y;
+            }
+            if (converged(initial)) {
+                stop(false, false);
+                return;
+            }
+            if (nonfinite || initial.x <= 0.0) {
+                stop(true, nonfinite);
+                return;
+            }
+        } else {
+            // The convergence test and beta of the iteration whose preconditioner just ran (sum slot 1 + parity).
+            vec3 updated = globalSum(current);
+            float rhoBefore = rhoBySlot[previous - 1u];
+            ratio = updated.x / rhoBefore;
+            bool nonfinite = updated.z != 0.0 || invalid(updated.x) || invalid(updated.y);
+            bool recorder = gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x == 0u;
+            if (recorder) {
+                ++iterations;
+                residualMax = updated.y;
+            }
+            if (converged(updated)) {
+                stop(false, false);
+                return;
+            }
+            bool degenerate = nonfinite || updated.x <= 0.0 || rhoBefore <= 0.0;
+            if (degenerate || invalid(ratio)) {
+                stop(true, nonfinite || (!degenerate && invalid(ratio)));
+                return;
+            }
+            if (recorder) {
+                rho = rhoBySlot[current - 1u] = updated.x;
+                beta = ratio;
+            }
+        }
+        // Every reader forms the new direction of a cell the same way, so A*d needs no pass of its own; d and A*d go to
+        // the scratch, as neighbouring tiles still read this tile's d and z.
+        float direction = value.w > 0.0 ? value.z + ratio * value.y : 0.0;
+        float product = 0.0;
         if (value.w > 0.0) {
-            float product = value.w * value.y;
+            product = value.w * direction;
             for (int i = 0; i < 4; ++i) {
                 ivec2 neighbor = cell + offsets[i];
-                if (!blocked(neighbor)) product -= vectors[neighbor.y * gridSize.x + neighbor.x].y;
+                if (blocked(neighbor)) continue;
+                vec4 other = vectors[neighbor.y * gridSize.x + neighbor.x];
+                if (other.w > 0.0) product -= other.z + ratio * other.y;
             }
-            value.z = product;
-            vectors[index].z = product;
         }
-        bool nonfinite = any(isnan(value)) || any(isinf(value)) || value.w < 0.0;
-        reducePartial(nonfinite ? vec4(0.0, 0.0, 1.0, 0.0)
-                                : vec4(value.y * value.z, abs(value.x), 0.0, 0.0));
+        if (validCell) scratch[index] = vec2(direction, product);
+        bool nonfinite = any(isnan(value)) || any(isinf(value)) || value.w < 0.0 || invalid(direction) || invalid(product);
+        storeSum(0u, nonfinite ? vec3(0.0, 0.0, 1.0) : vec3(direction * product, abs(value.x), 0.0));
         return;
     }
-    if (!validCell) return;
-    if (phase == 0) {
-        vectors[index] = vec4(0.0);
-        if (blocked(cell)) {
-            imageStore(pressureTex, cell, vec4(0.0));
-            return;
-        }
-        float phi = imageLoad(liquidPhiTex, cell).x;
-        if (invalid(phi)) {
-            imageStore(pressureTex, cell, vec4(0.0));
-            vectors[index].w = -1.0;
-            return;
-        }
-        if (phi >= liquidPhiThreshold) {
-            imageStore(pressureTex, cell, vec4(0.0));
-            return;
-        }
-        float rhs = -imageLoad(rhsTex, cell).x;
-        float pressure = imageLoad(pressureTex, cell).x;
-        if (invalid(rhs) || invalid(pressure)) {
-            imageStore(pressureTex, cell, vec4(0.0));
-            vectors[index].w = -1.0;
-            return;
-        }
-        float diagonal = 0.0;
-        float neighbor_sum = 0.0;
-        for (int i = 0; i < 4; ++i) {
-            ivec2 neighbor = cell + offsets[i];
-            if (blocked(neighbor)) continue;
-            diagonal += 1.0;
-            if (imageLoad(liquidPhiTex, neighbor).x < liquidPhiThreshold)
-                neighbor_sum += imageLoad(pressureTex, neighbor).x;
-        }
-        // Reuse the previous solution, but form b-Ap using today's liquid/solid mask.
-        float residual = rhs - (diagonal * pressure - neighbor_sum);
-        if (diagonal == 0.0) imageStore(pressureTex, cell, vec4(0.0));
-        float scaledResidual = diagonal > 0.0 ? residual / diagonal : 0.0;
-        vectors[index] = vec4(residual, scaledResidual, scaledResidual, diagonal);
-        return;
-    }
-
-    vec4 value = vectors[index];
-    if (value.w <= 0.0) return;
     if (phase == 2) {
-        float pressure = imageLoad(pressureTex, cell).x + alpha * value.y;
-        float residual = value.x - alpha * value.z;
-        if (invalid(pressure) || invalid(residual)) {
-            // The reduction reports breakdown without allowing nonfinite pressure into projection.
-            vectors[index] = vec4(0.0, 0.0, 0.0, -1.0);
+        vec2 updatedDirection = validCell ? scratch[index] : vec2(0.0);
+        value.y = updatedDirection.x;
+        value.z = updatedDirection.y;
+        if (validCell && value.w > 0.0) vectors[index].y = value.y;
+        vec3 curvature = globalSum(0u);
+        float rhoNow = rhoBySlot[previous - 1u];
+        float step = rhoNow / curvature.x;
+        bool nonfinite = curvature.z != 0.0 || invalid(curvature.x) || invalid(curvature.y);
+        // A step is only formed, and only reported as nonfinite, from positive finite sums.
+        bool degenerate = nonfinite || curvature.x <= 0.0 || rhoNow <= 0.0;
+        if (degenerate || invalid(step)) {
+            stop(true, nonfinite || (!degenerate && invalid(step)));
             return;
         }
-        imageStore(pressureTex, cell, vec4(pressure, 0.0, 0.0, 0.0));
-        vectors[index].x = residual;
-    } else {
-        vectors[index].y = value.z + beta * value.y;
+        if (gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x == 0u) alpha = step;
+        if (value.w > 0.0) {
+            float pressure = imageLoad(pressureTex, cell).x + step * value.y;
+            float residual = value.x - step * value.z;
+            if (invalid(pressure) || invalid(residual)) {
+                // The sums report breakdown without allowing nonfinite pressure into projection.
+                value = vec4(0.0, 0.0, 0.0, -1.0);
+                vectors[index] = value;
+            } else {
+                imageStore(pressureTex, cell, vec4(pressure, 0.0, 0.0, 0.0));
+                vectors[index].x = residual;
+            }
+        }
+        return;
     }
 }

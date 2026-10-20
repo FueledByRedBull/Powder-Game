@@ -28,19 +28,32 @@ Run:
 - Double-click powder_game.exe
 
 Controls:
-- 1: Sand brush
-- 2: Water brush
-- 3: Solid brush
-- 4: Erase brush
-- 5: Smoke brush
-- 6: Fire brush
-- [ / ]: Decrease / increase brush radius
+- 1: Sand
+- 2: Water
+- 3: Solid
+- 4: Erase
+- 5: Smoke
+- 6: Fire
+- 7: Wood
+- 8: Oil
+- [ / ]: Decrease / increase brush radius (1 to 96)
 - Left mouse: paint
+- H: Show / hide the on-screen help
+- F1: Normal view
+- F2-F10: Debug views (boundary, water, water velocity, gas velocity,
+  gas pressure, smoke, temperature, fuel/reaction, failure counters)
 - Esc: quit
 
+The window shows a dark cave. A compact inventory (top left) holds the eight
+materials, the selected one's name and the brush radius, with a help panel under
+it that hides itself after a few seconds. The brush is a ring and a warm lantern
+light over the simulation.
+
 Notes:
-- Keep the shaders/ folder next to powder_game.exe.
-- Requires a GPU/driver with OpenGL 4.3+ support.
+- Keep the shaders/ folder and the DLLs next to powder_game.exe.
+- Requires OpenGL 4.3 core with at least 18 image units, 18 compute image
+  uniforms, 19 combined shader output resources, 8 SSBO bindings and 16
+  fragment texture units; the app checks the first four at startup.
 TXT
 
 mkdir -p "$(dirname "$ZIP_PATH")"

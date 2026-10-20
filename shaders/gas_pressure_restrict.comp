@@ -1,36 +1,42 @@
 #version 430
 
+// Restricts the fine residual with the transpose of gas_pressure_prolongate.comp (weights summing to 4 per
+// coarse cell in the interior), so every level uses the same unscaled 5-point operator.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D rhsFineTex;
+layout(r32f, binding = 0) uniform readonly image2D rhsFineTex;
 layout(r32f, binding = 1) uniform readonly image2D pressureFineTex;
-layout(r16f, binding = 2) uniform writeonly image2D rhsCoarseTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+layout(r32f, binding = 2) uniform writeonly image2D rhsCoarseTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D kindTex;
+// Each V-cycle's coarse correction starts from zero.
+layout(r32f, binding = 4) uniform writeonly image2D pressureCoarseTex;
+layout(r8ui, binding = 5) uniform readonly uimage2D coarseKindTex;
+// Fine residual, written by the first pass (gatherPass 0, over the fine grid) and gathered by the second.
+layout(r32f, binding = 6) uniform image2D residualTex;
 
 uniform ivec2 fineSize;
 uniform ivec2 coarseSize;
 uniform int boundaryScale;
+uniform int openTop;
+// Conductance of a face into porous sand (kind 4), toward zero pressure; as in the water solve (kSandLeak), it
+// keeps gas sealed inside sand from forming a singular system.
+uniform float sandLeak;
+// Height of the finest grid: with an open top it holds zero pressure at its ghost row, fineHeight + 0.5.
+uniform int fineHeight;
+uniform int gatherPass;
 
-// Match the relaxation operator, including zero correction at mixed footprints.
-int cellKind(ivec2 coord) {
-    if (coord.x < 0 || coord.y < 0 || coord.x >= fineSize.x || coord.y >= fineSize.y) {
-        return 1;
-    }
-    ivec2 fineMin = coord * boundaryScale;
-    ivec2 fineMax = fineMin + ivec2(boundaryScale);
-    if (any(greaterThan(fineMax, imageSize(boundaryTex)))) {
-        return 1;
-    }
-    bool solid = false;
-    bool fluid = false;
-    for (int y = fineMin.y; y < fineMax.y; ++y) {
-        for (int x = fineMin.x; x < fineMax.x; ++x) {
-            bool occupied = imageLoad(boundaryTex, ivec2(x, y)).r != 0u;
-            solid = solid || occupied;
-            fluid = fluid || !occupied;
-        }
-    }
-    return solid ? (fluid ? 2 : 1) : 0;
+// Open top: a level with spacing h reaches that zero from its top centres, (top + 0.5) h fine cells up, so the
+// ghost weighs h / distance (1 on the finest grid; odd levels whose top row straddles the edge weigh more).
+float openTopWeight(int top) {
+    float h = float(boundaryScale);
+    return h / max(float(fineHeight) + 0.5 - (float(top) + 0.5) * h, 0.5);
+}
+
+// 0: fluid, 1: solid/outside, 3: open top (zero pressure).
+uint cellKind(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= fineSize.x) return 1u;
+    if (coord.y >= fineSize.y) return openTop != 0 ? 3u : 1u;
+    return imageLoad(kindTex, coord).r;
 }
 
 float residualAt(ivec2 coord) {
@@ -39,38 +45,57 @@ float residualAt(ivec2 coord) {
     float diagonal = 0.0;
     for (int i = 0; i < 4; ++i) {
         ivec2 neighbor = coord + offsets[i];
-        int kind = cellKind(neighbor);
-        if (kind == 0) {
+        uint kind = cellKind(neighbor);
+        if (kind == 0u) {
             pressure_sum += imageLoad(pressureFineTex, neighbor).x;
-        }
-        if (kind != 1) {
             diagonal += 1.0;
+        } else if (kind == 3u) {
+            diagonal += openTopWeight(fineSize.y - 1);
+        } else if (kind == 4u) {
+            diagonal += sandLeak;
         }
     }
-    float pC = imageLoad(pressureFineTex, coord).x;
-    float h = float(boundaryScale);
-    float lap = (pressure_sum - diagonal * pC) / (h * h);
+    float lap = pressure_sum - diagonal * imageLoad(pressureFineTex, coord).x;
     return imageLoad(rhsFineTex, coord).x - lap;
+}
+
+bool coarseFluid(ivec2 coord) {
+    return all(greaterThanEqual(coord, ivec2(0))) && all(lessThan(coord, coarseSize)) &&
+           imageLoad(coarseKindTex, coord).r == 0u;
 }
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (gatherPass == 0) {
+        if (all(lessThan(coord, fineSize)))
+            imageStore(residualTex, coord, vec4(imageLoad(kindTex, coord).r == 0u ? residualAt(coord) : 0.0));
+        return;
+    }
     if (coord.x >= coarseSize.x || coord.y >= coarseSize.y) {
         return;
     }
-
-    ivec2 base = coord * 2;
-    float residual_sum = 0.0;
-    for (int y = 0; y < 2; ++y) {
-        for (int x = 0; x < 2; ++x) {
-            ivec2 fine = base + ivec2(x, y);
-            // A correction cell is usable only when its entire footprint is fluid.
-            if (cellKind(fine) != 0) {
-                imageStore(rhsCoarseTex, coord, vec4(0.0));
-                return;
+    imageStore(pressureCoarseTex, coord, vec4(0.0));
+    float sum = 0.0;
+    if (coarseFluid(coord)) {
+        // Fine cells whose prolongation stencil can reach this coarse cell: its children and the nearest child of
+        // each neighbour (a substituted donor always lands on the fine cell's own parent).
+        for (int y = 2 * coord.y - 1; y <= 2 * coord.y + 2; ++y) {
+            for (int x = 2 * coord.x - 1; x <= 2 * coord.x + 2; ++x) {
+                ivec2 fine = ivec2(x, y);
+                if (any(lessThan(fine, ivec2(0))) || any(greaterThanEqual(fine, fineSize)) ||
+                    imageLoad(kindTex, fine).r != 0u) continue;
+                ivec2 parent = fine / 2;
+                ivec2 toward = ivec2(fine.x & 1, fine.y & 1) * 2 - 1;
+                float weight = 0.0;
+                for (int i = 0; i < 4; ++i) {
+                    ivec2 offset = ivec2(i & 1, i >> 1);
+                    ivec2 donor = parent + offset * toward;
+                    if ((coarseFluid(donor) ? donor : parent) == coord)
+                        weight += (offset.x == 0 ? 0.75 : 0.25) * (offset.y == 0 ? 0.75 : 0.25);
+                }
+                if (weight > 0.0) sum += weight * imageLoad(residualTex, fine).x;
             }
-            residual_sum += residualAt(fine);
         }
     }
-    imageStore(rhsCoarseTex, coord, vec4(residual_sum * 0.25, 0.0, 0.0, 0.0));
+    imageStore(rhsCoarseTex, coord, vec4(sum, 0.0, 0.0, 0.0));
 }

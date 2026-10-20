@@ -1,0 +1,163 @@
+#version 430
+
+// Flexible preconditioned conjugate gradient for the gas pressure, with one multigrid V-cycle
+// (gas_pressure_relax/restrict/prolongate) as the preconditioner. Vectors live in the Laplacian's sign
+// convention: s = b - L x is the residual the V-cycle takes, z ~ L^-1 s, q = L d. CG runs on -L, which is
+// positive (semi)definite, and the signs cancel in alpha and beta.
+// Phases: 0 s = b - L x, z = 0; 1 q = L d and partial d.q; 2 alpha (one workgroup); 3 x += alpha d,
+// s -= alpha q, partial s.z_old, z = 0; 4 partial s.z; 5 beta (one workgroup); 6 d = z + beta d.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 1) uniform image2D xTex;
+layout(r32f, binding = 2) uniform image2D sTex;
+layout(r32f, binding = 3) uniform image2D zTex;
+layout(r32f, binding = 4) uniform image2D dTex;
+layout(r32f, binding = 5) uniform image2D qTex;
+layout(r8ui, binding = 6) uniform readonly uimage2D kindTex;
+
+// Per workgroup: x s.z, y s.z_old, z d.q.
+layout(std430, binding = 0) buffer Partials {
+    vec4 partials[];
+};
+// rz (s.z of the current direction), alpha, beta.
+layout(std430, binding = 1) buffer Scalars {
+    float rz;
+    float alpha;
+    float beta;
+    float rz0;  // rz of the first direction: iterations past round-off (|rz| < 1e-10 rz0) freeze x
+};
+
+uniform ivec2 gridSize;
+uniform int phase;
+uniform int openTop;
+// Conductance of a face into porous sand (kind 4), toward zero pressure; as in the water solve (kSandLeak), it
+// keeps gas sealed inside sand from forming a singular system.
+uniform float sandLeak;
+uniform int partialCount;
+uniform int first;
+
+shared float sums[256];
+shared float sums2[256];
+
+uint cellKind(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x) return 1u;
+    if (coord.y >= gridSize.y) return openTop != 0 ? 2u : 1u;
+    return imageLoad(kindTex, coord).r;
+}
+
+// The fine operator of pressure_residual.comp: neighbours that are fluid add their value, every
+// non-wall neighbour (fluid or open top) adds to the diagonal.
+float value(bool direction, ivec2 coord) {
+    return direction ? imageLoad(dTex, coord).x : imageLoad(xTex, coord).x;
+}
+
+float laplacian(bool direction, ivec2 coord) {
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float sum = 0.0;
+    float diagonal = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        uint kind = cellKind(coord + offsets[i]);
+        if (kind == 0u) sum += value(direction, coord + offsets[i]);
+        if (kind == 4u) diagonal += sandLeak;
+        else if (kind != 1u) diagonal += 1.0;
+    }
+    return sum - diagonal * value(direction, coord);
+}
+
+// Sums a and b over the workgroup; lane 0 returns them.
+vec2 reduce(float a, float b) {
+    uint lane = gl_LocalInvocationIndex;
+    sums[lane] = a;
+    sums2[lane] = b;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+            sums2[lane] += sums2[lane + stride];
+        }
+        barrier();
+    }
+    return vec2(sums[0], sums2[0]);
+}
+
+// One workgroup sums every partial in a fixed order, so all runs agree bit for bit.
+vec4 total() {
+    uint lane = gl_LocalInvocationIndex;
+    vec4 sum = vec4(0.0);
+    for (int i = int(lane); i < partialCount; i += 256) sum += partials[i];
+    sums[lane] = sum.x;
+    sums2[lane] = sum.y;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sums[lane] += sums[lane + stride];
+            sums2[lane] += sums2[lane + stride];
+        }
+        barrier();
+    }
+    float x = sums[0], y = sums2[0];
+    barrier();
+    sums[lane] = sum.z;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sums[lane] += sums[lane + stride];
+        barrier();
+    }
+    return vec4(x, y, sums[0], 0.0);
+}
+
+void main() {
+    if (phase == 2 || phase == 5) {
+        vec4 t = total();
+        if (gl_LocalInvocationIndex == 0u) {
+            bool spent = abs(rz) <= 1e-10 * abs(rz0) || abs(rz) <= 1e-30;
+            if (phase == 2) {
+                alpha = !spent && abs(t.z) > 1e-30 ? rz / t.z : 0.0;
+            } else {
+                if (first != 0) rz0 = t.x;
+                beta = first != 0 || spent ? 0.0 : (t.x - t.y) / rz;
+                rz = t.x;
+            }
+        }
+        return;
+    }
+
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = coord.x < gridSize.x && coord.y < gridSize.y;
+    bool fluid = inside && cellKind(coord) == 0u;
+    float a = 0.0, b = 0.0;
+    if (phase == 0) {
+        if (inside) {
+            imageStore(sTex, coord, vec4(fluid ? imageLoad(rhsTex, coord).x - laplacian(false, coord) : 0.0));
+            imageStore(zTex, coord, vec4(0.0));
+        }
+        return;
+    } else if (phase == 1) {
+        float q = fluid ? laplacian(true, coord) : 0.0;
+        if (inside) imageStore(qTex, coord, vec4(q));
+        b = fluid ? imageLoad(dTex, coord).x * q : 0.0;
+        vec2 r = reduce(0.0, b);
+        if (gl_LocalInvocationIndex == 0u) partials[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x].z = r.y;
+        return;
+    } else if (phase == 3) {
+        if (fluid) {
+            float d = imageLoad(dTex, coord).x;
+            imageStore(xTex, coord, vec4(imageLoad(xTex, coord).x + alpha * d));
+            float s = imageLoad(sTex, coord).x - alpha * imageLoad(qTex, coord).x;
+            imageStore(sTex, coord, vec4(s));
+            b = s * imageLoad(zTex, coord).x;
+        }
+        if (inside) imageStore(zTex, coord, vec4(0.0));
+        vec2 r = reduce(0.0, b);
+        if (gl_LocalInvocationIndex == 0u) partials[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x].y = r.y;
+        return;
+    } else if (phase == 4) {
+        a = fluid ? imageLoad(sTex, coord).x * imageLoad(zTex, coord).x : 0.0;
+        vec2 r = reduce(a, 0.0);
+        if (gl_LocalInvocationIndex == 0u) partials[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x].x = r.x;
+        return;
+    } else if (phase == 6) {
+        if (inside) imageStore(dTex, coord, vec4(fluid ? imageLoad(zTex, coord).x + beta * imageLoad(dTex, coord).x : 0.0));
+    }
+}

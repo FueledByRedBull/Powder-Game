@@ -8,16 +8,28 @@ layout(r16f, binding = 2) uniform readonly image2D temperatureTex;
 layout(rg16f, binding = 3) uniform image2D combustionTex;
 layout(r16f, binding = 4) uniform image2D oxidizerTex;
 layout(r16f, binding = 5) uniform image2D fuelTex;
+layout(rg16f, binding = 6) uniform readonly image2D oilTex;            // x: oil share of the liquid (oil_field.comp)
+layout(r16f, binding = 7) uniform readonly image2D sandOccupancyTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 heatSize;
 uniform float dt;
 uniform float waterCooling;
+// Sand occupancy at which sand covering a cell smothers its fire completely (cuts fuel and oxygen like water does).
+uniform float sandSmother;
 
-float sampleWater(ivec2 gas_coord) {
+// Liquid that is water, not oil (oil is fuel, not a quencher), and sand, averaged over the gas cell's 2x2 cells.
+float sampleWater(ivec2 gas_coord, out float sand) {
     ivec2 full = clamp(gas_coord * 2, ivec2(0), gridSize - ivec2(2));
-    return 0.25 * (imageLoad(waterAmountTex, full).x + imageLoad(waterAmountTex, full + ivec2(1, 0)).x +
-                   imageLoad(waterAmountTex, full + ivec2(0, 1)).x + imageLoad(waterAmountTex, full + ivec2(1, 1)).x);
+    float water = 0.0;
+    sand = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 cell = full + ivec2(i & 1, i >> 1);
+        water += imageLoad(waterAmountTex, cell).x * (1.0 - imageLoad(oilTex, cell).x);
+        sand += imageLoad(sandOccupancyTex, cell).x;
+    }
+    sand *= 0.25;
+    return 0.25 * water;
 }
 
 void main() {
@@ -26,7 +38,8 @@ void main() {
         return;
     }
 
-    float water = sampleWater(coord);
+    float sand;
+    float water = sampleWater(coord, sand);
     vec2 combustion = imageLoad(combustionTex, coord).xy;
     float oxidizer = imageLoad(oxidizerTex, coord).x;
     float fuel = imageLoad(fuelTex, coord).x;
@@ -38,7 +51,7 @@ void main() {
         return;
     }
 
-    float suppression = clamp(water * waterCooling, 0.0, 1.0);
+    float suppression = max(clamp(water * waterCooling, 0.0, 1.0), clamp(sand / sandSmother, 0.0, 1.0));
     combustion.y *= pow(max(1.0 - suppression * 2.2, 0.0), dt * 60.0);
     fuel = clamp(fuel * pow(1.0 - suppression * 0.85, dt * 60.0), 0.0, 1.0);
     oxidizer = clamp(oxidizer * pow(max(1.0 - suppression * 1.2, 0.0), dt * 60.0), 0.0, 1.0);

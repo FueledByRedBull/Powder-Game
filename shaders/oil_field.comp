@@ -1,0 +1,29 @@
+#version 430
+
+// Oil field from the per-cell tallies of phase_particles.comp, which it clears for the next tick.
+// x: oil share of the cell's liquid records (buoyancy and drift, fire suppression, colour); y: oil amount in full cells
+// (records over the rest density, saturating at 1).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform writeonly image2D oilTex;
+
+layout(std430, binding = 0) buffer PhaseCells {
+    uint cellCounts[];
+};
+
+uniform ivec2 gridSize;
+uniform float restDensity;  // records per cell at rest
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(cell, gridSize))) {
+        return;
+    }
+    int linear = cell.y * gridSize.x + cell.x;
+    uint oil = cellCounts[2 * linear];
+    uint total = cellCounts[2 * linear + 1];
+    cellCounts[2 * linear] = 0u;
+    cellCounts[2 * linear + 1] = 0u;
+    float share = total > 0u ? float(oil) / float(total) : 0.0;
+    imageStore(oilTex, cell, vec4(share, min(float(oil) / restDensity, 1.0), 0.0, 0.0));
+}

@@ -27,6 +27,24 @@ uniform float reactionAdd;
 uniform int blockedBySolid;
 uniform int blockedByWater;
 uniform int clearMode;
+uniform float maxVelocity;
+// Per-cell random velocity (gas cells/s) so a stroke breaks up instead of moving as a block.
+uniform float velocitySpread;
+uniform uint spawnSeed;
+
+uint hashCell(uvec2 cell, uint salt) {
+    uint h = cell.x * 0x8da6b343u ^ cell.y * 0xd8163841u ^ salt * 0xcb1ab31fu;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    return h;
+}
+
+// Stamps set rather than add: the faster of the gas already there and the brush wins, so overlapping
+// stamps never pile up speed.
+float stampVelocity(float current, float brush) {
+    return clamp(abs(brush) > abs(current) ? brush : current, -maxVelocity, maxVelocity);
+}
 
 bool fullCellInsideBrush(ivec2 fullCoord) {
     vec2 cellCenter = vec2(fullCoord) + vec2(0.5);
@@ -62,25 +80,27 @@ bool overlapsWater(ivec2 coord) {
     return false;
 }
 
+// Clearing also zeroes the right/top faces shared with the neighbours: the zero stores are idempotent,
+// while additive stores must stay single-owner.
 void storeOwnedFaces(ivec2 coord, vec2 velocity, bool clearOnly) {
     if (coord.y < gasSize.y) {
         ivec2 uFace = ivec2(coord.x, coord.y);
-        float uValue = clearOnly ? 0.0 : clamp(imageLoad(gasUTex, uFace).x + velocity.x, -4.0, 4.0);
+        float uValue = clearOnly ? 0.0 : stampVelocity(imageLoad(gasUTex, uFace).x, velocity.x);
         imageStore(gasUTex, uFace, vec4(uValue, 0.0, 0.0, 0.0));
     }
-    if (coord.x == gasSize.x - 1 && coord.y < gasSize.y) {
+    if ((clearOnly || coord.x == gasSize.x - 1) && coord.y < gasSize.y) {
         ivec2 uFace = ivec2(coord.x + 1, coord.y);
-        float uValue = clearOnly ? 0.0 : clamp(imageLoad(gasUTex, uFace).x + velocity.x, -4.0, 4.0);
+        float uValue = clearOnly ? 0.0 : stampVelocity(imageLoad(gasUTex, uFace).x, velocity.x);
         imageStore(gasUTex, uFace, vec4(uValue, 0.0, 0.0, 0.0));
     }
     if (coord.x < gasSize.x) {
         ivec2 vFace = ivec2(coord.x, coord.y);
-        float vValue = clearOnly ? 0.0 : clamp(imageLoad(gasVTex, vFace).x + velocity.y, -4.0, 4.0);
+        float vValue = clearOnly ? 0.0 : stampVelocity(imageLoad(gasVTex, vFace).x, velocity.y);
         imageStore(gasVTex, vFace, vec4(vValue, 0.0, 0.0, 0.0));
     }
-    if (coord.y == gasSize.y - 1 && coord.x < gasSize.x) {
+    if ((clearOnly || coord.y == gasSize.y - 1) && coord.x < gasSize.x) {
         ivec2 vFace = ivec2(coord.x, coord.y + 1);
-        float vValue = clearOnly ? 0.0 : clamp(imageLoad(gasVTex, vFace).x + velocity.y, -4.0, 4.0);
+        float vValue = clearOnly ? 0.0 : stampVelocity(imageLoad(gasVTex, vFace).x, velocity.y);
         imageStore(gasVTex, vFace, vec4(vValue, 0.0, 0.0, 0.0));
     }
 }
@@ -100,7 +120,8 @@ void main() {
         imageStore(smokeDenTex, coord, vec4(0.0));
         imageStore(temperatureTex, coord, vec4(0.0));
         imageStore(fuelTex, coord, vec4(0.0));
-        imageStore(oxidizerTex, coord, vec4(0.0));
+        // Erased gas is fresh air.
+        imageStore(oxidizerTex, coord, vec4(1.0));
         imageStore(reactionTex, coord, vec4(0.0));
         return;
     }
@@ -112,7 +133,9 @@ void main() {
         return;
     }
 
-    storeOwnedFaces(coord, gasVelocity, false);
+    vec2 spread = vec2(hashCell(uvec2(coord), spawnSeed), hashCell(uvec2(coord), spawnSeed + 1u)) / 4294967295.0;
+    vec2 stampedVelocity = gasVelocity + (spread * 2.0 - 1.0) * velocitySpread;
+    storeOwnedFaces(coord, stampedVelocity, false);
 
     float currentDensity = imageLoad(smokeDenTex, coord).x;
     float currentTemperature = imageLoad(temperatureTex, coord).x;
@@ -121,12 +144,14 @@ void main() {
     vec2 reaction = imageLoad(reactionTex, coord).xy;
     vec2 centerVelocity = imageLoad(gasCenterVelocityTex, coord).xy;
 
-    imageStore(smokeDenTex, coord, vec4(clamp(currentDensity + smokeDensity, 0.0, 1.0), 0.0, 0.0, 0.0));
-    imageStore(gasCenterVelocityTex, coord, vec4(clamp(centerVelocity + gasVelocity, vec2(-4.0), vec2(4.0)), 0.0, 0.0));
-    imageStore(temperatureTex, coord, vec4(clamp(currentTemperature + temperatureAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
-    imageStore(fuelTex, coord, vec4(clamp(currentFuel + fuelAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
-    imageStore(oxidizerTex, coord, vec4(clamp(currentOxidizer + oxidizerAdd, 0.0, 1.0), 0.0, 0.0, 0.0));
-    reaction.x = 0.0;
-    reaction.y = clamp(reaction.y + reactionAdd, 0.0, 1.0);
+    // Scalars take the larger of the field and the brush, so a held or overlapping brush keeps a steady
+    // source instead of saturating.
+    imageStore(smokeDenTex, coord, vec4(clamp(max(currentDensity, smokeDensity), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(gasCenterVelocityTex, coord,
+               vec4(stampVelocity(centerVelocity.x, stampedVelocity.x), stampVelocity(centerVelocity.y, stampedVelocity.y), 0.0, 0.0));
+    imageStore(temperatureTex, coord, vec4(clamp(max(currentTemperature, temperatureAdd), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(fuelTex, coord, vec4(clamp(max(currentFuel, fuelAdd), 0.0, 1.0), 0.0, 0.0, 0.0));
+    imageStore(oxidizerTex, coord, vec4(clamp(max(currentOxidizer, oxidizerAdd), 0.0, 1.0), 0.0, 0.0, 0.0));
+    reaction.y = clamp(max(reaction.y, reactionAdd), 0.0, 1.0);
     imageStore(reactionTex, coord, vec4(reaction, 0.0, 0.0));
 }

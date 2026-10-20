@@ -17,8 +17,9 @@ uniform ivec2 brushCenter;
 uniform int brushRadius;
 uniform int maxParticles;
 
+// A particle is cleared with the cell it occupies, matching the cell-centre test of the grid clears.
 bool insideBrush(vec2 position) {
-    vec2 delta = position - (vec2(brushCenter) + vec2(0.5));
+    vec2 delta = floor(position) - vec2(brushCenter);
     return dot(delta, delta) <= float(brushRadius * brushRadius);
 }
 

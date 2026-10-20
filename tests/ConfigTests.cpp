@@ -61,27 +61,42 @@ struct FloatSetting {
 
 constexpr FloatSetting kFloatSettings[] = {
     {"POWDER_FIXED_DT", &SimulationConfig::fixed_dt, 1.0F / 60.0F, FloatDomain::TimeStep},
-    {"POWDER_WATER_CFL", &SimulationConfig::water_cfl_limit, 0.9F, FloatDomain::Positive},
-    {"POWDER_WATER_GRAVITY", &SimulationConfig::water_gravity, -140.0F, FloatDomain::Signed},
-    {"POWDER_WATER_FLIP_BLEND", &SimulationConfig::water_flip_blend, 0.95F, FloatDomain::UnitInterval},
+    {"POWDER_WATER_CFL", &SimulationConfig::water_cfl_limit, 16.0F, FloatDomain::Positive},
+    {"POWDER_WATER_GRAVITY", &SimulationConfig::water_gravity, -1962.0F, FloatDomain::Signed},
+    {"POWDER_WATER_MAX_VELOCITY", &SimulationConfig::water_max_velocity, 2400.0F, FloatDomain::Positive},
+    {"POWDER_WATER_DENSITY_RATE", &SimulationConfig::water_density_rate, 20.0F, FloatDomain::Nonnegative},
+    {"POWDER_WATER_FLIP_BLEND", &SimulationConfig::water_flip_blend, 0.97F, FloatDomain::UnitInterval},
     {"POWDER_WATER_PRESSURE_RESIDUAL", &SimulationConfig::water_pressure_residual_threshold, 0.12F, FloatDomain::Nonnegative},
-    {"POWDER_GAS_CFL", &SimulationConfig::gas_cfl_limit, 1.1F, FloatDomain::Positive},
-    {"POWDER_GAS_PRESSURE_RESIDUAL", &SimulationConfig::gas_pressure_residual_threshold, 0.015F, FloatDomain::Nonnegative},
-    {"POWDER_GAS_BUOYANCY_TEMPERATURE", &SimulationConfig::gas_buoyancy_temperature, 1.6F, FloatDomain::Signed},
-    {"POWDER_GAS_BUOYANCY_SMOKE", &SimulationConfig::gas_buoyancy_smoke, 0.55F, FloatDomain::Signed},
-    {"POWDER_GAS_COMBUSTION_RATE", &SimulationConfig::gas_combustion_rate, 2.1F, FloatDomain::Nonnegative},
+    {"POWDER_GAS_CFL", &SimulationConfig::gas_cfl_limit, 8.0F, FloatDomain::Positive},
+    {"POWDER_GAS_PRESSURE_RESIDUAL", &SimulationConfig::gas_pressure_residual_threshold, 0.25F, FloatDomain::Nonnegative},
+    {"POWDER_GAS_BUOYANCY_TEMPERATURE", &SimulationConfig::gas_buoyancy_temperature, 1200.0F, FloatDomain::Signed},
+    {"POWDER_GAS_BUOYANCY_SMOKE", &SimulationConfig::gas_buoyancy_smoke, 10.0F, FloatDomain::Signed},
+    {"POWDER_GAS_COMBUSTION_RATE", &SimulationConfig::gas_combustion_rate, 10.0F, FloatDomain::Nonnegative},
     {"POWDER_GAS_WATER_COOLING", &SimulationConfig::gas_water_cooling, 2.4F, FloatDomain::Nonnegative},
-    {"POWDER_GAS_TEMPERATURE_DIFFUSION", &SimulationConfig::gas_temperature_diffusion, 0.045F, FloatDomain::Nonnegative},
+    {"POWDER_GAS_TEMPERATURE_DIFFUSION", &SimulationConfig::gas_temperature_diffusion, 10.0F, FloatDomain::Nonnegative},
     {"POWDER_GAS_SMOKE_DISSIPATION", &SimulationConfig::gas_smoke_dissipation, 0.08F, FloatDomain::Nonnegative},
-    {"POWDER_SAND_DRAG", &SimulationConfig::sand_drag, 0.1F, FloatDomain::Nonnegative},
-    {"POWDER_SAND_MAX_VELOCITY", &SimulationConfig::sand_max_velocity, 280.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_DRAG", &SimulationConfig::sand_drag, 60.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_MAX_VELOCITY", &SimulationConfig::sand_max_velocity, 2400.0F, FloatDomain::Nonnegative},
     {"POWDER_SAND_FRICTION", &SimulationConfig::sand_friction_coefficient, 0.62F, FloatDomain::Nonnegative},
     {"POWDER_SAND_REFERENCE_DENSITY", &SimulationConfig::sand_reference_density, 2.0F, FloatDomain::Positive},
-    {"POWDER_SAND_SHEAR_MODULUS", &SimulationConfig::sand_shear_modulus, 12000.0F, FloatDomain::Positive},
-    {"POWDER_SAND_LAME_LAMBDA", &SimulationConfig::sand_lame_lambda, 12000.0F, FloatDomain::Nonnegative},
-    {"POWDER_SAND_FRICTION_ALPHA", &SimulationConfig::sand_friction_alpha, 0.5F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_SHEAR_MODULUS", &SimulationConfig::sand_shear_modulus, 196000.0F, FloatDomain::Positive},
+    {"POWDER_SAND_LAME_LAMBDA", &SimulationConfig::sand_lame_lambda, 196000.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_FRICTION_ALPHA", &SimulationConfig::sand_friction_alpha, 0.6F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_FRICTION_RATE_GAIN", &SimulationConfig::sand_friction_rate_gain, 0.68F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_COHESION", &SimulationConfig::sand_cohesion, 0.3F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_MAX_DILATION", &SimulationConfig::sand_max_dilation, 0.14F, FloatDomain::Nonnegative},
     {"POWDER_SAND_CFL", &SimulationConfig::sand_cfl_limit, 0.4F, FloatDomain::Positive},
-    {"POWDER_SAND_SPAWN_OCCUPANCY_LIMIT", &SimulationConfig::sand_spawn_occupancy_limit, 0.45F, FloatDomain::UnitInterval},
+    {"POWDER_SAND_ADVECTION_CFL", &SimulationConfig::sand_advection_cfl, 1.0F, FloatDomain::Positive},
+    {"POWDER_SAND_GRAVITY", &SimulationConfig::sand_gravity, 1962.0F, FloatDomain::Signed},
+    {"POWDER_WATER_ADVECTION_CFL", &SimulationConfig::water_advection_cfl, 2.0F, FloatDomain::Positive},
+    {"POWDER_SAND_VISCOSITY", &SimulationConfig::sand_viscosity, 200.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_CONTACT_DAMPING", &SimulationConfig::sand_contact_damping, 6.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_SLEEP_SPEED", &SimulationConfig::sand_sleep_speed, 4.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_WAKE_IMPACT_SPEED", &SimulationConfig::sand_wake_impact_speed, 60.0F, FloatDomain::Positive},
+    {"POWDER_SAND_WAKE_WATER_SPEED", &SimulationConfig::sand_wake_water_speed, 40.0F, FloatDomain::Positive},
+    {"POWDER_WATER_SLEEP_SPEED", &SimulationConfig::water_sleep_speed, 2.0F, FloatDomain::Nonnegative},
+    {"POWDER_WATER_WAKE_SPEED", &SimulationConfig::water_wake_speed, 5.0F, FloatDomain::Positive},
+    {"POWDER_SAND_SPAWN_OCCUPANCY_LIMIT", &SimulationConfig::sand_spawn_occupancy_limit, 0.225F, FloatDomain::UnitInterval},
     {"POWDER_REPLAY_DETERMINISM_REL_TOL", &SimulationConfig::replay_determinism_relative_tolerance, 0.15F, FloatDomain::Nonnegative},
     {"POWDER_REPLAY_DETERMINISM_ABS_TOL", &SimulationConfig::replay_determinism_absolute_tolerance, 0.05F, FloatDomain::Nonnegative},
     {"POWDER_COMBINED_TARGET_FRAME_MS", &SimulationConfig::combined_target_frame_ms, 33.34F, FloatDomain::Positive},
@@ -96,16 +111,18 @@ struct IntSetting {
 
 constexpr IntSetting kIntSettings[] = {
     {"POWDER_WATER_MIN_SUBSTEPS", &SimulationConfig::water_min_substeps, 1},
-    {"POWDER_WATER_MAX_SUBSTEPS", &SimulationConfig::water_max_substeps, 3},
+    {"POWDER_WATER_MAX_SUBSTEPS", &SimulationConfig::water_max_substeps, 6},
     {"POWDER_WATER_PRESSURE_ITERATIONS", &SimulationConfig::water_pressure_iterations, 1024},
     {"POWDER_GAS_MIN_SUBSTEPS", &SimulationConfig::gas_min_substeps, 1},
     {"POWDER_GAS_MAX_SUBSTEPS", &SimulationConfig::gas_max_substeps, 2},
-    {"POWDER_GAS_PRESSURE_ITERATIONS", &SimulationConfig::gas_pressure_iterations, 24},
+    {"POWDER_GAS_PRESSURE_ITERATIONS", &SimulationConfig::gas_pressure_iterations, 48},
     {"POWDER_SAND_MAX_SUBSTEPS", &SimulationConfig::sand_max_substeps, 64},
     {"POWDER_REPLAY_REPEAT", &SimulationConfig::replay_repeat_count, 2},
 };
 
 void ClearConfigEnvironment() {
+    SetValue(nullptr, "POWDER_SAND_SLEEP_TICKS");
+    SetValue(nullptr, "POWDER_WATER_SLEEP_TICKS");
     for (const auto& setting : kFloatSettings) {
         SetValue(nullptr, setting.name);
     }
@@ -142,7 +159,7 @@ template <typename Run>
 void CheckSimulationConfig(const Run& run) {
     run("fixed simulation clock is independent of render frequency", [] {
         const double dt = 1.0 / 60.0;
-        for (int frames_per_second : {30, 60, 144, 240}) {
+        for (int frames_per_second : {60, 144, 240}) {
             FixedStepClock clock;
             int steps = 0;
             for (int frame = 0; frame < 10 * frames_per_second; ++frame) {
@@ -150,16 +167,41 @@ void CheckSimulationConfig(const Run& run) {
             }
             Require(steps >= 599 && steps <= 600, "ten elapsed seconds must produce 600 ticks within one tick");
         }
+        // Below 40 Hz every frame counts as an overrun: one tick per frame, the rest dropped (documented slow motion).
+        FixedStepClock slow_display;
+        int slow_steps = 0;
+        for (int frame = 0; frame < 300; ++frame) slow_steps += slow_display.Advance(1.0 / 30.0, dt);
+        Require(slow_steps == 300, "a 30 Hz frame rate runs one tick per frame");
         FixedStepClock clock;
         Require(clock.Advance(dt * 0.5, dt) == 0 && clock.Advance(dt * 0.5, dt) == 1,
                 "sub-frame elapsed time must carry into the next frame");
-        Require(clock.Advance(10.0, dt) == 4 && clock.Advance(0.0, dt) == 0,
-                "a stall must have bounded catch-up and no lingering backlog");
+        Require(clock.Advance(dt * 0.9, dt) == 0 && clock.Advance(dt * 1.2, dt) == 2,
+                "a frame that kept up may catch up two ticks");
+        Require(clock.Advance(10.0, dt) == 1 && clock.Advance(0.0, dt) == 1 && clock.Advance(0.0, dt) == 0,
+                "a stall runs one tick and keeps at most one tick of backlog");
         Require(clock.Advance(-1.0, dt) == 0, "clock rollback must not advance or rewind the simulation");
+    });
+    run("fixed simulation clock cannot death-spiral when a tick costs more than its duration", [] {
+        const double dt = 1.0 / 60.0;
+        for (double tick_cost : {0.020, 0.050, 0.200}) {
+            FixedStepClock clock;
+            double frame = dt;
+            int most = 0;
+            for (int i = 0; i < 200; ++i) {
+                const int steps = clock.Advance(frame, dt);
+                Require(steps >= 1 || frame < dt, "a frame of at least one tick must advance the simulation");
+                Require(frame <= 1.5 * dt ? steps <= 2 : steps <= 1, "an overrun frame must be followed by one tick");
+                if (i > 0) most = std::max(most, steps);
+                frame = 0.002 + steps * tick_cost;  // the next frame waits for this one's ticks plus rendering
+            }
+            // 20 ms ticks overrun only after a two-tick catch-up; slower ticks overrun every frame.
+            Require(most == (tick_cost < 1.5 * dt ? 2 : 1), "catch-up must stop at the first overrun");
+        }
     });
     run("substep count respects finite inputs before narrowing", [] {
         using powder_config::SubstepCount;
-        Require(SubstepCount(72.0F, 1.0F / 60.0F, 0.9F, 1, 3) == 2, "water default count");
+        Require(SubstepCount(2400.0F, 1.0F / 60.0F, 16.0F, 1, 6) <= 6, "water default count at the speed cap fits the budget");
+        Require(SubstepCount(40.0F, 1.0F / 60.0F, 0.9F, 1, 3) == 1, "slow water takes one substep");
         Require(SubstepCount(0.0F, 1.0F, 1.0F, 2, 8) == 2, "minimum count");
         Require(SubstepCount(3.25F, 1.0F, 1.0F, 1, 8) == 4, "fraction rounds upward");
         Require(SubstepCount(72.0F, 1.0F / 15.0F, 0.9F, 1, 6) == 6,
@@ -250,7 +292,7 @@ void CheckSimulationConfig(const Run& run) {
     for (const auto& [name, value] : {std::pair{"POWDER_FIXED_DT", "0.001"},
                                      {"POWDER_FIXED_DT", "0.1"},
                                      {"POWDER_REPLAY_REPEAT", "5"},
-                                     {"POWDER_WATER_MIN_SUBSTEPS", "4"},
+                                     {"POWDER_WATER_MIN_SUBSTEPS", "7"},
                                      {"POWDER_GAS_MIN_SUBSTEPS", "3"}}) {
         run(std::string("configuration upper or paired bound ") + name,
             [&] { ExpectInvalidConfig(name, value); });
@@ -275,6 +317,29 @@ void CheckSimulationConfig(const Run& run) {
                 Require(config.*(setting.member) == std::numeric_limits<int>::max(), setting.name);
             }
         }
+    });
+    // Zero disables sleep-packing; the still-tick timer saturates at 255.
+    run("sand sleep ticks domain", [] {
+        ClearConfigEnvironment();
+        Require(powder_config::LoadConfigFromEnvironment().sand_sleep_ticks == 12, "POWDER_SAND_SLEEP_TICKS default");
+        for (const char* value : {"0", "255"}) {
+            SetValue(value, "POWDER_SAND_SLEEP_TICKS");
+            Require(powder_config::LoadConfigFromEnvironment().sand_sleep_ticks == std::atoi(value),
+                    "sand sleep ticks endpoint");
+        }
+        ExpectInvalidConfig("POWDER_SAND_SLEEP_TICKS", "-1");
+        ExpectInvalidConfig("POWDER_SAND_SLEEP_TICKS", "256");
+    });
+    run("water sleep ticks domain", [] {
+        ClearConfigEnvironment();
+        Require(powder_config::LoadConfigFromEnvironment().water_sleep_ticks == 30, "POWDER_WATER_SLEEP_TICKS default");
+        for (const char* value : {"0", "255"}) {
+            SetValue(value, "POWDER_WATER_SLEEP_TICKS");
+            Require(powder_config::LoadConfigFromEnvironment().water_sleep_ticks == std::atoi(value),
+                    "water sleep ticks endpoint");
+        }
+        ExpectInvalidConfig("POWDER_WATER_SLEEP_TICKS", "-1");
+        ExpectInvalidConfig("POWDER_WATER_SLEEP_TICKS", "256");
     });
     run("loader preserves lexical error setting names", [] {
         ExpectInvalidConfig("POWDER_GAS_CFL", "1junk");

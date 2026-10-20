@@ -8,7 +8,8 @@ struct WaterParticle {
     vec4 state2;
 };
 
-layout(std430, binding = 0) readonly buffer WaterParticlesSrc {
+// Writable: every copied record is deactivated, so the source becomes an all-inactive scratch pool for the next tick.
+layout(std430, binding = 0) buffer WaterParticlesSrc {
     WaterParticle srcParticles[];
 };
 
@@ -18,9 +19,18 @@ layout(std430, binding = 1) buffer WaterParticlesDst {
 
 layout(std430, binding = 2) buffer WaterSpawnCursor {
     uint spawnCursor;
+    // Fastest live particle as float bits (non-negative floats order like their bits); the host sizes substeps from it.
+    uint fastestSpeedBits;
+};
+
+// water_pack.comp's flags: particles in a cell with the pack bit now live in the packed texture.
+layout(std430, binding = 3) readonly buffer WaterCellTally {
+    uint tally[];
 };
 
 uniform int maxParticles;
+uniform ivec2 gridSize;
+uniform int dropPacked;
 
 void main() {
     uint index = gl_GlobalInvocationID.x;
@@ -31,6 +41,20 @@ void main() {
     WaterParticle particle = srcParticles[index];
     if (particle.state1.x < 0.5) {
         return;
+    }
+    srcParticles[index].state1.x = 0.0;
+    // The same particles water_sleep.comp tallied.
+    vec2 position = particle.state0.xy;
+    if (dropPacked == 1 && particle.state1.x >= 0.5 && !any(isnan(position)) && !any(isinf(position)) &&
+        all(greaterThanEqual(position, vec2(0.0))) && all(lessThan(position, vec2(gridSize)))) {
+        ivec2 cell = ivec2(floor(position));
+        if ((tally[cell.y * gridSize.x + cell.x] & (1u << 31)) != 0u) return;
+    }
+
+    float speed = length(particle.state0.zw);
+    // The plain read skips most atomics: a stale value only costs a redundant one.
+    if (!isnan(speed) && !isinf(speed) && floatBitsToUint(speed) > fastestSpeedBits) {
+        atomicMax(fastestSpeedBits, floatBitsToUint(speed));
     }
 
     uint dst_index = atomicAdd(spawnCursor, 1u);

@@ -122,16 +122,6 @@ vec2 sampleVelocitySrc(vec2 position) {
     return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
 }
 
-vec2 sampleVelocityFwd(vec2 position) {
-    vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
-    ivec2 base = ivec2(floor(p));
-    vec2 frac = fract(p);
-    vec2 v00 = imageLoad(gasVelocityFwd, base).xy;
-    vec2 v10 = imageLoad(gasVelocityFwd, clampCoord(base + ivec2(1, 0))).xy;
-    vec2 v01 = imageLoad(gasVelocityFwd, clampCoord(base + ivec2(0, 1))).xy;
-    vec2 v11 = imageLoad(gasVelocityFwd, clampCoord(base + ivec2(1, 1))).xy;
-    return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
-}
 
 
 
@@ -253,7 +243,7 @@ void main() {
 
     vec2 center = vec2(coord) + vec2(0.5);
     vec2 backtrace = clamp(center - sampleVelocitySrc(center) * dt, vec2(0.5), vec2(gasSize) - vec2(0.5));
-    vec2 reverseTrace = clamp(center + sampleVelocityFwd(center) * dt, vec2(0.5), vec2(gasSize) - vec2(0.5));
+    vec2 reverseTrace = clamp(center + sampleVelocitySrc(center) * dt, vec2(0.5), vec2(gasSize) - vec2(0.5));
 
     TransportStencil backStencil = transportStencil(center, backtrace, vec2(0.5), gasSize - ivec2(1), -1);
     TransportStencil reverseStencil = transportStencil(center, reverseTrace, vec2(0.5), gasSize - ivec2(1), -1);
@@ -275,9 +265,10 @@ void main() {
     imageStore(fuelDst, coord, vec4(clampLocalFuel(backStencil, fuel) * scalarDissipation, 0.0, 0.0, 0.0));
     imageStore(oxidizerDst,
                coord,
-               vec4(clampLocalOxidizer(backStencil, oxidizer) * scalarDissipation, 0.0, 0.0, 0.0));
+               vec4(clampLocalOxidizer(backStencil, oxidizer), 0.0, 0.0, 0.0));
     reaction = clampLocalReaction(backStencil, reaction);
-    reaction.x = 0.0;
+    // x is the burn rate that drives combustion expansion; it travels with the gas.
+    reaction.x = max(reaction.x, 0.0);
     reaction.y = clamp(reaction.y, 0.0, 1.0) * scalarDissipation;
     if (invalid(smoke) || invalid(temperature) || invalid(fuel) || invalid(oxidizer) || invalid(reaction.y)) {
         atomicAdd(nanInfDetected, 1u);

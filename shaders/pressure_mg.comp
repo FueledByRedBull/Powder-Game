@@ -1,0 +1,384 @@
+#version 430
+
+// Multigrid preconditioner of the water CG in pressure_cg.comp (MGPCG, McAdams et al. 2010): z = M^-1 r is one
+// V-cycle from zero. Level 0 is the CG grid; level l + 1 halves level l. Every level smooths with damped Jacobi sweeps
+// before and after its coarse correction, prolongation is bilinear and restriction its transpose, and the coarsest
+// level runs a fixed number of Jacobi sweeps from zero. Each part is a fixed symmetric linear map and every smoother
+// contracts, so M^-1 stays symmetric positive definite for any coarse operator and CG remains valid.
+// Coarse cells are rediscretised: air (Dirichlet) if any child is air, else liquid if any child is liquid, else a wall,
+// sand-porous when a child is sand. Coarse liquid cells couple to liquid neighbours by -1 and carry 1 per open
+// neighbour (sandLeak per sand wall) on the diagonal, the fine operator's form; restricting with weights summing to 4
+// absorbs the factor of four between grid spacings. Prolongation treats walls as Neumann: a wall partner of the
+// bilinear stencil takes the fine cell's own coarse value (pulling it toward zero instead multiplied the iterations).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+
+// Level 0: residual, search direction, A*direction or preconditioned residual, diagonal (pressure_cg.comp).
+layout(std430, binding = 0) buffer Vectors { vec4 vectors[]; };
+layout(std430, binding = 2) readonly buffer Scalars {
+    float rho;
+    float alpha;
+    float beta;
+    float residualMax;
+    uint running;
+    uint invalidInput;
+    uint iterations;
+    uint padding;
+    uvec4 liquidBounds;  // first and last cell of the solve, from pressure_cg_reduce.comp
+};
+layout(std430, binding = 4) readonly buffer Tiles {
+    uvec4 tileDispatch;
+    uvec4 tileInfo;
+    uint tiles[];
+};
+layout(std430, binding = 5) writeonly buffer TileSums { vec4 tileSums[]; };
+layout(std430, binding = 6) buffer Levels {
+    // Indirect arguments: 0 the coarsest solve, l the box of level l. pressure_cg.comp zeroes them when the solve stops.
+    uvec4 levelDispatch[8];
+    // First and last cell of level l that this solve classifies: the solve's bounds plus one cell. Cells outside it
+    // keep an earlier solve's data and read as walls.
+    ivec4 levelBox[8];
+    vec4 cells[];  // levels 1..L in order: b, x, diagonal (0 outside the solve), type
+};
+
+uniform ivec2 gridSize;
+uniform int levels;  // L, the coarsest level
+uniform float sandLeak;
+// Once per solve: 0: boxes and indirect arguments; 1: classify level `level` (and form the diagonals of level - 1),
+// for level = 1 .. L; 5: diagonals of level L. Per V-cycle: 2: restrict from `level` to level + 1,
+// for level = 0 .. L - 1; 3: coarsest solve; 4: prolongate to `level` and smooth, for level = L - 1 .. 0. Level 0
+// steps run one workgroup per listed CG tile, the others over a level's box.
+uniform int phase;
+uniform int level;
+uniform int slot;     // tile sum slot of z = M^-1 r (pressure_cg.comp)
+uniform int initial;  // 1: also start the search direction, d = z
+
+const float omega = 2.0 / 3.0;
+const int coarsestSweeps = 16;
+const int sweeps = 1;  // damped Jacobi sweeps before and after each coarse correction
+const float wall = 0.0, sandWall = 1.0, air = 2.0, liquid = 3.0;
+const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+ivec2 levelSize(int l) {
+    ivec2 size = gridSize;
+    for (int i = 0; i < l; ++i) size = (size + 1) / 2;
+    return size;
+}
+
+int levelOffset(int l) {
+    int offset = 0;
+    ivec2 size = gridSize;
+    for (int i = 1; i < l; ++i) {
+        size = (size + 1) / 2;
+        offset += size.x * size.y;
+    }
+    return offset;
+}
+
+bool invalid(float value) { return isnan(value) || isinf(value); }
+
+// Sizes and offsets of the step's fine level (`level`) and coarse level (`level` + 1).
+ivec2 fineSize, coarseSize;
+int fineOffset, coarseOffset;
+
+vec4 levelCell(int l, int offset, ivec2 size, ivec2 c) {
+    ivec4 box = levelBox[l];
+    if (any(lessThan(c, box.xy)) || any(greaterThan(c, box.zw))) return vec4(0.0);
+    return cells[offset + c.y * size.x + c.x];
+}
+
+// b and diagonal of a fine cell, zero outside the solve.
+vec2 fineCell(ivec2 c) {
+    if (level == 0) {
+        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) return vec2(0.0);
+        vec4 value = vectors[c.y * gridSize.x + c.x];
+        return value.w > 0.0 ? value.xw : vec2(0.0);
+    }
+    vec4 value = levelCell(level, fineOffset, fineSize, c);
+    return value.z > 0.0 ? value.xz : vec2(0.0);
+}
+
+// Level-0 child type: walls from the mask, liquid where the CG has a row (or invalid input), air elsewhere.
+float baseType(ivec2 c) {
+    if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) return wall;
+    uint mask = imageLoad(boundaryTex, c).r;
+    if (mask != 0u) return mask >= 2u ? sandWall : wall;
+    return vectors[c.y * gridSize.x + c.x].w != 0.0 ? liquid : air;
+}
+
+float conductance(float type) { return type >= air ? 1.0 : type == sandWall ? sandLeak : 0.0; }
+
+float levelDiagonal(int l, int offset, ivec2 size, ivec2 c) {
+    if (levelCell(l, offset, size, c).w != liquid) return 0.0;
+    float diagonal = 0.0;
+    for (int i = 0; i < 4; ++i) diagonal += conductance(levelCell(l, offset, size, c + offsets[i]).w);
+    return diagonal;
+}
+
+void setup() {
+    if (gl_GlobalInvocationID.xy != uvec2(0u)) return;
+    ivec2 first = ivec2(liquidBounds.xy), last = ivec2(liquidBounds.zw);
+    bool on = running != 0u && all(lessThanEqual(first, last));
+    levelDispatch[0] = uvec4(on ? 1u : 0u, 1u, 1u, 0u);
+    ivec2 size = gridSize;
+    for (int l = 1; l < 8; ++l) {
+        size = (size + 1) / 2;
+        first /= 2;
+        last /= 2;
+        ivec2 low = max(first - 1, ivec2(0)), high = min(last + 1, size - 1);
+        levelBox[l] = ivec4(low, high);
+        uvec2 groups = uvec2((high - (low & ivec2(~7))) / 8 + 1);
+        levelDispatch[l] = on && l <= levels ? uvec4(groups, 1u, 0u) : uvec4(0u, 1u, 1u, 0u);
+    }
+}
+
+// Cell of a box dispatch over level l.
+ivec2 boxCell(int l) { return (levelBox[l].xy & ivec2(~7)) + ivec2(gl_GlobalInvocationID.xy); }
+
+void classify() {
+    ivec2 cell = boxCell(level);
+    if (any(lessThan(cell, levelBox[level].xy)) || any(greaterThan(cell, levelBox[level].zw))) return;
+    ivec2 size = levelSize(level);
+    int offset = levelOffset(level);
+    ivec2 childSize = levelSize(level - 1);
+    int childOffset = levelOffset(level - 1);
+    bool anyAir = false, anyLiquid = false, anySand = false;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 child = cell * 2 + ivec2(i & 1, i >> 1);
+        float type = level == 1 ? baseType(child) : levelCell(level - 1, childOffset, childSize, child).w;
+        anyAir = anyAir || type == air;
+        anyLiquid = anyLiquid || type == liquid;
+        anySand = anySand || type == sandWall;
+        // The children's types are complete, so their diagonals can be formed here.
+        if (level > 1 && all(lessThan(child, childSize)))
+            cells[childOffset + child.y * childSize.x + child.x].z = levelDiagonal(level - 1, childOffset, childSize, child);
+    }
+    cells[offset + cell.y * size.x + cell.x].w = anyAir ? air : anyLiquid ? liquid : anySand ? sandWall : wall;
+}
+
+void coarsestDiagonal() {
+    ivec2 cell = ivec2(gl_LocalInvocationID.xy);
+    ivec2 size = levelSize(levels);
+    int offset = levelOffset(levels);
+    if (all(lessThan(cell, size))) cells[offset + cell.y * size.x + cell.x].z = levelDiagonal(levels, offset, size, cell);
+}
+
+shared float sweep[2][64];
+
+void coarsest() {
+    ivec2 cell = ivec2(gl_LocalInvocationID.xy);
+    uint lane = gl_LocalInvocationIndex;
+    ivec2 size = levelSize(levels);
+    int offset = levelOffset(levels);
+    bool inside = all(lessThan(cell, size));
+    vec4 value = inside ? levelCell(levels, offset, size, cell) : vec4(0.0);
+    bool solving = value.z > 0.0;
+    float x = 0.0;
+    sweep[0][lane] = 0.0;
+    barrier();
+    for (int s = 0; s < coarsestSweeps; ++s) {
+        int from = s & 1;
+        float neighbors = 0.0;
+        if (cell.x > 0) neighbors += sweep[from][lane - 1u];
+        if (cell.x < 7) neighbors += sweep[from][lane + 1u];
+        if (cell.y > 0) neighbors += sweep[from][lane - 8u];
+        if (cell.y < 7) neighbors += sweep[from][lane + 8u];
+        x = solving ? x + omega * (value.x - value.z * x + neighbors) / value.z : 0.0;
+        sweep[1 - from][lane] = x;
+        barrier();
+    }
+    if (solving) cells[offset + cell.y * size.x + cell.x].y = x;
+}
+
+// First coarse cell of a V-cycle step's 8x8 block: under a listed CG tile for level 0, else in the level + 1 box.
+ivec2 blockOrigin() {
+    if (level != 0) return (levelBox[level + 1].xy & ivec2(~7)) + ivec2(gl_WorkGroupID.xy) * 8;
+    uint tile = tiles[gl_WorkGroupID.x];
+    uint across = uint((gridSize.x + 15) / 16);
+    return ivec2(int(tile % across), int(tile / across)) * 8;
+}
+
+// Staging for a block's fine neighbourhood (at most 22x22 cells) and its coarse one (12x12).
+const int downWidth = 18 + 2 * sweeps;  // the 18x18 residual footprint plus the pre-smoothing margin
+const int upWidth = 14 + 4 * sweeps;    // the 16x16 block plus pre- and post-smoothing margins
+const int staged = downWidth > upWidth ? downWidth * downWidth : upWidth * upWidth;
+shared vec2 fineShared[staged];
+shared float valueShared[2][staged];
+shared float coarseShared[144];
+shared bool coarseWallShared[144];
+
+// A coarse cell outside the solve that is not air. Prolongation substitutes the fine cell's own coarse value for such a
+// partner, the cell-centred analogue of a Neumann wall, instead of pulling the correction toward zero there.
+bool coarseWall(ivec2 c) {
+    vec4 value = levelCell(level + 1, coarseOffset, coarseSize, c);
+    return value.z <= 0.0 && value.w != air;
+}
+
+// One damped Jacobi sweep from valueShared[from] into the other buffer over the staged cells at least `margin` from
+// the edge of a width x width block.
+void stagedSweep(int width, int margin, int from) {
+    int inner = width - 2 * margin;
+    for (int i = int(gl_LocalInvocationIndex); i < inner * inner; i += 64) {
+        int k = (i / inner + margin) * width + i % inner + margin;
+        vec2 cell = fineShared[k];
+        float x = valueShared[from][k];
+        float neighbors = valueShared[from][k - 1] + valueShared[from][k + 1] + valueShared[from][k - width] +
+                          valueShared[from][k + width];
+        valueShared[1 - from][k] = cell.y > 0.0 ? x + omega * (cell.x - cell.y * x + neighbors) / cell.y : 0.0;
+    }
+    barrier();
+}
+
+// Stage fine b and diagonals over a width x width block and start the pre-smoothing from zero, x = omega D^-1 b.
+void stageFine(ivec2 fineOrigin, int width) {
+    for (int i = int(gl_LocalInvocationIndex); i < width * width; i += 64) {
+        vec2 cell = fineCell(fineOrigin + ivec2(i % width, i / width));
+        fineShared[i] = cell;
+        valueShared[0][i] = cell.y > 0.0 ? omega * cell.x / cell.y : 0.0;
+    }
+}
+
+// The remaining pre-smoothing sweeps, each valid one cell further in; returns the buffer holding the result.
+int presmooth(int width) {
+    barrier();
+    for (int k = 1; k < sweeps; ++k) stagedSweep(width, k, (k - 1) & 1);
+    return (sweeps - 1) & 1;
+}
+
+// b of the block's coarse cells: the pre-smoothed residual of fine cells 2J - 1 .. 2J + 2 under the transposed
+// bilinear weights.
+void restrictResidual() {
+    ivec2 origin = blockOrigin();
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    ivec2 cell = origin + local;
+    // Loaded alongside the staging: this cell's row and its wall partners.
+    bool solved = all(lessThan(cell, coarseSize)) && levelCell(level + 1, coarseOffset, coarseSize, cell).z > 0.0;
+    bool walls[9];
+    for (int i = 0; i < 9; ++i) walls[i] = coarseWall(cell + ivec2(i % 3 - 1, i / 3 - 1));
+    const int width = downWidth;
+    stageFine(origin * 2 - 1 - sweeps, width);
+    int from = presmooth(width);
+    for (int i = int(gl_LocalInvocationIndex); i < 324; i += 64) {
+        int k = (i / 18 + sweeps) * width + i % 18 + sweeps;
+        vec2 cell = fineShared[k];
+        float x = valueShared[from][k];
+        float neighbors = valueShared[from][k - 1] + valueShared[from][k + 1] + valueShared[from][k - width] +
+                          valueShared[from][k + width];
+        valueShared[1 - from][k] = cell.y > 0.0 ? cell.x - cell.y * x + neighbors : 0.0;  // b - A x
+    }
+    barrier();
+    if (!solved) return;
+    const float weights[4] = float[4](0.25, 0.75, 0.75, 0.25);
+    float sum = 0.0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+            sum += weights[x] * weights[y] * valueShared[1 - from][(2 * local.y + y + sweeps) * width + 2 * local.x + x + sweeps];
+    // A child's interpolation partners that are walls lend their weight to this cell (see prolongate).
+    for (int i = 0; i < 4; ++i) {
+        ivec2 side = ivec2(i & 1, i >> 1);
+        ivec2 toward = side * 2 - 1;
+        float lent = 0.1875 * (float(walls[4 + toward.x]) + float(walls[4 + 3 * toward.y])) +
+                     0.0625 * float(walls[4 + toward.x + 3 * toward.y]);
+        sum += lent * valueShared[1 - from][(2 * local.y + side.y + 1 + sweeps) * width + 2 * local.x + side.x + 1 + sweeps];
+    }
+    cells[coarseOffset + cell.y * coarseSize.x + cell.x].x = sum;
+}
+
+shared vec3 tileWork[64];
+
+// The block's 16x16 fine cells: the pre-smoothed value (recomputed from b) plus the bilinear prolongation of the coarse
+// solution, then the post-smoothing sweeps. Coarse solutions are staged over origin - 2 .. origin + 9.
+void prolongate() {
+    ivec2 origin = blockOrigin();
+    int lane = int(gl_LocalInvocationIndex);
+    ivec2 coarseOrigin = origin - 2;
+    for (int i = lane; i < 144; i += 64) {
+        vec4 value = levelCell(level + 1, coarseOffset, coarseSize, coarseOrigin + ivec2(i % 12, i / 12));
+        coarseShared[i] = value.z > 0.0 ? value.y : 0.0;
+        coarseWallShared[i] = value.z <= 0.0 && value.w != air;
+    }
+    const int margin = 2 * sweeps - 1;  // pre-smoothing, then post-smoothing margin around the block
+    ivec2 fineOrigin = origin * 2 - margin;
+    const int stage = upWidth;
+    stageFine(fineOrigin, stage);
+    int from = presmooth(stage);
+    int inner = stage - 2 * (sweeps - 1);
+    for (int i = lane; i < inner * inner; i += 64) {
+        ivec2 at = ivec2(i % inner, i / inner) + (sweeps - 1);
+        int k = at.y * stage + at.x;
+        if (fineShared[k].y <= 0.0) continue;
+        ivec2 c = fineOrigin + at;
+        ivec2 own = (c >> 1) - coarseOrigin;
+        ivec2 other = own + ivec2((c.x & 1) == 0 ? -1 : 1, (c.y & 1) == 0 ? -1 : 1);
+        float self = coarseShared[own.y * 12 + own.x];
+        int across = own.y * 12 + other.x, along = other.y * 12 + own.x, diagonal = other.y * 12 + other.x;
+        valueShared[from][k] += 0.5625 * self +
+                                0.1875 * ((coarseWallShared[across] ? self : coarseShared[across]) +
+                                          (coarseWallShared[along] ? self : coarseShared[along])) +
+                                0.0625 * (coarseWallShared[diagonal] ? self : coarseShared[diagonal]);
+    }
+    barrier();
+    for (int k = 0; k < sweeps; ++k) {
+        stagedSweep(stage, sweeps + k, from);
+        from = 1 - from;
+    }
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    vec3 total = vec3(0.0);  // r.z, max |r|, nonfinite flag over this thread's level-0 cells
+    for (int i = 0; i < 4; ++i) {
+        ivec2 offset = local * 2 + ivec2(i & 1, i >> 1);
+        ivec2 child = origin * 2 + offset;
+        if (any(greaterThanEqual(child, fineSize))) continue;
+        int k = (offset.y + margin) * stage + offset.x + margin;
+        float z = fineShared[k].y > 0.0 ? valueShared[from][k] : 0.0;
+        if (level != 0) {
+            if (fineShared[k].y > 0.0) cells[fineOffset + child.y * fineSize.x + child.x].y = z;
+            continue;
+        }
+        uint index = uint(child.y * gridSize.x + child.x);
+        vec4 value = vectors[index];
+        vectors[index].z = z;
+        if (initial != 0) vectors[index].y = z;
+        bool nonfinite = any(isnan(value)) || any(isinf(value)) || invalid(z) || value.w < 0.0;
+        if (nonfinite) total.z = 1.0;
+        else total += vec3(value.w > 0.0 ? value.x * z : 0.0, 0.0, 0.0);
+        total.y = max(total.y, nonfinite ? 0.0 : abs(value.x));
+    }
+    if (level != 0) return;
+    // Fixed-order tree over the tile, so the CG's global sums repeat bit for bit.
+    uint lane64 = gl_LocalInvocationIndex;
+    tileWork[lane64] = total;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane64 < stride) {
+            vec3 other = tileWork[lane64 + stride];
+            tileWork[lane64] = vec3(tileWork[lane64].x + other.x, max(tileWork[lane64].yz, other.yz));
+        }
+        barrier();
+    }
+    if (lane64 == 0u) tileSums[gl_WorkGroupID.x * 3u + uint(slot)] = vec4(tileWork[0], 0.0);
+}
+
+void main() {
+    if (phase == 0) {
+        setup();
+        return;
+    }
+    if (phase == 1) {
+        classify();
+        return;
+    }
+    if (phase == 5) {
+        coarsestDiagonal();
+        return;
+    }
+    if (phase == 3) {
+        coarsest();
+        return;
+    }
+    fineSize = levelSize(level);
+    coarseSize = levelSize(level + 1);
+    fineOffset = levelOffset(level);
+    coarseOffset = levelOffset(level + 1);
+    if (phase == 2) restrictResidual();
+    else prolongate();
+}

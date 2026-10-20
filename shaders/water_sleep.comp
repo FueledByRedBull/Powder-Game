@@ -1,0 +1,55 @@
+#version 430
+
+// Calm-water tally: advances each particle's still-tick timer and counts the particles of every cell (water_pack.comp
+// decides). Runs at the start of a tick, before compaction, over the slots that may hold records.
+layout(local_size_x = 256) in;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;  // x: 0 inactive, else 1 + ticks the particle has been slower than sleepSpeed
+    vec4 state2;
+};
+
+layout(std430, binding = 0) buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+// Per cell: bits 0-11 particles, 12-23 ready particles (water_pack.comp adds bit 31 pack).
+layout(std430, binding = 1) buffer WaterCellTally {
+    uint tally[];
+};
+
+uniform ivec2 gridSize;
+uniform int maxParticles;
+uniform float sleepSpeed;
+uniform int sleepTicks;
+uniform float particleMass;
+
+bool invalid(vec2 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+    WaterParticle particle = particles[index];
+    // NaN fails the comparison; water_particle_compact.comp uses the same test to drop exactly these particles.
+    if (!(particle.state1.x >= 0.5)) {
+        return;
+    }
+    vec2 position = particle.state0.xy;
+    if (invalid(position) || any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, vec2(gridSize)))) {
+        return;
+    }
+    float speed = length(particle.state0.zw);
+    float still = speed < sleepSpeed ? min(floor(particle.state1.x - 1.0) + 1.0, 255.0) : 0.0;
+    particles[index].state1.x = 1.0 + still;
+
+    // Only plain water of the brush's mass packs (a packed cell stores a particle count and wakes as water, so oil and
+    // its lit state, state2.z/w, must stay records; a cell holding any oil never has all its particles ready).
+    bool ready = still >= float(sleepTicks) && particle.state1.y == particleMass && particle.state2.z < 0.5;
+    ivec2 cell = ivec2(floor(position));
+    atomicAdd(tally[cell.y * gridSize.x + cell.x], ready ? 4097u : 1u);
+}

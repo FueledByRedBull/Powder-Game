@@ -22,13 +22,16 @@ void main() {
     ivec2 src_min = max(dst * scale - ivec2(1), ivec2(0));
     ivec2 src_max = min(dst * scale + ivec2(scale + 1), srcSize);
 
+    // 1: a painted wall in the footprint; 3: dense sand only, which the gas pressure solve treats as porous.
     uint blocked = 0u;
-    for (int y = src_min.y; y < src_max.y && blocked == 0u; ++y) {
+    for (int y = src_min.y; y < src_max.y && blocked != 1u; ++y) {
         for (int x = src_min.x; x < src_max.x; ++x) {
-            if (imageLoad(srcBoundaryTex, ivec2(x, y)).r != 0u) {
+            uint source = imageLoad(srcBoundaryTex, ivec2(x, y)).r;
+            if (source == 1u) {
                 blocked = 1u;
                 break;
             }
+            if (source == 3u) blocked = 3u;
         }
     }
 

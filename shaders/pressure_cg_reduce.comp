@@ -12,7 +12,7 @@ layout(std430, binding = 2) buffer Scalars {
     uint running;
     uint invalidInput;
     uint iterations;
-    uint padding;
+    uint finishedGroups;
     uvec4 liquidBounds;
 };
 layout(std430, binding = 3) buffer DebugCounters {
@@ -21,6 +21,12 @@ layout(std430, binding = 3) buffer DebugCounters {
     uint pressureNonconverged;
     uint inactiveTileMisses;
 };
+// The tile list of pressure_cg.comp, reset here for the solve's phase 8.
+layout(std430, binding = 4) buffer Tiles {
+    uvec4 tileDispatch;
+    uvec4 tileInfo;
+    uint tiles[];
+};
 
 uniform int cellCount;
 uniform int partialCount;
@@ -28,15 +34,18 @@ uniform ivec2 gridSize;
 uniform ivec2 solveOrigin;
 uniform ivec2 solveSize;
 uniform float residualThreshold;
-// Initial partial/final (0/1), then final d*A*d (3), updated rho (5), block-initial rho (7).
+// The start of a solve, after pressure_cg.comp phase 0: per-workgroup partials (0), then their final reduction (1),
+// which forms rho and decides whether the solve runs. Later reductions finish inside pressure_cg.comp.
 uniform int phase;
+// 1: a restart of a converged solve from its true residual b - Ap (RunWaterProjection), which keeps the iteration
+// count and the tile list of the solve it continues.
+uniform int restart;
 shared vec4 totals[256];
 shared uvec4 bounds[256];
 
 bool invalid(float value) { return isnan(value) || isinf(value); }
 
 void main() {
-    if (phase >= 2 && running == 0u) return;
     uint lane = gl_LocalInvocationID.x;
     bool finalReduction = phase != 0;
     vec4 total = vec4(0.0);
@@ -46,10 +55,8 @@ void main() {
             vec4 item = partials[i].values;
             total.x += item.x;
             total.yz = max(total.yz, item.yz);
-            if (phase == 1) {
-                extent.xy = min(extent.xy, partials[i].bounds.xy);
-                extent.zw = max(extent.zw, partials[i].bounds.zw);
-            }
+            extent.xy = min(extent.xy, partials[i].bounds.xy);
+            extent.zw = max(extent.zw, partials[i].bounds.zw);
         }
     } else {
         uint invocation = gl_GlobalInvocationID.x;
@@ -62,21 +69,19 @@ void main() {
             } else {
                 total.x = value.w > 0.0 ? value.x * value.z : 0.0;
                 total.y = abs(value.x);
-                if (phase == 0 && (value.w > 0.0 || value.x != 0.0)) extent = uvec4(cell, cell);
+                if (value.w > 0.0 || value.x != 0.0) extent = uvec4(cell, cell);
             }
         }
     }
     totals[lane] = total;
-    if (phase <= 1) bounds[lane] = extent;
+    bounds[lane] = extent;
     barrier();
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             totals[lane].x += totals[lane + stride].x;
             totals[lane].yz = max(totals[lane].yz, totals[lane + stride].yz);
-            if (phase <= 1) {
-                bounds[lane].xy = min(bounds[lane].xy, bounds[lane + stride].xy);
-                bounds[lane].zw = max(bounds[lane].zw, bounds[lane + stride].zw);
-            }
+            bounds[lane].xy = min(bounds[lane].xy, bounds[lane + stride].xy);
+            bounds[lane].zw = max(bounds[lane].zw, bounds[lane + stride].zw);
         }
         barrier();
     }
@@ -84,40 +89,28 @@ void main() {
     total = totals[0];
     if (!finalReduction) {
         partials[gl_WorkGroupID.x].values = total;
-        if (phase == 0) partials[gl_WorkGroupID.x].bounds = bounds[0];
+        partials[gl_WorkGroupID.x].bounds = bounds[0];
         return;
     }
-    if (phase == 1) {
-        rho = total.x;
-        alpha = beta = 0.0;
-        running = 1u;
-        invalidInput = iterations = padding = 0u;
-        liquidBounds = bounds[0];
+    rho = total.x;
+    alpha = beta = 0.0;
+    invalidInput = finishedGroups = 0u;
+    liquidBounds = bounds[0];
+    if (restart == 0) {
+        iterations = 0u;
+        tileDispatch = uvec4(0u, 1u, 1u, 0u);
+        tileInfo = uvec4(0u);
     }
-    if (phase == 7) rho = total.x;
+    residualMax = total.y;
     bool nonfinite = total.z != 0.0 || invalid(total.x) || invalid(total.y);
-    if (phase == 5) ++iterations;
-    if (phase != 3) {
-        residualMax = total.y;
-        // Leave margin for the independent true-residual check after the solve.
-        if (!nonfinite && residualMax <= residualThreshold * 0.5) {
-            running = 0u;
-            return;
-        }
-    }
-    bool breakdown = nonfinite || total.x <= 0.0 || rho <= 0.0;
-    if (!breakdown && phase == 3) {
-        alpha = rho / total.x;
-        breakdown = invalid(alpha);
-    } else if (!breakdown && phase == 5) {
-        beta = total.x / rho;
-        rho = total.x;
-        breakdown = invalid(beta);
-    }
-    if (breakdown) {
+    // A start leaves margin for the independent true-residual check after the solve; a restart is that same check of
+    // b - Ap, so a pressure that already passes it is kept unchanged.
+    running = !nonfinite && residualMax <= residualThreshold * (restart != 0 ? 1.0 : 0.5) ? 0u : 1u;
+    if (running != 0u && (nonfinite || total.x <= 0.0 || rho <= 0.0)) {
         running = 0u;
         invalidInput = 1u;
         atomicAdd(pressureNonconverged, 1u);
-        if (nonfinite || invalid(alpha) || invalid(beta)) atomicAdd(nanInfDetected, 1u);
+        if (nonfinite) atomicAdd(nanInfDetected, 1u);
     }
+    if (restart != 0) tileDispatch = uvec4(running != 0u ? tileInfo.x : 0u, 1u, 1u, 0u);
 }

@@ -25,6 +25,11 @@ layout(std430, binding = 3) buffer SandGridMomentumY {
     ivec2 gridMomentumY[];
 };
 
+// Moisture-weighted mass per node, deposited only by the occupancy transfer (depositMoisture 1) for sand_rasterize.comp.
+layout(std430, binding = 4) buffer SandGridMoisture {
+    uint gridMoisture[];
+};
+
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
     uint particleOverflowBlocked;
@@ -39,6 +44,11 @@ uniform float velocityScale;
 uniform float dt;
 uniform float shearModulus;
 uniform float lameLambda;
+// Kelvin-Voigt viscosity on the APIC velocity gradient: Kirchhoff stress J eta (C + C^T).
+uniform float viscosity;
+// A grain's rest area is its mass over the reference density (state2.z holds its volume correction).
+uniform float referenceDensity;
+uniform int depositMoisture;
 
 bool validCell(ivec2 coord) {
     // Retain the full material stencil. Grid contact supplies the obstacle reaction.
@@ -86,7 +96,7 @@ int signedCarry(int previous, int delta) {
     return 0;
 }
 
-void depositCell(ivec2 cell, float weight, vec2 momentum, float mass) {
+void depositCell(ivec2 cell, float weight, vec2 momentum, float mass, float moisture) {
     if (weight <= 0.0 || !validCell(cell)) {
         return;
     }
@@ -95,6 +105,8 @@ void depositCell(ivec2 cell, float weight, vec2 momentum, float mass) {
     float weightedMass = weight * mass;
     uint count = uint(round(weightedMass * massScale));
     if (atomicAdd(gridMass[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    // Bounded by the node's mass sum (moisture < 1), so it cannot overflow before gridMass does.
+    if (depositMoisture == 1) atomicAdd(gridMoisture[index], uint(round(weightedMass * moisture * massScale)));
     ivec2 delta = ivec2(round(momentum * velocityScale));
     int carryX = signedCarry(atomicAdd(gridMomentumX[index].x, delta.x), delta.x);
     int carryY = signedCarry(atomicAdd(gridMomentumY[index].x, delta.y), delta.y);
@@ -121,7 +133,8 @@ void main() {
     vec2 velocity = particle.state0.zw;
     float mass = particle.state1.y;
     mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
-    float restArea = particle.state2.z;
+    float restArea = mass / referenceDensity;
+    float moisture = particle.state2.w - floor(particle.state2.w);  // sand_particle_step.comp's trait/moisture packing
     if (invalid(position) || invalid(velocity) || invalid(affine[0]) || invalid(affine[1]) ||
         isnan(mass) || isinf(mass) || mass <= 0.0 ||
         any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, vec2(gridSize)))) {
@@ -135,12 +148,19 @@ void main() {
         mat2 deformation = mat2(particle.state3.xy, particle.state3.zw);
         if (invalid(deformation[0]) || invalid(deformation[1]) || !(restArea > 0.0) || isinf(restArea) ||
             !principalStretch(deformation, left, stretch)) {
+            // The particle step repairs this state; deposit mass and momentum without stress meanwhile.
             atomicAdd(nanInfDetected, 1u);
-            return;
+            restArea = 0.0;
+        } else {
+            vec2 strain = log(stretch);
+            vec2 principalStress = 2.0 * shearModulus * strain + lameLambda * (strain.x + strain.y);
+            stress = left * mat2(principalStress.x, 0.0, 0.0, principalStress.y) * transpose(left);
+            // Confined grains only (the contact-damping ramp in sand_particle_step): a lone grain spreads its mass thinner than
+            // the reference density the diffusion substep limit assumes.
+            float volume = determinant(deformation);
+            float confined = volume < 0.95 ? min((0.95 - volume) / 0.1, 1.0) : 0.0;
+            stress += volume * confined * viscosity * (affine + transpose(affine));
         }
-        vec2 strain = log(stretch);
-        vec2 principalStress = 2.0 * shearModulus * strain + lameLambda * (strain.x + strain.y);
-        stress = left * mat2(principalStress.x, 0.0, 0.0, principalStress.y) * transpose(left);
     }
     vec2 maxMomentum = ((abs(velocity) + 1.5 * (abs(affine[0]) + abs(affine[1]))) * mass +
                         dt * restArea * (abs(stress[0]) + abs(stress[1]))) * velocityScale;
@@ -168,7 +188,7 @@ void main() {
             float weight = wx[i] * wy[j];
             vec2 gradient = vec2(dx[i] * wy[j], wx[i] * dy[j]);
             vec2 momentum = weight * mass * apicVelocity - dt * restArea * stress * gradient;
-            depositCell(cell, weight, momentum, mass);
+            depositCell(cell, weight, momentum, mass, moisture);
         }
     }
 }

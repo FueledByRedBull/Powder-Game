@@ -17,8 +17,12 @@ void main() {
 
     uint material = imageLoad(materialTex, coord).r;
     float sand_occupancy = imageLoad(sandOccupancyTex, coord).x;
-    uint static_blocked = material == 2u ? 1u : 0u;
-    uint blocked = material == 2u || sand_occupancy > 0.05 ? 1u : 0u;
+    // Painted rock (2) and wood (3, 256 and up while burning or charred; wood_burn.comp) are solids.
+    bool solid = material >= 2u;
+    uint static_blocked = solid ? 1u : 0u;
+    // 1 is a painted solid. Sand walls off water above a quarter of rest density (a lone grain peaks at 0.28 and stays
+    // open to the water around it; a poured pile is 0.3-1) and gas above three quarters, marked 2 and 3.
+    uint blocked = solid ? 1u : (sand_occupancy > 0.75 ? 3u : (sand_occupancy > 0.25 ? 2u : 0u));
     imageStore(staticBoundaryTex, coord, uvec4(static_blocked, 0u, 0u, 0u));
     imageStore(boundaryTex, coord, uvec4(blocked, 0u, 0u, 0u));
 }

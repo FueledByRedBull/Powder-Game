@@ -6,8 +6,12 @@ layout(r16f, binding = 0) uniform readonly image2D gasUTex;
 layout(r16f, binding = 1) uniform readonly image2D gasVTex;
 layout(r16f, binding = 2) uniform writeonly image2D divergenceTex;
 layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+// x: fuel burned per second (fire_rd.comp).
+layout(rg16f, binding = 4) uniform readonly image2D reactionTex;
 
 uniform ivec2 gasSize;
+// Gas volume released per unit of fuel burned (Nguyen et al. 2002): burning cells are asked to expand.
+uniform float expansion;
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -23,5 +27,6 @@ void main() {
     float uR = imageLoad(gasUTex, ivec2(coord.x + 1, coord.y)).x;
     float vB = imageLoad(gasVTex, ivec2(coord.x, coord.y)).x;
     float vT = imageLoad(gasVTex, ivec2(coord.x, coord.y + 1)).x;
-    imageStore(divergenceTex, coord, vec4((uR - uL) + (vT - vB), 0.0, 0.0, 0.0));
+    float source = expansion * max(imageLoad(reactionTex, coord).x, 0.0);
+    imageStore(divergenceTex, coord, vec4((uR - uL) + (vT - vB) - source, 0.0, 0.0, 0.0));
 }

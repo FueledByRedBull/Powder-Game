@@ -7,6 +7,10 @@ layout(r16f, binding = 3) uniform image2D waterAmountTex;
 layout(rg16f, binding = 4) uniform image2D waterVelocityTex;
 layout(r16f, binding = 5) uniform image2D gasTemperatureTex;
 layout(rg16f, binding = 6) uniform image2D gasReactionTex;
+// Sleeping sand grains per cell: erased and walled over like the moving grains.
+layout(r8ui, binding = 7) uniform uimage2D sandPackedTex;
+// Packed calm water per cell (water_pack.comp): cleared with the water.
+layout(r8ui, binding = 1) uniform uimage2D waterPackedTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 dispatchOrigin;
@@ -34,6 +38,7 @@ bool hasWater(ivec2 coord) {
 void resetWater(ivec2 coord) {
     imageStore(waterAmountTex, coord, vec4(0.0));
     imageStore(waterVelocityTex, coord, vec4(0.0));
+    imageStore(waterPackedTex, coord, uvec4(0u));
 }
 
 void main() {
@@ -46,11 +51,12 @@ void main() {
     }
 
     uint current_material = imageLoad(materialTex, coord).r;
-    bool solid = current_material == 2u;
+    bool solid = current_material >= 2u;  // rock or wood
     bool water = hasWater(coord);
 
     if (clearMode == 1) {
         imageStore(materialTex, coord, uvec4(0u));
+        imageStore(sandPackedTex, coord, uvec4(0u));
         resetWater(coord);
         imageStore(gasTemperatureTex, ivec2(coord / 2), vec4(0.0));
         imageStore(gasReactionTex, ivec2(coord / 2), vec4(0.0));
@@ -70,6 +76,9 @@ void main() {
 
     if (clearWater == 1 || (replaceMaterial == 1 && materialValue != 0u)) {
         resetWater(coord);
+    }
+    if (replaceMaterial == 1 && materialValue != 0u) {
+        imageStore(sandPackedTex, coord, uvec4(0u));
     }
 
     if (clearGas == 1) {

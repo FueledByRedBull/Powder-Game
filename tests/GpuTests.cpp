@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -87,6 +88,20 @@ void BindImage(GLuint binding, GLuint texture, GLenum access, GLenum format) {
     glBindImageTexture(binding, texture, 0, GL_FALSE, 0, access, format);
 }
 
+// water_particle_step samples the sand fields; an empty world leaves the water untouched.
+void BindNoSand(Resources& resources, int width, int height) {
+    const std::vector<float> velocity(static_cast<std::size_t>((width + 2) * (height + 2) * 2));
+    const std::vector<float> occupancy(static_cast<std::size_t>(width * height));
+    BindImage(5, resources.Texture(width + 2, height + 2, GL_RG32F, GL_RG, GL_FLOAT, velocity.data()), GL_READ_ONLY, GL_RG32F);
+    BindImage(6, resources.Texture(width, height, GL_R16F, GL_RED, GL_FLOAT, occupancy.data()), GL_READ_ONLY, GL_R16F);
+    // Liquid everywhere and one advection move per step: the grid-RK2 transport these fixtures check analytically.
+    const std::vector<float> liquid(static_cast<std::size_t>(width * height), 1.0F);
+    BindImage(7, resources.Texture(width, height, GL_R16F, GL_RED, GL_FLOAT, liquid.data()), GL_READ_ONLY, GL_R16F);
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glUniform1f(glGetUniformLocation(static_cast<GLuint>(program), "advectionCfl"), 1.0e6F);
+}
+
 void Dispatch(int width, int height) {
     glDispatchCompute(static_cast<GLuint>((width + 15) / 16), static_cast<GLuint>((height + 15) / 16), 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
@@ -150,6 +165,7 @@ void HalfStorage() {
                 BindImage(0, result, GL_WRITE_ONLY, GL_R16F);
                 BindImage(1, second_result, GL_WRITE_ONLY, GL_R16F);
                 BindImage(2, boundary, GL_READ_ONLY, GL_R8UI);
+                BindImage(3, resources.Texture(size + 2, size + 2, GL_RG32F, GL_RG, GL_FLOAT, std::vector<float>(2 * (size + 2) * (size + 2)).data()), GL_READ_ONLY, GL_RG32F);
                 width = size + 1;
                 index = width + 1;
                 invalid_count = 2 * size * (size - 1);
@@ -167,6 +183,10 @@ void HalfStorage() {
                 result = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT);
                 glUniform1f(glGetUniformLocation(program, "liquidPhiThreshold"), 0.42F);
                 glUniform1f(glGetUniformLocation(program, "gravityDelta"), 0.0F);
+                glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+                glUniform1f(glGetUniformLocation(program, "restDensity"), 4.0F);
+                glUniform1f(glGetUniformLocation(program, "densityRate"), 0.0F);
+                resources.Buffer(0, sizeof(zero), zero.data());  // cell counts: the density term sees an empty world
                 BindImage(0, u_source, GL_READ_ONLY, GL_R16F);
                 BindImage(1, v_source, GL_READ_ONLY, GL_R16F);
                 BindImage(2, result, GL_WRITE_ONLY, GL_R16F);
@@ -210,7 +230,9 @@ void HalfStorage() {
                 const GLuint sdf = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT, distance.data());
                 const GLuint water = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT, zero.data());
                 const GLuint water_velocity = resources.Texture(size, size, GL_RG16F, GL_RG, GL_FLOAT, zero_vector.data());
-                result = resources.Texture(size + 2, size + 2, GL_RG16F, GL_RG, GL_FLOAT);
+                result = resources.Texture(size + 2, size + 2, GL_RG32F, GL_RG, GL_FLOAT);
+                glUniform1f(glGetUniformLocation(program, "buoyancy"), 0.0F);
+                glUniform1f(glGetUniformLocation(program, "waterFullVolume"), 1.0F);
                 glUniform1f(glGetUniformLocation(program, "dt"), std::isfinite(value) ? 0.0F : 1.0F);
                 glUniform1f(glGetUniformLocation(program, "gravity"), std::isfinite(value) ? 0.0F : -value);
                 glUniform1f(glGetUniformLocation(program, "damping"), 1.0F);
@@ -221,7 +243,7 @@ void HalfStorage() {
                 BindImage(0, sdf, GL_READ_ONLY, GL_R16F);
                 BindImage(1, water, GL_READ_ONLY, GL_R16F);
                 BindImage(2, water_velocity, GL_READ_ONLY, GL_RG16F);
-                BindImage(3, result, GL_WRITE_ONLY, GL_RG16F);
+                BindImage(3, result, GL_WRITE_ONLY, GL_RG32F);
                 width = height = size + 2;
                 index = 2 * width + 2;
                 vector_result = true;
@@ -457,7 +479,7 @@ void WaterAffineTransfer() {
         const GLuint previous_v = resources.Texture(width, height + 1, GL_R16F, GL_RED, GL_FLOAT, v.data());
         std::array<float, 12> particle{px, py, 7.0F, 8.0F, 1.0F, 1.0F};
         const GLuint particles = resources.Buffer(0, sizeof(particle), particle.data());
-        const std::array<GLuint, 4> zero_counters{};
+        const std::array<GLuint, 5> zero_counters{};
         const GLuint counters = resources.Buffer(1, sizeof(zero_counters), zero_counters.data());
         const GLuint program = resources.Program("water_particle_step.comp");
         glUseProgram(program);
@@ -472,11 +494,12 @@ void WaterAffineTransfer() {
         BindImage(2, previous_v, GL_READ_ONLY, GL_R16F);
         BindImage(3, current_u, GL_READ_ONLY, GL_R16F);
         BindImage(4, current_v, GL_READ_ONLY, GL_R16F);
+        BindNoSand(resources, width, height);
         glDispatchCompute(1, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, particles);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(particle), particle.data());
-        std::array<GLuint, 4> debug{};
+        std::array<GLuint, 5> debug{};
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, counters);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(debug), debug.data());
         CheckGl("water affine transfer readback");
@@ -515,6 +538,185 @@ void WaterAffineTransfer() {
     }
 }
 
+
+// A particle's bilinear cell weight that lands in a wall or past the domain edge goes to its own cell: a film against
+// a wall keeps its whole density (it used to lose the wall's share and read as air).
+void WaterWallDensity() {
+    constexpr int size = 8;
+    std::array<unsigned char, size * size> walls{};
+    for (int y = 0; y < size; ++y) walls[static_cast<std::size_t>(y * size + 3)] = 1;
+    // Beside the wall column, at the left edge, in the corner, and in open water.
+    const std::vector<std::array<float, 12>> particles{{2.9F, 4.5F, 0, 0, 1, 1}, {0.25F, 4.5F, 0, 0, 1, 1},
+                                                        {0.3F, 0.3F, 0, 0, 1, 1}, {6.5F, 6.5F, 0, 0, 1, 1}};
+    Resources resources;
+    const std::array<GLuint, size * (size + 1)> zero_faces{};
+    const std::array<GLint, size * (size + 1) * 2> zero_momentum{};
+    const std::array<GLuint, size * size> zero_cells{};
+    const std::array<GLuint, 5> no_errors{};
+    const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, walls.data());
+    resources.Buffer(0, static_cast<GLsizeiptr>(particles.size() * sizeof(particles[0])), particles.data());
+    resources.Buffer(1, sizeof(zero_faces), zero_faces.data());
+    resources.Buffer(2, sizeof(zero_faces), zero_faces.data());
+    resources.Buffer(3, sizeof(zero_momentum), zero_momentum.data());
+    resources.Buffer(4, sizeof(zero_momentum), zero_momentum.data());
+    const GLuint counts = resources.Buffer(5, sizeof(zero_cells), zero_cells.data());
+    resources.Buffer(7, sizeof(no_errors), no_errors.data());
+    const GLuint program = resources.Program("water_particle_p2g.comp");
+    glUseProgram(program);
+    glUniform2i(glGetUniformLocation(program, "gridSize"), size, size);
+    glUniform1i(glGetUniformLocation(program, "maxParticles"), static_cast<GLint>(particles.size()));
+    glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+    glUniform1f(glGetUniformLocation(program, "velocityScale"), 4096.0F);
+    BindImage(0, boundary, GL_READ_ONLY, GL_R8UI);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    std::array<GLuint, size * size> actual{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, counts);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(actual), actual.data());
+    std::ostringstream failures;
+    GLuint total = 0;
+    for (GLuint value : actual) total += value;
+    for (const auto& cell : std::array<std::array<int, 2>, 4>{{{2, 4}, {0, 4}, {0, 0}, {6, 6}}}) {
+        const GLuint value = actual[static_cast<std::size_t>(cell[1] * size + cell[0])];
+        std::cout << "  wall density cell (" << cell[0] << ',' << cell[1] << ") count=" << value << " of 4096\n";
+        if (value + 3U < 4096U || value > 4096U + 3U) failures << " [cell (" << cell[0] << ',' << cell[1] << ") holds " << value << " of 4096]";
+    }
+    for (int y = 0; y < size; ++y)
+        if (actual[static_cast<std::size_t>(y * size + 3)] != 0U) failures << " [wall cell (3," << y << ") received mass]";
+    if (total + 8U < 4U * 4096U || total > 4U * 4096U + 8U) failures << " [total mass " << total << " is not 4 particles]";
+    Require(failures.str().empty(), "wall-side density mismatch:" + failures.str());
+}
+
+// A face reached only by edge-of-support weights must average particle velocities: weights that round to zero
+// used to keep their full momentum, so 64 fast particles beside one barely-touching particle read as 26,000 cells/s
+// (the realism-pass sand replay's half-float overflow).
+void WaterSparseFace() {
+    constexpr int size = 8;
+    constexpr float speed = 2400.0F;
+    std::vector<std::array<float, 12>> particles(64, {4.49F, 4.5F, speed, 0, 1, 1});
+    particles.push_back({4.475F, 4.5F, speed, 0, 1, 1});
+    Resources resources;
+    const std::array<unsigned char, size * size> open{};
+    const std::array<GLuint, size * (size + 1)> zero_faces{};
+    const std::array<GLint, size * (size + 1) * 2> zero_momentum{};
+    const std::array<GLuint, size * size> zero_cells{};
+    const std::array<GLuint, 5> no_errors{};
+    const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, open.data());
+    resources.Buffer(0, static_cast<GLsizeiptr>(particles.size() * sizeof(particles[0])), particles.data());
+    const GLuint weights = resources.Buffer(1, sizeof(zero_faces), zero_faces.data());
+    resources.Buffer(2, sizeof(zero_faces), zero_faces.data());
+    const GLuint sums = resources.Buffer(3, sizeof(zero_momentum), zero_momentum.data());
+    resources.Buffer(4, sizeof(zero_momentum), zero_momentum.data());
+    resources.Buffer(5, sizeof(zero_cells), zero_cells.data());
+    resources.Buffer(7, sizeof(no_errors), no_errors.data());
+    const GLuint program = resources.Program("water_particle_p2g.comp");
+    glUseProgram(program);
+    glUniform2i(glGetUniformLocation(program, "gridSize"), size, size);
+    glUniform1i(glGetUniformLocation(program, "maxParticles"), static_cast<GLint>(particles.size()));
+    glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+    glUniform1f(glGetUniformLocation(program, "velocityScale"), 4096.0F);
+    BindImage(0, boundary, GL_READ_ONLY, GL_R8UI);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    std::array<GLuint, size * (size + 1)> face_weights{};
+    std::array<GLint, size * (size + 1) * 2> face_sums{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, weights);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(face_weights), face_weights.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sums);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(face_sums), face_sums.data());
+    std::ostringstream failures;
+    double fastest = 0.0;
+    for (std::size_t face = 0; face < face_weights.size(); ++face) {
+        if (face_weights[face] == 0U) continue;
+        const double momentum = static_cast<double>(face_sums[2 * face]) + 4294967296.0 * face_sums[2 * face + 1];
+        const double velocity = momentum / face_weights[face];
+        fastest = std::max(fastest, std::abs(velocity));
+        if (std::abs(velocity) > speed + 1.0) failures << " [u face " << face << " averages " << velocity << " cells/s]";
+    }
+    std::cout << "  sparse face fastest u=" << fastest << " of particle speed " << speed << '\n';
+    Require(failures.str().empty(), "sparse water face exceeds its particles' velocity:" + failures.str());
+}
+
+// The density term of the water divergence: an over-full cell is asked to expand, a void inside the bulk to contract,
+// both capped; the free surface and a uniformly sparse cloud are never pulled in.
+void WaterDensityTerm() {
+    constexpr int size = 8;
+    constexpr float rate = 6.0F, rest = 4.0F;
+    struct Fixture {
+        std::array<GLuint, size * size> counts{};
+        std::array<float, size * size> phi;
+        Fixture() { phi.fill(1.0F); }
+        void Fill(int x0, int y0, int x1, int y1, float particles) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x) {
+                    counts[static_cast<std::size_t>(y * size + x)] = static_cast<GLuint>(particles * 4096.0F);
+                    phi[static_cast<std::size_t>(y * size + x)] = particles >= 1.0F ? 0.0F : 1.0F;
+                }
+        }
+    };
+    const auto divergence = [&](const Fixture& fixture) {
+        Resources resources;
+        const std::array<unsigned char, size * size> open{};
+        const std::array<float, (size + 1) * size> zero_faces{};
+        const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, open.data());
+        const GLuint phi = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT, fixture.phi.data());
+        const GLuint u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT, zero_faces.data());
+        const GLuint v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT, zero_faces.data());
+        const GLuint result = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT);
+        resources.Buffer(0, sizeof(fixture.counts), fixture.counts.data());
+        const std::array<GLuint, 5> no_errors{};
+        resources.Buffer(7, sizeof(no_errors), no_errors.data());
+        const GLuint program = resources.Program("water_divergence.comp");
+        glUseProgram(program);
+        glUniform2i(glGetUniformLocation(program, "gridSize"), size, size);
+        glUniform1f(glGetUniformLocation(program, "liquidPhiThreshold"), 0.42F);
+        glUniform1f(glGetUniformLocation(program, "gravityDelta"), 0.0F);
+        glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+        glUniform1f(glGetUniformLocation(program, "restDensity"), rest);
+        glUniform1f(glGetUniformLocation(program, "densityRate"), rate);
+        BindImage(0, u, GL_READ_ONLY, GL_R16F);
+        BindImage(1, v, GL_READ_ONLY, GL_R16F);
+        BindImage(2, result, GL_WRITE_ONLY, GL_R16F);
+        BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
+        BindImage(4, phi, GL_READ_ONLY, GL_R16F);
+        Dispatch(size, size);
+        return ReadScalar(result, size, size);
+    };
+    std::ostringstream failures;
+    const auto expect = [&](const std::vector<float>& actual, int x, int y, float expected, const char* label) {
+        const float value = actual[static_cast<std::size_t>(y * size + x)];
+        std::cout << "  density term " << label << ": divergence=" << value << " expected " << expected << '\n';
+        if (!std::isfinite(value) || std::abs(value - expected) > 0.002F) failures << " [" << label << ": " << value << " not " << expected << ']';
+    };
+    // The rhs is -(div - target), so a positive target divergence rate * error shows as a negative divergence.
+    Fixture full;
+    full.Fill(1, 1, 7, 7, 5.0F);  // 25% over rest
+    auto result = divergence(full);
+    expect(result, 3, 3, -rate * 0.25F, "over-full bulk cell");
+    Fixture crowded;
+    crowded.Fill(1, 1, 7, 7, 12.0F);  // 200% over rest: the correction saturates at 50%
+    result = divergence(crowded);
+    expect(result, 3, 3, -rate * 0.5F, "capped over-full cell");
+    Fixture void_cell;
+    void_cell.Fill(1, 1, 7, 7, 4.0F);
+    void_cell.Fill(3, 3, 4, 4, 2.0F);  // a hole in full water: half rest, neighbours full
+    void_cell.phi[3 * size + 3] = 0.0F;
+    result = divergence(void_cell);
+    expect(result, 3, 3, rate * 0.5F, "void inside the bulk contracts");
+    expect(result, 3, 4, 0.0F, "full neighbour of the void is at rest");
+    Fixture surface;
+    surface.Fill(1, 1, 7, 4, 4.0F);
+    surface.Fill(1, 4, 7, 5, 2.0F);  // a half-full top layer above full water
+    for (int x = 1; x < 7; ++x) surface.phi[4 * size + x] = 0.0F;
+    result = divergence(surface);
+    expect(result, 3, 4, 0.0F, "half-full free-surface layer is not pulled in");
+    Fixture mist;
+    mist.Fill(1, 1, 7, 7, 1.0F);  // a uniformly sparse block, a quarter of rest: liquid, but nothing to correct
+    for (std::size_t i = 0; i < mist.phi.size(); ++i) mist.phi[i] = mist.counts[i] != 0U ? 0.0F : 1.0F;
+    result = divergence(mist);
+    expect(result, 3, 3, 0.0F, "uniformly sparse cloud is left alone");
+    Require(failures.str().empty(), "density term mismatch:" + failures.str());
+}
 
 void BoundaryMask() {
     Resources resources;
@@ -580,7 +782,7 @@ void WaterIntegration() {
     const GLuint u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
     const GLuint v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
     const GLuint particles = resources.Buffer(0, sizeof(float) * 12, nullptr);
-    const std::array<GLuint, 4> zeros{};
+    const std::array<GLuint, 5> zeros{};
     const GLuint debug = resources.Buffer(1, sizeof(zeros), zeros.data());
     const GLuint program = resources.Program("water_particle_step.comp");
     glUseProgram(program);
@@ -592,6 +794,7 @@ void WaterIntegration() {
     BindImage(2, v, GL_READ_ONLY, GL_R16F);
     BindImage(3, u, GL_READ_ONLY, GL_R16F);
     BindImage(4, v, GL_READ_ONLY, GL_R16F);
+    BindNoSand(resources, size, size);
     struct Timer {
         GLuint query = 0;
         Timer() { glGenQueries(1, &query); }
@@ -608,6 +811,7 @@ void WaterIntegration() {
         const double scale = std::min(1.0, 72.0 / std::max(1e-30, std::hypot(x, y)));
         return std::array<double, 2>{x * scale, y * scale};
     };
+    GLuint clamped = 0;
     const auto run = [&](float ux, float vy, bool turn, float initial_x, float initial_y,
                          float damping, float dt, int steps, float flip) {
         std::vector<float> values_u((size + 1) * size, ux), values_v(size * (size + 1));
@@ -637,9 +841,12 @@ void WaterIntegration() {
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, particles);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(particle), particle.data());
-        std::array<GLuint, 4> counters{};
+        std::array<GLuint, 5> counters{};
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counters), counters.data());
+        // The cap is a visible clip: each step that cuts a velocity counts it (the callers check the count).
+        clamped = counters[4];
+        counters[4] = 0U;
         Require(counters == zeros && particle[4] == 1.0F && particle[5] == 1.0F,
                 "water integration must preserve live mass without invalid counters");
         std::cout << "water integration dt=" << dt << " steps=" << steps << " GPU us=" << elapsed / 1000.0 << '\n';
@@ -654,12 +861,14 @@ void WaterIntegration() {
         near(actual[1], py + dt * expected[1], "capped y displacement");
         near(actual[2], expected[0], "capped stored x velocity");
         near(actual[3], expected[1], "capped stored y velocity");
+        near(static_cast<float>(clamped), std::hypot(flow[0], flow[1]) > 72.0F ? 1.0 : 0.0, "clamp counter");
     }
     for (float sign : {-1.0F, 1.0F}) {
         const auto actual = run(sign * 144.0F, 0.0F, true, sign * 144.0F, 0.0F, 1.0F, dt, 1, 0.0F);
         const auto expected = cap(sign * 144.0, sign * 36.0);
         near(actual[0], px + dt * expected[0], "capped midpoint x displacement");
         near(actual[1], py + dt * expected[1], "capped midpoint y displacement");
+        near(static_cast<float>(clamped), 1.0, "clamp counter");
     }
     for (int rate : {60, 120, 240}) {
         const auto actual = run(0, 0, false, 12.0F, -5.0F, 0.992F, 1.0F / rate, rate / 2, 1.0F);
@@ -668,6 +877,7 @@ void WaterIntegration() {
         near(actual[3], -5.0 * factor, "equal-duration y damping at " + std::to_string(rate));
         near(actual[0], px, "zero-grid transport x");
         near(actual[1], py, "zero-grid transport y");
+        near(static_cast<float>(clamped), 0.0, "no clamp below the cap");
     }
     // A tangential edge impulse samples exactly at its last face row/column, as at the mirrored first edge.
     for (int axis = 0; axis < 2; ++axis) for (bool upper : {false, true}) {
@@ -698,7 +908,7 @@ void WaterIntegration() {
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, particles);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(particle), particle.data());
-        std::array<GLuint, 4> counters{};
+        std::array<GLuint, 5> counters{};
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug);
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counters), counters.data());
         Require(counters == zeros && particle[4] == 1.0F && particle[5] == 1.0F,
@@ -712,6 +922,139 @@ void WaterIntegration() {
     CheckGl("water integration");
     std::cout << "water integration checks=" << checks << '\n';
     Require(failures.str().empty(), "water transport/timestep mismatch:" + failures.str());
+}
+
+// Sand and water: particles caught in sand are carried out instead of freezing, add nothing to the transfer while
+// caught, and drag toward the sand around them.
+void WaterSand() {
+    constexpr int size = 16;
+    struct Result {
+        std::array<float, 12> particle{};
+        std::array<GLuint, 5> counters{};
+    };
+    // Mask: a 4x4 sand block (2) at cells 6..9, optional painted cells (1). Sand moves down at 30 cells/s.
+    const auto step = [&](const std::vector<std::array<int, 3>>& cells, std::array<float, 12> start, float occupancy,
+                          float sand_drag, float dt) {
+        Resources resources;
+        std::vector<GLubyte> mask(size * size, 0);
+        for (int y = 6; y < 10; ++y)
+            for (int x = 6; x < 10; ++x) mask[static_cast<std::size_t>(y * size + x)] = 2;
+        for (const auto& cell : cells) mask[static_cast<std::size_t>(cell[1] * size + cell[0])] = static_cast<GLubyte>(cell[2]);
+        const std::vector<float> zero_faces(static_cast<std::size_t>((size + 1) * size), 0.0F);
+        std::vector<float> sand_velocity(static_cast<std::size_t>((size + 2) * (size + 2) * 2), 0.0F);
+        for (std::size_t i = 1; i < sand_velocity.size(); i += 2) sand_velocity[i] = -30.0F;
+        const std::vector<float> sand_occupancy(static_cast<std::size_t>(size * size), occupancy);
+        const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+        const GLuint u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT, zero_faces.data());
+        const GLuint v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT, zero_faces.data());
+        const GLuint particles = resources.Buffer(0, sizeof(start), start.data());
+        const std::array<GLuint, 5> zeros{};
+        const GLuint counters = resources.Buffer(1, sizeof(zeros), zeros.data());
+        const GLuint program = resources.Program("water_particle_step.comp");
+        glUseProgram(program);
+        glUniform2i(glGetUniformLocation(program, "gridSize"), size, size);
+        glUniform1i(glGetUniformLocation(program, "maxParticles"), 1);
+        glUniform1f(glGetUniformLocation(program, "dt"), dt);
+        glUniform1f(glGetUniformLocation(program, "velocityDamping"), 1.0F);
+        glUniform1f(glGetUniformLocation(program, "maxVelocity"), 1000.0F);
+        glUniform1f(glGetUniformLocation(program, "flipBlend"), 1.0F);
+        glUniform1f(glGetUniformLocation(program, "sandDrag"), sand_drag);
+        BindImage(0, boundary, GL_READ_ONLY, GL_R8UI);
+        BindImage(1, u, GL_READ_ONLY, GL_R16F);
+        BindImage(2, v, GL_READ_ONLY, GL_R16F);
+        BindImage(3, u, GL_READ_ONLY, GL_R16F);
+        BindImage(4, v, GL_READ_ONLY, GL_R16F);
+        BindImage(5, resources.Texture(size + 2, size + 2, GL_RG32F, GL_RG, GL_FLOAT, sand_velocity.data()), GL_READ_ONLY, GL_RG32F);
+        BindImage(6, resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT, sand_occupancy.data()), GL_READ_ONLY, GL_R16F);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+        Result result;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, particles);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(result.particle), result.particle.data());
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, counters);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(result.counters), result.counters.data());
+        CheckGl("water sand step");
+        return result;
+    };
+    std::ostringstream failures;
+    const auto near = [&](float actual, float expected, float tolerance, const std::string& label) {
+        if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance)
+            failures << " [" << label << ": expected " << expected << ", got " << actual << ']';
+    };
+    // Caught at (7.3, 6.9) in the block's bottom row: one cell below is open, so the particle moves down one cell,
+    // keeps its place in the cell and its tangential speed, and gains the sand's outward speed.
+    auto result = step({}, {7.3F, 6.9F, 4.0F, 0.0F, 1.0F, 1.0F}, 0.0F, 0.0F, 0.0F);
+    std::cout << "sand escape down: " << result.particle[0] << ',' << result.particle[1] << " v=" << result.particle[2] << ','
+              << result.particle[3] << '\n';
+    near(result.particle[0], 7.3F, 0.0001F, "escape keeps x");
+    near(result.particle[1], 5.9F, 0.0001F, "escape moves one cell down");
+    near(result.particle[2], 4.0F, 0.0001F, "escape keeps the tangential velocity");
+    near(result.particle[3], -30.0F, 0.0001F, "escape gains the sand's outward speed");
+    if (result.particle[4] != 1.0F || result.counters != std::array<GLuint, 5>{}) failures << " [escape must keep the particle without counters]";
+    // A painted cell below blocks that ray, which must not be crossed: the next shortest is left, two cells.
+    result = step({{7, 5, 1}}, {7.3F, 6.9F, 0.0F, 0.0F, 1.0F, 1.0F}, 0.0F, 0.0F, 0.0F);
+    near(result.particle[0], 5.3F, 0.0001F, "walled ray: moves left two cells");
+    near(result.particle[1], 6.9F, 0.0001F, "walled ray: keeps y");
+    // Painted cells on every side leave no way out: the particle stays and stops.
+    result = step({{7, 5, 1}, {7, 7, 1}, {6, 6, 1}, {8, 6, 1}}, {7.3F, 6.9F, 4.0F, 0.0F, 1.0F, 1.0F}, 0.0F, 0.0F, 0.0F);
+    near(result.particle[0], 7.3F, 0.0001F, "sealed particle keeps x");
+    near(result.particle[1], 6.9F, 0.0001F, "sealed particle keeps y");
+    near(result.particle[2], 0.0F, 0.0001F, "sealed particle stops");
+    // Caught next to the open last column: the escape lands in that cell's outer half, beyond the domain clamp. The
+    // move must start from the clamped edge (it once swept backward from there and left the domain at y < 0).
+    result = step({{14, 1, 2}}, {14.97F, 1.485F, 2.0F, 28.0F, 1.0F, 1.0F}, 0.0F, 0.0F, 0.01F);
+    std::cout << "sand escape at the edge: " << result.particle[0] << ',' << result.particle[1] << '\n';
+    near(result.particle[0], 15.4999F, 0.001F, "edge escape stays at the domain edge");
+    near(result.particle[1], 1.765F, 0.001F, "edge escape moves along y only");
+    if (result.particle[4] != 1.0F || result.counters != std::array<GLuint, 5>{}) failures << " [edge escape must keep the particle without counters]";
+    // Drag toward the sand: constant occupancy 0.5 at sand velocity (0,-30) relaxes the particle at rate*0.5.
+    constexpr float rate = 24.0F, dt = 0.01F;
+    result = step({}, {2.5F, 2.5F, 0.0F, 0.0F, 1.0F, 1.0F}, 0.5F, rate, dt);
+    const float expected = -30.0F * (1.0F - std::exp(-rate * 0.5F * dt));
+    std::cout << "sand drag on water: vy=" << result.particle[3] << " expected " << expected << '\n';
+    near(result.particle[3], expected, 0.01F, "water relaxes toward the sand velocity");
+    Require(failures.str().empty(), "water/sand particle coupling mismatch:" + failures.str());
+
+    // A particle caught in sand adds nothing to the transfer; the same particle in open air adds its weight.
+    for (const bool caught : {true, false}) {
+        Resources resources;
+        std::vector<GLubyte> mask(size * size, 0);
+        mask[static_cast<std::size_t>(7 * size + 7)] = caught ? 2 : 0;
+        const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+        const std::array<float, 12> particle{7.5F, 7.5F, 3.0F, 0.0F, 1.0F, 1.0F};
+        resources.Buffer(0, sizeof(particle), particle.data());
+        const std::vector<GLuint> face_weights((size + 1) * size, 0U);
+        const std::vector<GLint> face_momentum((size + 1) * size * 2, 0);
+        const std::vector<GLuint> cell_weights(size * size, 0U);
+        const GLuint u_weights = resources.Buffer(1, static_cast<GLsizeiptr>(face_weights.size() * sizeof(GLuint)), face_weights.data());
+        resources.Buffer(2, static_cast<GLsizeiptr>(face_weights.size() * sizeof(GLuint)), face_weights.data());
+        resources.Buffer(3, static_cast<GLsizeiptr>(face_momentum.size() * sizeof(GLint)), face_momentum.data());
+        resources.Buffer(4, static_cast<GLsizeiptr>(face_momentum.size() * sizeof(GLint)), face_momentum.data());
+        const GLuint counts = resources.Buffer(5, static_cast<GLsizeiptr>(cell_weights.size() * sizeof(GLuint)), cell_weights.data());
+        const std::array<GLuint, 4> no_errors{};
+        resources.Buffer(7, sizeof(no_errors), no_errors.data());
+        const GLuint program = resources.Program("water_particle_p2g.comp");
+        glUseProgram(program);
+        glUniform2i(glGetUniformLocation(program, "gridSize"), size, size);
+        glUniform1i(glGetUniformLocation(program, "maxParticles"), 1);
+        glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+        glUniform1f(glGetUniformLocation(program, "velocityScale"), 4096.0F);
+        BindImage(0, boundary, GL_READ_ONLY, GL_R8UI);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+        std::vector<GLuint> counted(face_weights.size()), faced(face_weights.size());
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, counts);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(cell_weights.size() * sizeof(GLuint)), counted.data());
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, u_weights);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(faced.size() * sizeof(GLuint)), faced.data());
+        const GLuint cell_total = std::accumulate(counted.begin(), counted.begin() + size * size, 0U);
+        const GLuint face_total = std::accumulate(faced.begin(), faced.end(), 0U);
+        std::cout << "p2g " << (caught ? "caught in sand" : "in open water") << ": cell weight=" << cell_total
+                  << " U face weight=" << face_total << '\n';
+        if (caught ? (cell_total != 0U || face_total != 0U) : (cell_total < 4000U || face_total == 0U))
+            failures << (caught ? " [a particle caught in sand must deposit nothing]" : " [an open particle must deposit its weight]");
+    }
+    Require(failures.str().empty(), "water/sand particle coupling mismatch:" + failures.str());
 }
 
 void WaterWallPressure() {
@@ -731,10 +1074,15 @@ void WaterWallPressure() {
     const std::array<float, size * size> zeros{};
     const GLuint cg_program = resources.Program("pressure_cg.comp");
     const GLuint cg_reduce = resources.Program("pressure_cg_reduce.comp");
+    const GLuint cg_multigrid = resources.Program("pressure_mg.comp");
     const GLuint cg_vectors = resources.Buffer(0, sizeof(float) * 4 * size * size, nullptr);
-    const GLuint cg_partials = resources.Buffer(1, sizeof(float) * 8, nullptr);
-    const GLuint cg_scalars = resources.Buffer(2, sizeof(float) * 4 + sizeof(GLuint) * 8, nullptr);
+    const GLuint cg_partials = resources.Buffer(1, sizeof(float) * 2 * size * size, nullptr);  // also the CG scratch
+    const GLuint cg_scalars = resources.Buffer(2, sizeof(float) * 6 + sizeof(GLuint) * 8, nullptr);
     const GLuint cg_debug = resources.Buffer(3, sizeof(GLuint) * 4, nullptr);
+    const GLuint cg_tiles = resources.Buffer(4, sizeof(GLuint) * 9, nullptr);  // dispatch args, tile count, one tile
+    const GLuint cg_sums = resources.Buffer(5, sizeof(float) * 12, nullptr);    // the one tile's three sums
+    // Multigrid arguments and boxes, then the one 2x2 coarse level of the 4x4 grid (its coarsest).
+    const GLuint cg_levels = resources.Buffer(6, sizeof(GLuint) * 64 + sizeof(float) * 16, nullptr);
     const auto solve = [&](GLuint rhs, GLuint boundary, GLuint phi, GLuint pressure) {
         const GLuint zero = 0;
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -744,6 +1092,10 @@ void WaterWallPressure() {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cg_partials);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cg_scalars);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, cg_debug);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, cg_tiles);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, cg_sums);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, cg_levels);
+        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, cg_tiles);
         BindImage(0, rhs, GL_READ_ONLY, GL_R16F);
         BindImage(1, pressure, GL_READ_WRITE, GL_R32F);
         BindImage(2, boundary, GL_READ_ONLY, GL_R8UI);
@@ -753,6 +1105,8 @@ void WaterWallPressure() {
         glUniform2i(glGetUniformLocation(cg_program, "solveOrigin"), 0, 0);
         glUniform2i(glGetUniformLocation(cg_program, "solveSize"), size, size);
         glUniform1f(glGetUniformLocation(cg_program, "liquidPhiThreshold"), phi_threshold);
+        glUniform1f(glGetUniformLocation(cg_program, "residualThreshold"), 0.002F);
+
         glUseProgram(cg_reduce);
         glUniform2i(glGetUniformLocation(cg_reduce, "gridSize"), size, size);
         glUniform2i(glGetUniformLocation(cg_reduce, "solveOrigin"), 0, 0);
@@ -760,24 +1114,57 @@ void WaterWallPressure() {
         glUniform1i(glGetUniformLocation(cg_reduce, "cellCount"), size * size);
         glUniform1i(glGetUniformLocation(cg_reduce, "partialCount"), 1);
         glUniform1f(glGetUniformLocation(cg_reduce, "residualThreshold"), 0.002F);
-        const auto dispatch = [&](GLuint program, int phase) {
+        glUseProgram(cg_multigrid);
+        glUniform2i(glGetUniformLocation(cg_multigrid, "gridSize"), size, size);
+        glUniform1i(glGetUniformLocation(cg_multigrid, "levels"), 1);
+        // Tile phases (1, 2) run per listed tile through the indirect arguments, as in the app; multigrid steps run
+        // from the tile list at level 0 and from their own arguments otherwise (slot 0 the coarsest, 1 the level-1 box).
+        const auto dispatch = [&](GLuint program, int phase, int slot = -2) {
             glUseProgram(program);
             glUniform1i(glGetUniformLocation(program, "phase"), phase);
-            glDispatchCompute(1, 1, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            if (slot >= 0) {
+                glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, cg_levels);
+                glDispatchComputeIndirect(slot * 16);
+                glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, cg_tiles);
+            } else if (slot == -1 || (program == cg_program && phase != 0 && phase < 8)) {
+                glDispatchComputeIndirect(0);
+            } else {
+                glDispatchCompute(1, 1, 1);
+            }
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        };
+        const auto precondition = [&](int slot, bool initial) {
+            glUseProgram(cg_multigrid);
+            glUniform1i(glGetUniformLocation(cg_multigrid, "level"), 0);
+            glUniform1i(glGetUniformLocation(cg_multigrid, "slot"), slot);
+            glUniform1i(glGetUniformLocation(cg_multigrid, "initial"), initial ? 1 : 0);
+            dispatch(cg_multigrid, 2, -1);
+            dispatch(cg_multigrid, 3, 0);
+            dispatch(cg_multigrid, 4, -1);
         };
         dispatch(cg_program, 0);
         dispatch(cg_reduce, 0);
         dispatch(cg_reduce, 1);
-        dispatch(cg_program, 5);
-        dispatch(cg_reduce, 7);
+        dispatch(cg_program, 8);
+        dispatch(cg_program, 9);
+        dispatch(cg_multigrid, 0);
+        glUseProgram(cg_multigrid);
+        glUniform1i(glGetUniformLocation(cg_multigrid, "level"), 1);
+        dispatch(cg_multigrid, 1, 1);
+        dispatch(cg_multigrid, 5, 0);
+        precondition(2, true);
+        glUseProgram(cg_program);
+        glUniform1i(glGetUniformLocation(cg_program, "parity"), 0);
+        glUniform1i(glGetUniformLocation(cg_program, "firstIteration"), 1);
+        dispatch(cg_program, 1);
+        glUniform1i(glGetUniformLocation(cg_program, "firstIteration"), 0);
         for (int iteration = 0; iteration < 32; ++iteration) {
-            dispatch(cg_program, 1);
-            dispatch(cg_reduce, 3);
+            glUseProgram(cg_program);
+            glUniform1i(glGetUniformLocation(cg_program, "parity"), iteration & 1);
             dispatch(cg_program, 2);
-            dispatch(cg_program, 4);
-            dispatch(cg_reduce, 5);
-            dispatch(cg_program, 3);
+            precondition(1 + (iteration & 1), false);
+            glUseProgram(cg_program);
+            dispatch(cg_program, 1);
         }
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
         std::array<GLuint, 4> counters{};
@@ -798,12 +1185,17 @@ void WaterWallPressure() {
     const GLuint divergence = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT);
     GLuint pressure = resources.Texture(size, size, GL_R32F, GL_RED, GL_FLOAT, zeros.data());
 
+    const GLuint counts = resources.Buffer(8, sizeof(zeros), zeros.data());  // empty cell counts for the density term
     const GLuint divergence_program = resources.Program("water_divergence.comp");
     const auto compute_divergence = [&](GLuint u_faces, GLuint v_faces) {
         glUseProgram(divergence_program);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, counts);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, storage_debug);
         glUniform2i(glGetUniformLocation(divergence_program, "gridSize"), size, size);
         glUniform1f(glGetUniformLocation(divergence_program, "liquidPhiThreshold"), phi_threshold);
+        glUniform1f(glGetUniformLocation(divergence_program, "weightScale"), 4096.0F);
+        glUniform1f(glGetUniformLocation(divergence_program, "restDensity"), 4.0F);
+        glUniform1f(glGetUniformLocation(divergence_program, "densityRate"), 0.0F);
         BindImage(0, u_faces, GL_READ_ONLY, GL_R16F);
         BindImage(1, v_faces, GL_READ_ONLY, GL_R16F);
         BindImage(2, divergence, GL_WRITE_ONLY, GL_R16F);
@@ -928,7 +1320,7 @@ void WaterWallPressure() {
     glBindTexture(GL_TEXTURE_2D, chamber_divergence);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RED, GL_FLOAT, chamber_rhs.data());
     const auto breakdown = solve(chamber_divergence, chamber_boundary, chamber_phi, pressure);
-    Require(breakdown[0] == 0 && breakdown[2] > 0, "incompatible closed RHS must report breakdown without NaNs");
+    Require(breakdown[0] == 0 && breakdown[2] > 0, "incompatible closed RHS must report breakdown without NaNs: nan/inf " + std::to_string(breakdown[0]) + ", nonconverged " + std::to_string(breakdown[2]));
     for (float value : ReadScalar(pressure, size, size)) Require(std::isfinite(value), "breakdown must keep pressure finite");
 
     walls.fill(1);
@@ -972,45 +1364,55 @@ void GasPressure() {
         Require(std::isfinite(actual) && std::abs(actual - expected) < 0.004F,
                 label + ": expected " + std::to_string(expected) + ", got " + std::to_string(actual));
     };
-    const auto relax_once = [](int width, int height, int scale, int mask_width, int mask_height,
-                               const std::vector<unsigned char>& mask, const std::vector<float>& rhs,
-                               const std::vector<float>& pressure) {
+    // One red-black Gauss-Seidel sweep (red, then black) in place over a level whose footprint kinds are given.
+    const auto relax_once = [](int width, int height, int scale, const std::vector<unsigned char>& kinds,
+                               const std::vector<float>& rhs, const std::vector<float>& pressure) {
         Resources resources;
-        const GLuint boundary = resources.Texture(mask_width, mask_height, GL_R8UI, GL_RED_INTEGER,
-                                                  GL_UNSIGNED_BYTE, mask.data());
-        const GLuint rhs_texture = resources.Texture(width, height, GL_R16F, GL_RED, GL_FLOAT, rhs.data());
-        const GLuint source = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT, pressure.data());
-        const GLuint output = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT);
+        const GLuint kind = resources.Texture(width, height, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, kinds.data());
+        const GLuint rhs_texture = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT, rhs.data());
+        const GLuint output = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT, pressure.data());
         const GLuint program = resources.Program("gas_pressure_relax.comp");
         glUseProgram(program);
         glUniform2i(glGetUniformLocation(program, "gridSize"), width, height);
         glUniform1i(glGetUniformLocation(program, "boundaryScale"), scale);
-        BindImage(0, rhs_texture, GL_READ_ONLY, GL_R16F);
-        BindImage(1, source, GL_READ_ONLY, GL_R32F);
-        BindImage(2, output, GL_WRITE_ONLY, GL_R32F);
-        BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
-        Dispatch(width, height);
+        BindImage(0, rhs_texture, GL_READ_ONLY, GL_R32F);
+        BindImage(1, output, GL_READ_WRITE, GL_R32F);
+        BindImage(3, kind, GL_READ_ONLY, GL_R8UI);
+        for (int parity = 0; parity < 2; ++parity) {
+            glUniform1i(glGetUniformLocation(program, "parity"), parity);
+            Dispatch(width, height);
+        }
         return ReadScalar(output, width, height);
     };
-    const auto restrict_rhs = [](int width, int height, int scale, const std::vector<unsigned char>& mask,
+    const auto restrict_rhs = [](int width, int height, int scale, const std::vector<unsigned char>& kinds,
                                  const std::vector<float>& rhs, const std::vector<float>& pressure) {
         Resources resources;
         const int coarse_width = (width + 1) / 2;
         const int coarse_height = (height + 1) / 2;
-        const GLuint boundary = resources.Texture(width * scale, height * scale, GL_R8UI, GL_RED_INTEGER,
-                                                  GL_UNSIGNED_BYTE, mask.data());
-        const GLuint rhs_texture = resources.Texture(width, height, GL_R16F, GL_RED, GL_FLOAT, rhs.data());
+        const GLuint kind = resources.Texture(width, height, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, kinds.data());
+        const GLuint rhs_texture = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT, rhs.data());
         const GLuint source = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT, pressure.data());
-        const GLuint output = resources.Texture(coarse_width, coarse_height, GL_R16F, GL_RED, GL_FLOAT);
+        const GLuint output = resources.Texture(coarse_width, coarse_height, GL_R32F, GL_RED, GL_FLOAT);
+        const GLuint coarse_pressure = resources.Texture(coarse_width, coarse_height, GL_R32F, GL_RED, GL_FLOAT);
+        const std::vector<unsigned char> coarse_kinds(static_cast<std::size_t>(coarse_width * coarse_height), 0);
+        const GLuint coarse_kind =
+            resources.Texture(coarse_width, coarse_height, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, coarse_kinds.data());
         const GLuint program = resources.Program("gas_pressure_restrict.comp");
         glUseProgram(program);
         glUniform2i(glGetUniformLocation(program, "fineSize"), width, height);
         glUniform2i(glGetUniformLocation(program, "coarseSize"), coarse_width, coarse_height);
         glUniform1i(glGetUniformLocation(program, "boundaryScale"), scale);
-        BindImage(0, rhs_texture, GL_READ_ONLY, GL_R16F);
+        BindImage(0, rhs_texture, GL_READ_ONLY, GL_R32F);
         BindImage(1, source, GL_READ_ONLY, GL_R32F);
-        BindImage(2, output, GL_WRITE_ONLY, GL_R16F);
-        BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
+        BindImage(2, output, GL_WRITE_ONLY, GL_R32F);
+        BindImage(3, kind, GL_READ_ONLY, GL_R8UI);
+        BindImage(4, coarse_pressure, GL_WRITE_ONLY, GL_R32F);
+        BindImage(5, coarse_kind, GL_READ_ONLY, GL_R8UI);
+        const GLuint residual = resources.Texture(width, height, GL_R32F, GL_RED, GL_FLOAT);
+        BindImage(6, residual, GL_READ_WRITE, GL_R32F);
+        glUniform1i(glGetUniformLocation(program, "gatherPass"), 0);
+        Dispatch(width, height);
+        glUniform1i(glGetUniformLocation(program, "gatherPass"), 1);
         Dispatch(coarse_width, coarse_height);
         return ReadScalar(output, coarse_width, coarse_height);
     };
@@ -1021,38 +1423,75 @@ void GasPressure() {
         std::vector<float> rhs(16, 0.0F);
         rhs[5] = 1.0F;
         rhs[6] = -1.0F;
-        const auto output = relax_once(4, 4, 1, 4, 4, mask, rhs, std::vector<float>(16, 0.0F));
-        // Each fluid cell has one open face: omega=2/3 relaxes toward pressure -rhs.
-        expect(output[5], -2.0F / 3.0F, "left pressure");
-        expect(output[6], 2.0F / 3.0F, "right pressure");
+        const auto output = relax_once(4, 4, 1, mask, rhs, std::vector<float>(16, 0.0F));
+        // One open face each: red cell 5 solves to -rhs, then black cell 6 sees it: (-1 - (-1)) / 1.
+        expect(output[5], -1.0F, "left pressure");
+        expect(output[6], 0.0F, "right pressure");
         expect(output[0], 0.0F, "solid pressure");
     });
     run("outside face diagonal", [&] {
-        const auto output = relax_once(2, 1, 1, 2, 1, {0, 0}, {1.0F, -1.0F}, {0.0F, 0.0F});
-        expect(output[0], -2.0F / 3.0F, "left domain-edge pressure");
-        expect(output[1], 2.0F / 3.0F, "right domain-edge pressure");
+        const auto output = relax_once(2, 1, 1, {0, 0}, {1.0F, -1.0F}, {0.0F, 0.0F});
+        expect(output[0], -1.0F, "left domain-edge pressure");
+        expect(output[1], 0.0F, "right domain-edge pressure");
     });
-    for (const auto& [scale, expected] : {std::pair{2, -2.0F / 3.0F}, {4, -8.0F / 3.0F}}) {
+    for (const auto& [scale, expected] : {std::pair{2, -0.25F}, {4, -0.25F}}) {
         run(scale == 2 ? "spacing h=2" : "spacing h=4", [&] {
             std::vector<float> rhs(9, 0.0F);
             rhs[4] = 1.0F;
-            const auto output = relax_once(3, 3, scale, 3 * scale, 3 * scale,
-                                           std::vector<unsigned char>(9 * scale * scale, 0), rhs,
-                                           std::vector<float>(9, 0.0F));
-            // Four open faces, zero neighbors: relaxed pressure is -(2/3)*h*h/4.
+            const auto output = relax_once(3, 3, scale, std::vector<unsigned char>(9, 0), rhs, std::vector<float>(9, 0.0F));
+            // The red centre has four open faces and zero neighbours: -rhs/4 on every level (unscaled operator;
+            // restriction carries the h^2).
             expect(output[4], expected, "interior coarse pressure");
         });
     }
-    run("partial boundary footprints", [&] {
+    run("open top", [&] {
+        Resources resources;
+        const std::vector<unsigned char> kinds(2, 0);
+        const std::vector<float> rhs{0.0F, 1.0F}, zero(2, 0.0F);
+        const GLuint kind = resources.Texture(1, 2, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, kinds.data());
+        const GLuint rhs_texture = resources.Texture(1, 2, GL_R32F, GL_RED, GL_FLOAT, rhs.data());
+        const GLuint output = resources.Texture(1, 2, GL_R32F, GL_RED, GL_FLOAT, zero.data());
+        const GLuint program = resources.Program("gas_pressure_relax.comp");
+        glUseProgram(program);
+        glUniform2i(glGetUniformLocation(program, "gridSize"), 1, 2);
+        glUniform1i(glGetUniformLocation(program, "boundaryScale"), 1);
+        glUniform1i(glGetUniformLocation(program, "openTop"), 1);
+        glUniform1i(glGetUniformLocation(program, "fineHeight"), 2);
+        glUniform1i(glGetUniformLocation(program, "parity"), 1);
+        BindImage(0, rhs_texture, GL_READ_ONLY, GL_R32F);
+        BindImage(1, output, GL_READ_WRITE, GL_R32F);
+        BindImage(3, kind, GL_READ_ONLY, GL_R8UI);
+        Dispatch(1, 2);
+        // The top cell (black) has a fluid neighbour at zero and the open top at zero pressure: (0 - 1) / 2.
+        expect(ReadScalar(output, 1, 2)[1], -0.5F, "open-top pressure");
+    });
+    run("kind coarsening", [&] {
+        Resources resources;
+        // 5x5 mask: a solid 2x2 block, one lone solid cell, and solid cells in the odd last column.
         std::vector<unsigned char> mask(25, 0);
-        mask[0] = 1;
-        const auto output = relax_once(3, 3, 2, 5, 5, mask, std::vector<float>(9, 0.0F),
-                                       std::vector<float>(9, 1.0F));
-        for (std::size_t cell : {2U, 5U, 6U, 7U, 8U}) {
-            expect(output[cell], 0.0F, "partial footprint pressure " + std::to_string(cell));
+        for (int i : {0, 1, 5, 6, 18, 4, 9}) mask[static_cast<std::size_t>(i)] = 1;
+        const GLuint fine = resources.Texture(5, 5, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+        const GLuint level0 = resources.Texture(5, 5, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE);
+        const GLuint level1 = resources.Texture(3, 3, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE);
+        const GLuint program = resources.Program("gas_pressure_kind.comp");
+        glUseProgram(program);
+        for (int level = 0; level < 2; ++level) {
+            const int coarse_size = level == 0 ? 5 : 3;
+            glUniform2i(glGetUniformLocation(program, "fineSize"), 5, 5);
+            glUniform2i(glGetUniformLocation(program, "coarseSize"), coarse_size, coarse_size);
+            glUniform1i(glGetUniformLocation(program, "fromMask"), level == 0 ? 1 : 0);
+            BindImage(0, level == 0 ? fine : level0, GL_READ_ONLY, GL_R8UI);
+            BindImage(1, level == 0 ? level0 : level1, GL_WRITE_ONLY, GL_R8UI);
+            Dispatch(coarse_size, coarse_size);
         }
-        expect(output[0], 0.0F, "solid-containing footprint pressure");
-        expect(output[4], 1.0F, "constant pressure in complete fluid footprint");
+        std::vector<unsigned char> kinds(9);
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+        glBindTexture(GL_TEXTURE_2D, level1);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, kinds.data());
+        // All-solid footprints are walls (the odd column counts only its cells inside the domain); any fluid
+        // child keeps a coarse cell fluid.
+        const std::vector<unsigned char> expected{1, 0, 1, 0, 0, 0, 0, 0, 0};
+        Require(kinds == expected, "coarse kinds must be solid only for all-solid footprints");
     });
     run("restriction wall operator", [&] {
         std::vector<unsigned char> mask(16, 0);
@@ -1067,8 +1506,9 @@ void GasPressure() {
     run("restriction physical rhs", [&] {
         const auto output = restrict_rhs(4, 4, 1, std::vector<unsigned char>(16, 0),
                                          std::vector<float>(16, 1.0F), std::vector<float>(16, 0.0F));
+        // Transposed bilinear weights: four per coarse cell.
         for (float value : output) {
-            expect(value, 1.0F, "restricted physical residual");
+            expect(value, 4.0F, "restricted physical residual");
         }
     });
     run("restriction spacing h=2", [&] {
@@ -1078,39 +1518,45 @@ void GasPressure() {
                 pressure[static_cast<std::size_t>(y * 6 + x)] = static_cast<float>(x * x + y * y);
             }
         }
-        const auto output = restrict_rhs(6, 6, 2, std::vector<unsigned char>(144, 0),
+        const auto output = restrict_rhs(6, 6, 2, std::vector<unsigned char>(36, 0),
                                          std::vector<float>(36, 2.0F), pressure);
-        // The center footprint is entirely interior: Lap(x*x+y*y)=4, so physical residual is 2-4/4=1.
-        expect(output[4], 1.0F, "restricted coarse-spacing residual");
+        // The centre stencil covers interior cells only: residual 2 - Lap(x*x+y*y) = -2, times the weights (4).
+        expect(output[4], -8.0F, "restricted interior residual");
     });
-    run("restriction blocked coarse cell", [&] {
+    run("restriction solid child", [&] {
         std::vector<unsigned char> mask(16, 0);
         mask[5] = 1;
         const auto output = restrict_rhs(4, 4, 1, mask, std::vector<float>(16, 1.0F),
                                          std::vector<float>(16, 0.0F));
-        expect(output[0], 0.0F, "coarse cell with a solid child");
-        for (std::size_t cell = 1; cell < output.size(); ++cell) {
-            expect(output[cell], 1.0F, "complete fluid coarse cell");
+        // The solid fine cell (1,1) would have sent 9/16, 3/16, 3/16 and 1/16 to coarse cells 0..3.
+        const std::array<float, 4> expected{4.0F - 0.5625F, 4.0F - 0.1875F, 4.0F - 0.1875F, 4.0F - 0.0625F};
+        for (std::size_t cell = 0; cell < output.size(); ++cell) {
+            expect(output[cell], expected[cell], "coarse residual " + std::to_string(cell));
         }
     });
     run("restriction odd extent", [&] {
         const auto output = restrict_rhs(3, 3, 1, std::vector<unsigned char>(9, 0),
                                          std::vector<float>(9, 1.0F), std::vector<float>(9, 0.0F));
-        expect(output[0], 1.0F, "complete coarse footprint");
-        for (std::size_t cell = 1; cell < output.size(); ++cell) {
-            expect(output[cell], 0.0F, "partial coarse footprint");
+        // Per axis the three fine cells send 2 to coarse cell 0 and 1 to cell 1 (donors past the edge fall back
+        // to the parent).
+        const std::array<float, 4> expected{4.0F, 2.0F, 2.0F, 1.0F};
+        for (std::size_t cell = 0; cell < output.size(); ++cell) {
+            expect(output[cell], expected[cell], "coarse footprint " + std::to_string(cell));
         }
     });
     run("prolongation blocked donor", [&] {
         Resources resources;
         const std::array<float, 4> coarse_values{100.0F, 1.0F, 1.0F, 1.0F};
         std::array<float, 16> fine_values{};
-        for (std::size_t cell : {0U, 1U, 4U, 5U}) {
-            fine_values[cell] = 0.25F;
-        }
+        fine_values.fill(0.25F);
+        // All four children of coarse cell 0 are solid, so it is a wall (its 100 is never a donor): fluid cells
+        // substitute their own parent (value 1) for it and gain exactly 1.
         std::array<unsigned char, 16> mask{};
-        mask[0] = 1;
+        for (std::size_t cell : {0U, 1U, 4U, 5U}) mask[cell] = 1;
         const GLuint boundary = resources.Texture(4, 4, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+        const std::array<unsigned char, 4> coarse_kinds{1, 0, 0, 0};
+        const GLuint coarse_boundary =
+            resources.Texture(2, 2, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, coarse_kinds.data());
         const GLuint coarse = resources.Texture(2, 2, GL_R32F, GL_RED, GL_FLOAT, coarse_values.data());
         const GLuint fine = resources.Texture(4, 4, GL_R32F, GL_RED, GL_FLOAT, fine_values.data());
         const GLuint program = resources.Program("gas_pressure_prolongate.comp");
@@ -1121,11 +1567,12 @@ void GasPressure() {
         BindImage(0, coarse, GL_READ_ONLY, GL_R32F);
         BindImage(1, fine, GL_READ_WRITE, GL_R32F);
         BindImage(2, boundary, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, coarse_boundary, GL_READ_ONLY, GL_R8UI);
         Dispatch(4, 4);
         const auto output = ReadScalar(fine, 4, 4);
         for (int y = 0; y < 4; ++y) {
             for (int x = 0; x < 4; ++x) {
-                const float expected = x == 0 && y == 0 ? 0.0F : (x < 2 && y < 2 ? 0.25F : 1.0F);
+                const float expected = x < 2 && y < 2 ? 0.0F : 1.25F;
                 expect(output[static_cast<std::size_t>(y * 4 + x)], expected,
                        "prolongated pressure (" + std::to_string(x) + "," + std::to_string(y) + ")");
             }
@@ -1280,7 +1727,8 @@ void SmokeDissipation() {
         constexpr float tolerance = 0.002F;
         // All runs cover 1/60 second, so their expected decay is independent of the substep count.
         for (std::size_t field = 0; field < source.size(); ++field) {
-            const float expected = initial * (field == 0 ? density_dissipation : scalar_dissipation);
+            // Oxygen does not decay: fire_rd.comp relaxes it toward fresh air instead.
+            const float expected = initial * (field == 0 ? density_dissipation : field == 3 ? 1.0F : scalar_dissipation);
             for (float value : ReadScalar(source[field], size, size)) {
                 Require(std::isfinite(value) && std::abs(value - expected) < tolerance,
                         std::string("corrected ") + field_names[field] + context + ": expected " +
@@ -1289,7 +1737,7 @@ void SmokeDissipation() {
         }
         const auto reaction = ReadVector(reaction_source, size, size);
         for (std::size_t cell = 0; cell < reaction.size() / 2; ++cell) {
-            Require(reaction[cell * 2] == 0.0F, "reserved reaction.x must remain zero" + context);
+            Require(reaction[cell * 2] == 0.0F, "a zero burn rate (reaction.x) must stay zero" + context);
             const float value = reaction[cell * 2 + 1];
             const float expected = initial_reaction * scalar_dissipation;
             Require(std::isfinite(value) && std::abs(value - expected) < tolerance,
@@ -1677,14 +2125,17 @@ void GasWallTransport() {
                         errors << " [" << field << '=' << value << ", expected " << expected_value << ']';
                 };
                 const float scalar_forward_expected = bounded_trace && !diagonal_trace ? 0.375F : 0.1875F;
-                const float scalar_correct_expected = bounded_trace && !diagonal_trace ? 0.171875F : 0.46875F;
+                // The reverse trace follows u^n (Selle et al. 2008), not the forward-advected velocity, so the bound
+                // (reversed) velocity texture is unused and the correction reads the forward field one trace downstream.
+                const float scalar_correct_expected = bounded_trace ? (diagonal_trace ? 0.59375F : 0.421875F) : 0.5F;
                 for (float value : endpoint_forward) exact(value, endpoint_mode == 2 ? scalar_forward_expected : initial, "scalar forward");
                 for (GLuint texture : corrected)
                     exact(ReadScalar(texture, size, size)[target_cell], endpoint_mode == 2 ? scalar_correct_expected : initial, "scalar correction");
                 exact(ReadVector(reaction_corrected, size, size)[target_cell * 2 + 1],
                       endpoint_mode == 2 ? scalar_correct_expected : initial, "reaction correction");
                 for (float value : endpoint_face_forward) exact(value, endpoint_mode == 2 ? (diagonal_trace ? 0.1875F : 0.375F) : initial, "face forward");
-                const float face_correct_expected = diagonal_trace ? 0.46875F : 0.171875F;
+                const float face_correct_expected =
+                    bounded_trace ? (diagonal_trace ? 0.59375F : 0.421875F) : (diagonal_trace ? 0.46875F : 0.171875F);
                 exact(ReadScalar(corrected_u, size + 1, size)[endpoint_u], endpoint_mode == 2 ? face_correct_expected : initial, "U correction");
                 exact(ReadScalar(corrected_v, size, size + 1)[endpoint_v], endpoint_mode == 2 ? face_correct_expected : initial, "V correction");
             }
@@ -1751,6 +2202,10 @@ void CouplingTime() {
                 const GLuint reaction = resources.Texture(size, size, GL_RG16F, GL_RG, GL_FLOAT, reaction_values.data());
                 const std::array<unsigned char, size * size> empty{};
                 const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, empty.data());
+                // No oil and no sand: the fixture checks the water coupling alone.
+                const std::array<float, size * size * 4 * 2> zero_rg{};
+                const GLuint no_oil = resources.Texture(size * 2, size * 2, GL_RG16F, GL_RG, GL_FLOAT, zero_rg.data());
+                const GLuint no_sand = resources.Texture(size * 2, size * 2, GL_R16F, GL_RED, GL_FLOAT, zero_rg.data());
                 const GLuint fire_program = resources.Program("coupling_fire.comp");
                 const GLuint heat_program = resources.Program("coupling_heat.comp");
                 const float dt = (1.0F / 60.0F) / static_cast<float>(steps);
@@ -1766,6 +2221,9 @@ void CouplingTime() {
                     BindImage(3, reaction, GL_READ_WRITE, GL_RG16F);
                     BindImage(4, oxidizer, GL_READ_WRITE, GL_R16F);
                     BindImage(5, fuel, GL_READ_WRITE, GL_R16F);
+                    BindImage(6, no_oil, GL_READ_ONLY, GL_RG16F);
+                    BindImage(7, no_sand, GL_READ_ONLY, GL_R16F);
+                    glUniform1f(glGetUniformLocation(fire_program, "sandSmother"), 0.35F);
                     Dispatch(size, size);
                     glUseProgram(heat_program);
                     glUniform2i(glGetUniformLocation(heat_program, "gridSize"), size * 2, size * 2);
@@ -1774,6 +2232,7 @@ void CouplingTime() {
                     glUniform1f(glGetUniformLocation(heat_program, "waterCooling"), cooling * 0.7F);
                     BindImage(0, heat, GL_READ_WRITE, GL_R16F);
                     BindImage(1, water_texture, GL_READ_ONLY, GL_R16F);
+                    BindImage(2, no_oil, GL_READ_ONLY, GL_RG16F);
                     Dispatch(size, size);
                 }
                 const float suppression = std::clamp(water * cooling, 0.0F, 1.0F);
@@ -1821,13 +2280,13 @@ void GasBrushBlocking() {
         float expected;
     };
     const std::array<BrushCase, 7> cases{{
-        {"dry fire", 0.0F, true, false, false, false, 0.375F},
-        {"trace water fire", 0.01F, true, false, false, false, 0.375F},
+        {"dry fire", 0.0F, true, false, false, false, 0.25F},
+        {"trace water fire", 0.01F, true, false, false, false, 0.25F},
         {"wet fire", 0.02F, true, false, false, false, 0.125F},
-        {"smoke over water", 1.0F, false, false, false, false, 0.375F},
+        {"smoke over water", 1.0F, false, false, false, false, 0.25F},
         {"gas mask wall", 0.0F, true, true, false, false, 0.125F},
         {"clear wet blocked cell", 1.0F, true, true, true, false, 0.0F},
-        {"water outside brush", 1.0F, true, false, false, true, 0.375F},
+        {"water outside brush", 1.0F, true, false, false, true, 0.25F},
     }};
     int failures = 0;
     for (const auto& test : cases) {
@@ -1872,6 +2331,7 @@ void GasBrushBlocking() {
             glUniform2i(glGetUniformLocation(program, "brushCenter"), 2, 2);
             glUniform1i(glGetUniformLocation(program, "brushRadius"), 0);
             glUniform2f(glGetUniformLocation(program, "gasVelocity"), 0.25F, 0.25F);
+            glUniform1f(glGetUniformLocation(program, "maxVelocity"), 10.0F);
             for (const char* uniform : {"smokeDensity", "temperatureAdd", "fuelAdd", "oxidizerAdd", "reactionAdd"})
                 glUniform1f(glGetUniformLocation(program, uniform), 0.25F);
             glUniform1i(glGetUniformLocation(program, "blockedBySolid"), 1);
@@ -1885,16 +2345,27 @@ void GasBrushBlocking() {
             BindImage(9, water_texture, GL_READ_ONLY, GL_R16F);
             BindImage(10, boundary_gas, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
-            const auto check = [&](const std::vector<float>& values, int changed, const std::string& field) {
+            // Clearing also zeroes the right/top face the target shares with its neighbour.
+            const auto check = [&](const std::vector<float>& values, int changed, const std::string& field,
+                                   int shared_face = -1) {
                 for (std::size_t i = 0; i < values.size(); ++i) {
-                    const float expected = static_cast<int>(i) == changed ? test.expected : 0.125F;
+                    const bool zeroed = test.clear && static_cast<int>(i) == shared_face;
+                    const float expected = static_cast<int>(i) == changed ? test.expected : zeroed ? 0.0F : 0.125F;
                     Require(values[i] == expected, field + " index=" + std::to_string(i) + " expected=" +
                                 std::to_string(expected) + " got=" + std::to_string(values[i]));
                 }
             };
-            for (GLuint field : fields) check(ReadScalar(field, size, size), target, "scalar");
-            check(ReadScalar(u, size + 1, size), 1 + size + 1, "U");
-            check(ReadScalar(v, size, size + 1), target, "V");
+            // Stamps keep the larger of field and brush (0.25 over 0.125); erased gas is fresh air (oxidizer 1).
+            for (std::size_t field = 0; field < fields.size(); ++field) {
+                auto values = ReadScalar(fields[field], size, size);
+                if (test.clear && field == 3) {
+                    Require(values[target] == 1.0F, "cleared oxidizer must be fresh air");
+                    values[target] = 0.0F;
+                }
+                check(values, target, "scalar");
+            }
+            check(ReadScalar(u, size + 1, size), 1 + size + 1, "U", 1 + size + 2);
+            check(ReadScalar(v, size, size + 1), target, "V", target + size);
             const auto centers = ReadVector(center, size, size);
             const auto reactions = ReadVector(reaction, size, size);
             for (int cell = 0; cell < size * size; ++cell) {
@@ -1951,7 +2422,6 @@ void ParticleCapacity() {
                     glUseProgram(program);
                     glUniform1i(glGetUniformLocation(program, "blockedBySolid"), 1);
                     glUniform1f(glGetUniformLocation(program, "occupancyLimit"), 1.0F);
-                    glUniform1f(glGetUniformLocation(program, "referenceDensity"), 2.0F);
                     BindImage(0, material_texture, GL_READ_ONLY, GL_R16UI);
                     BindImage(1, occupancy_texture, GL_READ_ONLY, GL_R16F);
                 } else {
@@ -1998,9 +2468,10 @@ void ParticleCapacity() {
                                 particle[2] == 2.0F && particle[3] == -3.0F && particle[4] == 1.0F && particle[5] == 1.0F,
                             "spawned particle must have the requested state");
                     if constexpr (sand) {
-                        Require(particle[10] == 0.5F && particle[12] == 1.0F && particle[13] == 0.0F &&
+                        Require(particle[10] == 0.0F && std::floor(particle[11]) == particle[11] &&
+                                    std::abs(particle[11]) <= 31.0F && particle[12] == 1.0F && particle[13] == 0.0F &&
                                     particle[14] == 0.0F && particle[15] == 1.0F,
-                                "sand spawn must initialize rest area and identity elastic deformation");
+                                "sand spawn must initialize no volume correction, an integer friction trait with no moisture and identity elastic deformation");
                     }
                 }
                 // A radius-one brush reaches five cells. Each requests more than the entire capacity,
@@ -2272,15 +2743,17 @@ void CompileShaders() {
         }
         glfwPollEvents();
     }
-    try {
-        Resources resources;
-        resources.programs.push_back(glutil::CreateProgramFromFiles((kShaderRoot / "fullscreen.vert").string(),
-                                                                   (kShaderRoot / "composite.frag").string()));
-        CheckGl("compile render shaders");
-        std::cout << "  compiled fullscreen.vert + composite.frag\n";
-    } catch (const std::exception& error) {
-        ++failures;
-        std::cerr << "  FAIL render shaders: " << error.what() << '\n';
+    for (const char* fragment : {"composite.frag", "hud.frag"}) {
+        try {
+            Resources resources;
+            resources.programs.push_back(glutil::CreateProgramFromFiles((kShaderRoot / "fullscreen.vert").string(),
+                                                                       (kShaderRoot / fragment).string()));
+            CheckGl("compile render shaders");
+            std::cout << "  compiled fullscreen.vert + " << fragment << '\n';
+        } catch (const std::exception& error) {
+            ++failures;
+            std::cerr << "  FAIL render shaders " << fragment << ": " << error.what() << '\n';
+        }
     }
     Require(failures == 0, std::to_string(failures) + " shader programs failed compilation/linking");
     CompileFailureCleanup();
@@ -2313,11 +2786,11 @@ void PrintContextInfo() {
 
 int main(int argc, char** argv) {
     const std::string selected = argc > 1 ? argv[1] : "all";
-    const std::array<std::pair<const char*, void (*)()>, 17> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 21> tests{{
         {"compile", CompileShaders}, {"water-transfer", WaterTransfer}, {"water-p2g", WaterP2G},
         {"half-storage", HalfStorage},
         {"water-affine", WaterAffineTransfer}, {"boundary-mask", BoundaryMask}, {"water-wall-pressure", WaterWallPressure},
-        {"water-integration", WaterIntegration},
+        {"water-integration", WaterIntegration}, {"water-sand", WaterSand}, {"water-wall-density", WaterWallDensity}, {"water-sparse-face", WaterSparseFace}, {"water-density-term", WaterDensityTerm},
         {"gas-pressure", GasPressure}, {"smoke-dissipation", SmokeDissipation},
         {"gas-velocity-dissipation", GasVelocityDissipation},
         {"gas-wall-transport", GasWallTransport}, {"coupling-time", CouplingTime},
@@ -2327,7 +2800,7 @@ int main(int argc, char** argv) {
                          return selected == test.first;
                      }))) {
         std::cerr << "Usage: powder_gpu_tests "
-                     "[all|compile|half-storage|water-transfer|water-p2g|water-affine|water-integration|boundary-mask|water-wall-pressure|gas-pressure|smoke-dissipation|gas-velocity-dissipation|gas-wall-transport|coupling-time|gas-brush-blocking|fire-reaction|particle-capacity|pressure-invalid]\n";
+                     "[all|compile|half-storage|water-transfer|water-p2g|water-affine|water-integration|water-sand|water-wall-density|water-density-term|boundary-mask|water-wall-pressure|gas-pressure|smoke-dissipation|gas-velocity-dissipation|gas-wall-transport|coupling-time|gas-brush-blocking|fire-reaction|particle-capacity|pressure-invalid]\n";
         return 2;
     }
 

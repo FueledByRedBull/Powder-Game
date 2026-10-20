@@ -19,24 +19,79 @@ layout(std430, binding = 1) buffer SandParticlesDst {
 
 layout(std430, binding = 2) buffer SandSpawnCursor {
     uint spawnCursor;
+    // Fastest live grain as float bits (non-negative floats order like their bits); the host sizes substeps from it.
+    uint fastestSpeedBits;
+    // Cell box of the live grains for the grid passes: 0xffffffff minus the minimum x and y, then the maximum plus one
+    // (all zero when no grain lives), so every bound reduces with atomicMax from a zero clear.
+    uint boxMinX;
+    uint boxMinY;
+    uint boxMaxX;
+    uint boxMaxY;
+};
+
+// sand_pack.comp's flags: grains in a cell with the pack bit now live in the packed texture.
+layout(std430, binding = 3) readonly buffer SandCellTally {
+    uint tally[];
 };
 
 uniform int maxParticles;
+uniform ivec2 gridSize;
+uniform int dropPacked;
+
+shared uint groupBox[4];
+
+bool invalid(vec2 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
 
 void main() {
+    if (gl_LocalInvocationIndex < 4u) groupBox[gl_LocalInvocationIndex] = 0u;
+    barrier();
+
     uint index = gl_GlobalInvocationID.x;
-    if (index >= uint(maxParticles)) {
-        return;
+    SandParticle particle;
+    bool live = false;
+    if (index < uint(maxParticles)) {
+        particle = srcParticles[index];
+        // NaN flags stay live, as before, so P2G reports them.
+        live = !(particle.state1.x < 0.5);
     }
-
-    SandParticle particle = srcParticles[index];
-    if (particle.state1.x < 0.5) {
-        return;
+    if (live) {
+        vec2 position = particle.state0.xy;
+        // The same grains sand_sleep.comp tallied.
+        bool counted = particle.state1.x >= 0.5 && !invalid(position) && all(greaterThanEqual(position, vec2(0.0))) &&
+                       all(lessThan(position, vec2(gridSize)));
+        ivec2 cell = counted ? ivec2(floor(position)) : ivec2(0);
+        if (counted && dropPacked == 1 && (tally[cell.y * gridSize.x + cell.x] & (1u << 31)) != 0u) {
+            live = false;
+        } else {
+            if (counted) {
+                atomicMax(groupBox[0], 0xffffffffu - uint(cell.x));
+                atomicMax(groupBox[1], 0xffffffffu - uint(cell.y));
+                atomicMax(groupBox[2], uint(cell.x) + 1u);
+                atomicMax(groupBox[3], uint(cell.y) + 1u);
+            } else {
+                // Invalid grains still reach P2G, which reports them; the whole grid keeps them in the box.
+                atomicMax(groupBox[0], 0xffffffffu);
+                atomicMax(groupBox[1], 0xffffffffu);
+                atomicMax(groupBox[2], uint(gridSize.x));
+                atomicMax(groupBox[3], uint(gridSize.y));
+            }
+            float speed = length(particle.state0.zw);
+            if (!isnan(speed) && !isinf(speed) && floatBitsToUint(speed) > fastestSpeedBits) {
+                atomicMax(fastestSpeedBits, floatBitsToUint(speed));
+            }
+            uint dstIndex = atomicAdd(spawnCursor, 1u);
+            if (dstIndex < uint(maxParticles)) {
+                dstParticles[dstIndex] = particle;
+            }
+        }
     }
-
-    uint dstIndex = atomicAdd(spawnCursor, 1u);
-    if (dstIndex >= uint(maxParticles)) {
-        return;
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && groupBox[2] != 0u) {
+        atomicMax(boxMinX, groupBox[0]);
+        atomicMax(boxMinY, groupBox[1]);
+        atomicMax(boxMaxX, groupBox[2]);
+        atomicMax(boxMaxY, groupBox[3]);
     }
-    dstParticles[dstIndex] = particle;
 }

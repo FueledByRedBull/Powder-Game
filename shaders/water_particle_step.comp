@@ -7,6 +7,10 @@ layout(r16f, binding = 1) uniform readonly image2D waterUPrevTex;
 layout(r16f, binding = 2) uniform readonly image2D waterVPrevTex;
 layout(r16f, binding = 3) uniform readonly image2D waterUTex;
 layout(r16f, binding = 4) uniform readonly image2D waterVTex;
+layout(rg32f, binding = 5) uniform readonly image2D sandVelocityTex;
+layout(r16f, binding = 6) uniform readonly image2D sandOccupancyTex;
+layout(r16f, binding = 7) uniform readonly image2D liquidVolumeTex;
+layout(rg16f, binding = 8) uniform readonly image2D oilTex;  // x: oil share of the cell's records (oil_field.comp)
 
 struct WaterParticle {
     vec4 state0;
@@ -23,6 +27,7 @@ layout(std430, binding = 1) buffer DebugCounters {
     uint particleOverflowBlocked;
     uint pressureNonconverged;
     uint inactiveTileMisses;
+    uint waterVelocityClamped;
 };
 
 uniform ivec2 gridSize;
@@ -31,13 +36,36 @@ uniform float velocityDamping;
 uniform float maxVelocity;
 uniform float flipBlend;
 uniform int maxParticles;
+// Rate (1/s) at which water relaxes toward the sand velocity where the sand is at full rest density.
+uniform float sandDrag;
+// Most cells a particle crosses per swept advection sub-move.
+uniform float advectionCfl;
+// Liquid volume above which a cell holds a clump, and a per-substep seed. Particles that converged onto one point
+// sample one velocity and can never separate, so in such a cell each takes a small swept random step.
+uniform float clumpVolume;
+uniform uint jitterSeed;
+// Oil (state2.z records) is lighter than water. oilBuoyancy (cells/s^2) is (1 - rho_oil / rho_water) g: every record
+// gets it in proportion to the local oil share, a Boussinesq body force on the mixture, so oil bodies rise as a whole
+// while water flows around them. oilDrift (cells/s) separates the two liquids within a cell, which the shared grid
+// velocity cannot. Both 0 when no oil exists.
+uniform float oilBuoyancy;
+uniform float oilDrift;
+uniform float restVolume;  // liquid volume of a cell at rest density
+// Turbulent and boundary-layer losses of supported liquid (1/s) and the gravity vector (cells/s^2). Liquid whose grid
+// acceleration differs from free fall is held up by pressure (a pool, a wave, a film on a ramp) and loses velocity at
+// up to bulkDamping; a free-falling blob, stream or droplet (acceleration g) keeps its speed.
+uniform float bulkDamping;
+uniform vec2 gravity;
+
+// Set when a speed cap cut this particle's velocity; each such particle is counted, so clipping is never silent.
+bool speedClamped = false;
 
 bool blockedCell(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
            imageLoad(boundaryMaskTex, cell).x != 0u;
 }
 
-float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
+float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 lastCell) {
     float hitTime = 1.0;
     hitNormal = vec2(0.0);
     for (int axis = 0; axis < 2; ++axis) {
@@ -56,6 +84,7 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
     }
 
     ivec2 cell = ivec2(floor(position));
+    lastCell = cell;
     ivec2 direction = ivec2(sign(displacement));
     vec2 nextCross = vec2(1e30);
     for (int axis = 0; axis < 2; ++axis) {
@@ -89,6 +118,7 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
             return time;
         }
         cell = target;
+        lastCell = cell;
         // Refer to the original segment instead of accumulating roundoff over a long sweep.
         for (int axis = 0; axis < 2; ++axis) {
             if (crossed[axis]) {
@@ -100,10 +130,51 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal) {
     return hitTime;
 }
 
+// Sand that closed over a particle carries it out. The particle moves a whole number of cells along the shortest
+// axis that reaches open water, keeping its place within the cell; rays stop at painted walls, so it never
+// crosses one. Its velocity gains the sand's outward speed, as if the advancing sand had pushed it.
+const int kEscapeReach = 24;
+
+void escapeSand(inout vec2 position, inout vec2 velocity) {
+    ivec2 cell = ivec2(floor(position));
+    int bestSteps = kEscapeReach + 1;
+    ivec2 bestDirection = ivec2(0);
+    for (int axis = 0; axis < 4; ++axis) {
+        ivec2 direction = ivec2(axis == 0 ? 1 : (axis == 1 ? -1 : 0), axis == 2 ? 1 : (axis == 3 ? -1 : 0));
+        for (int steps = 1; steps < bestSteps; ++steps) {
+            ivec2 probe = cell + direction * steps;
+            if (probe.x < 0 || probe.y < 0 || probe.x >= gridSize.x || probe.y >= gridSize.y) break;
+            uint mask = imageLoad(boundaryMaskTex, probe).x;
+            if (mask == 1u) break;
+            if (mask == 0u) {
+                bestSteps = steps;
+                bestDirection = direction;
+                break;
+            }
+        }
+    }
+    if (bestDirection == ivec2(0)) return;
+    position += vec2(bestDirection * bestSteps);
+    vec2 outward = vec2(bestDirection);
+    vec2 sandVelocity = imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+    velocity += outward * max(dot(sandVelocity - velocity, outward), 0.0);
+    float speed = length(velocity);
+    if (speed > maxVelocity) {
+        velocity *= maxVelocity / speed;
+        speedClamped = true;
+    }
+}
+
 void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 affine,
                         vec2 displacement, float bounce) {
     position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
-    // A particle already inside painted geometry waits for the brush's explicit clearing.
+    if (imageLoad(boundaryMaskTex, ivec2(floor(position))).x >= 2u) {
+        escapeSand(position, velocity);
+        // The escape keeps the place within the cell, which in an edge cell can lie beyond the clamp; the domain
+        // sweep below needs a start inside it (else its hit time is negative and the move runs backward).
+        position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
+    }
+    // A particle still inside painted geometry waits for the brush's explicit clearing.
     if (blockedCell(ivec2(floor(position)))) {
         velocity = vec2(0.0);
         affine = mat2(0.0);
@@ -113,12 +184,18 @@ void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 aff
     // Each contact removes one inward displacement component; the remaining tangent is swept again.
     for (int contact = 0; contact < 2; ++contact) {
         vec2 normal;
-        float time = sweepGrid(position, displacement, normal);
+        ivec2 openCell;
+        float time = sweepGrid(position, displacement, normal, openCell);
         position += displacement * time;
+        position += normal * 0.0001;
+        // Rounding in the hit point can land a contact (or an edge-grazing move) a few ulps inside the next cell,
+        // which may be a wall, where the particle would stick. Keep it in the last open cell the sweep traversed.
+        if (any(notEqual(ivec2(floor(position)), openCell))) {
+            position = clamp(position, vec2(openCell), vec2(openCell + ivec2(1)) - vec2(1.0 / 256.0));
+        }
         if (all(equal(normal, vec2(0.0)))) {
             return;
         }
-        position += normal * 0.0001;
         displacement *= 1.0 - time;
         for (int axis = 0; axis < 2; ++axis) {
             if (normal[axis] != 0.0) {
@@ -133,24 +210,52 @@ void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 aff
     }
 }
 
-float sampleUPrev(ivec2 coord) {
-    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x, gridSize.y - 1));
-    return imageLoad(waterUPrevTex, clamped).x;
+ivec2 clampU(ivec2 coord) {
+    return clamp(coord, ivec2(0), ivec2(gridSize.x, gridSize.y - 1));
 }
 
-float sampleVPrev(ivec2 coord) {
-    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x - 1, gridSize.y));
-    return imageLoad(waterVPrevTex, clamped).x;
+ivec2 clampV(ivec2 coord) {
+    return clamp(coord, ivec2(0), ivec2(gridSize.x - 1, gridSize.y));
 }
 
-float sampleUCurrent(ivec2 coord) {
-    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x, gridSize.y - 1));
-    return imageLoad(waterUTex, clamped).x;
+// A face with solid or sand on both sides lies inside a wall and holds no fluid velocity (p2g drops it too). A particle
+// reads the nearest live face toward itself instead, so a painted wall is free-slip like the domain edge, whose
+// clamped sampling does the same, and the kernel keeps its full support. The same substitute serves the previous and
+// the projected fields. A face with a wall on one side is the wall's normal face and keeps its stored value.
+ivec2 liveU(ivec2 face, vec2 position) {
+    face = clampU(face);
+    for (int i = 0; i < 3 && blockedCell(face - ivec2(1, 0)) && blockedCell(face); ++i) {
+        vec2 delta = position - vec2(float(face.x), float(face.y) + 0.5);
+        face = clampU(face + (abs(delta.x) > abs(delta.y) ? ivec2(delta.x > 0.0 ? 1 : -1, 0)
+                                                           : ivec2(0, delta.y > 0.0 ? 1 : -1)));
+    }
+    return face;
 }
 
-float sampleVCurrent(ivec2 coord) {
-    ivec2 clamped = clamp(coord, ivec2(0), ivec2(gridSize.x - 1, gridSize.y));
-    return imageLoad(waterVTex, clamped).x;
+ivec2 liveV(ivec2 face, vec2 position) {
+    face = clampV(face);
+    for (int i = 0; i < 3 && blockedCell(face - ivec2(0, 1)) && blockedCell(face); ++i) {
+        vec2 delta = position - vec2(float(face.x) + 0.5, float(face.y));
+        face = clampV(face + (abs(delta.x) > abs(delta.y) ? ivec2(delta.x > 0.0 ? 1 : -1, 0)
+                                                           : ivec2(0, delta.y > 0.0 ? 1 : -1)));
+    }
+    return face;
+}
+
+float sampleUPrev(ivec2 face) {
+    return imageLoad(waterUPrevTex, face).x;
+}
+
+float sampleVPrev(ivec2 face) {
+    return imageLoad(waterVPrevTex, face).x;
+}
+
+float sampleUCurrent(ivec2 face) {
+    return imageLoad(waterUTex, face).x;
+}
+
+float sampleVCurrent(ivec2 face) {
+    return imageLoad(waterVTex, face).x;
 }
 
 float bilerpUCurrent(vec2 position) {
@@ -158,10 +263,10 @@ float bilerpUCurrent(vec2 position) {
     ivec2 base = ivec2(floor(face_pos));
     vec2 frac = fract(face_pos);
 
-    float v00 = sampleUCurrent(base);
-    float v10 = sampleUCurrent(base + ivec2(1, 0));
-    float v01 = sampleUCurrent(base + ivec2(0, 1));
-    float v11 = sampleUCurrent(base + ivec2(1, 1));
+    float v00 = sampleUCurrent(liveU(base, position));
+    float v10 = sampleUCurrent(liveU(base + ivec2(1, 0), position));
+    float v01 = sampleUCurrent(liveU(base + ivec2(0, 1), position));
+    float v11 = sampleUCurrent(liveU(base + ivec2(1, 1), position));
 
     float vx0 = mix(v00, v10, frac.x);
     float vx1 = mix(v01, v11, frac.x);
@@ -173,10 +278,10 @@ float bilerpVCurrent(vec2 position) {
     ivec2 base = ivec2(floor(face_pos));
     vec2 frac = fract(face_pos);
 
-    float v00 = sampleVCurrent(base);
-    float v10 = sampleVCurrent(base + ivec2(1, 0));
-    float v01 = sampleVCurrent(base + ivec2(0, 1));
-    float v11 = sampleVCurrent(base + ivec2(1, 1));
+    float v00 = sampleVCurrent(liveV(base, position));
+    float v10 = sampleVCurrent(liveV(base + ivec2(1, 0), position));
+    float v01 = sampleVCurrent(liveV(base + ivec2(0, 1), position));
+    float v11 = sampleVCurrent(liveV(base + ivec2(1, 1), position));
 
     float vx0 = mix(v00, v10, frac.x);
     float vx1 = mix(v01, v11, frac.x);
@@ -215,10 +320,11 @@ mat2 gatherGridVelocity(vec2 position, out vec2 currentVelocity, out vec2 previo
     for (int j = 0; j < 3; ++j) {
         for (int i = 0; i < 3; ++i) {
             ivec2 face = uBase + ivec2(i, j);
+            ivec2 source = liveU(face, position);
             float weight = uWx[i] * uWy[j];
-            float value = sampleUCurrent(face);
+            float value = sampleUCurrent(source);
             currentVelocity.x += weight * value;
-            previousVelocity.x += weight * sampleUPrev(face);
+            previousVelocity.x += weight * sampleUPrev(source);
             vec2 facePos = vec2(float(face.x), float(face.y) + 0.5);
             vec2 delta = facePos - position;
             cxx += 4.0 * weight * value * delta.x;
@@ -236,10 +342,11 @@ mat2 gatherGridVelocity(vec2 position, out vec2 currentVelocity, out vec2 previo
     for (int j = 0; j < 3; ++j) {
         for (int i = 0; i < 3; ++i) {
             ivec2 face = vBase + ivec2(i, j);
+            ivec2 source = liveV(face, position);
             float weight = vWx[i] * vWy[j];
-            float value = sampleVCurrent(face);
+            float value = sampleVCurrent(source);
             currentVelocity.y += weight * value;
-            previousVelocity.y += weight * sampleVPrev(face);
+            previousVelocity.y += weight * sampleVPrev(source);
             vec2 facePos = vec2(float(face.x) + 0.5, float(face.y));
             vec2 delta = facePos - position;
             cyx += 4.0 * weight * value * delta.x;
@@ -262,9 +369,40 @@ bool invalidMat2(mat2 value) {
     return invalidVec2(value[0]) || invalidVec2(value[1]);
 }
 
+// Sand volume fraction at a position (cell-centred bilinear) and the velocity of the sand there.
+float sampleSand(vec2 position, out vec2 velocity) {
+    vec2 centred = position - vec2(0.5);
+    ivec2 base = ivec2(floor(centred));
+    vec2 f = centred - vec2(base);
+    float fraction = 0.0;
+    vec2 momentum = vec2(0.0);
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 cell = clamp(base + ivec2(i, j), ivec2(0), gridSize - ivec2(1));
+            float occupancy = imageLoad(sandOccupancyTex, cell).x;
+            if (occupancy > 0.0) {
+                float weight = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y) * occupancy;
+                fraction += weight;
+                momentum += weight * imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+            }
+        }
+    }
+    velocity = fraction > 0.0 ? momentum / fraction : vec2(0.0);
+    return fraction;
+}
+
 vec2 cappedVelocity(vec2 value) {
     float speed = length(value);
-    return speed > maxVelocity && speed > 0.0 ? value * (maxVelocity / speed) : value;
+    if (speed > maxVelocity) {
+        speedClamped = true;
+        return value * (maxVelocity / speed);
+    }
+    return value;
+}
+
+vec2 advectionVelocity(vec2 position, vec2 particleVelocity) {
+    ivec2 cell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
+    return cappedVelocity(imageLoad(liquidVolumeTex, cell).x > 0.0 ? sampleProjectedGridVelocity(position) : particleVelocity);
 }
 
 void main() {
@@ -293,6 +431,34 @@ void main() {
     vec2 flip_velocity = velocity + (pic_velocity - prev_grid_velocity);
     velocity = mix(pic_velocity, flip_velocity, clamp(flipBlend, 0.0, 1.0));
 
+    // Drag toward the sand: the equal and opposite exchange of sand_grid_update's water drag.
+    vec2 sandVelocity;
+    float sandFraction = sampleSand(position, sandVelocity);
+    if (sandFraction > 0.0) {
+        velocity = mix(velocity, sandVelocity, 1.0 - exp(-sandDrag * sandFraction * dt));
+    }
+
+    if (oilBuoyancy > 0.0) {
+        // Bilinear oil share at the particle (cell centres), the same for oil and water records alike: a force that
+        // differed per record would build per-record slip, which FLIP keeps.
+        vec2 p = position - 0.5;
+        ivec2 c0 = ivec2(floor(p));
+        vec2 f = p - vec2(c0);
+        float share = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 o = ivec2(i & 1, i >> 1);
+            ivec2 c = clamp(c0 + o, ivec2(0), gridSize - ivec2(1));
+            share += imageLoad(oilTex, c).x * (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        }
+        velocity.y += oilBuoyancy * share * dt;
+    }
+
+    if (bulkDamping > 0.0) {
+        float g = max(length(gravity), 1.0);
+        float support = clamp(length((pic_velocity - prev_grid_velocity) / dt - gravity) / g, 0.0, 1.0);
+        velocity *= exp(-bulkDamping * support * dt);
+    }
+
     // The configured factor is per 1/120 second, matching the original default substep.
     velocity = cappedVelocity(velocity * pow(velocityDamping, 120.0 * dt));
 
@@ -303,18 +469,63 @@ void main() {
         return;
     }
 
-    vec2 advect_v0 = cappedVelocity(sampleProjectedGridVelocity(position));
-    vec2 mid_position = position + advect_v0 * (0.5 * dt);
-    vec2 advect_v1 = cappedVelocity(sampleProjectedGridVelocity(mid_position));
-    vec2 next_position = position + advect_v1 * dt;
-    if (invalidVec2(next_position) || invalidVec2(advect_v0) || invalidVec2(advect_v1)) {
-        atomicAdd(nanInfDetected, 1u);
-        particle.state1.x = 0.0;
-        particles[index] = particle;
-        return;
+    // A pressure substep may carry a particle several cells, so it advects in swept sub-moves of at most advectionCfl
+    // cells, each RK2 through the projected field. Where the grid holds no liquid (a droplet that left its own deposit)
+    // the field is empty and the particle flies ballistically on its own velocity instead.
+    float reach = max(length(velocity), length(sampleProjectedGridVelocity(position))) * dt;
+    int moves = clamp(int(ceil(reach / advectionCfl)), 1, 64);
+    float moveDt = dt / float(moves);
+    for (int move = 0; move < moves; ++move) {
+        vec2 advect_v0 = advectionVelocity(position, velocity);
+        vec2 mid_position = position + advect_v0 * (0.5 * moveDt);
+        // A midpoint inside a wall has no fluid velocity to sample: the second stage reuses the first.
+        if (blockedCell(ivec2(floor(mid_position)))) {
+            mid_position = position;
+        }
+        vec2 advect_v1 = advectionVelocity(mid_position, velocity);
+        if (invalidVec2(advect_v0) || invalidVec2(advect_v1)) {
+            atomicAdd(nanInfDetected, 1u);
+            particle.state1.x = 0.0;
+            particles[index] = particle;
+            return;
+        }
+        moveWithCollisions(position, velocity, affine, advect_v1 * moveDt, 0.0);
     }
-
-    moveWithCollisions(position, velocity, affine, next_position - position, 0.0);
+    if (speedClamped) {
+        atomicAdd(waterVelocityClamped, 1u);
+    }
+    ivec2 finalCell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
+    if (clumpVolume > 0.0 && imageLoad(liquidVolumeTex, finalCell).x > clumpVolume) {
+        // Hashed from the particle's own state, not its slot: slots are reordered nondeterministically.
+        uvec4 bits = floatBitsToUint(vec4(position, velocity));
+        uint h = bits.x * 747796405u + bits.y * 2891336453u + bits.z * 1664525u + bits.w * 22695477u + jitterSeed * 2654435761u;
+        h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+        vec2 jitter = (vec2(float(h & 65535u), float(h >> 16)) / 65536.0 - 0.5) * 0.5;
+        vec2 keptVelocity = velocity;  // a position-only correction: contacts must not change the velocity
+        mat2 keptAffine = affine;
+        moveWithCollisions(position, keptVelocity, keptAffine, jitter, 0.0);
+    }
+    if (oilDrift > 0.0) {
+        // Drift-flux separation: oil slips up through water and water slips down through oil, relative to the shared
+        // flow, at a fixed speed scaled by how much of the other liquid is in this cell or the one it moves into.
+        // A position-only move, like the clump step. (The buoyancy applied to oil records alone instead built
+        // per-record slip under FLIP and shot oil jets out of the pool.)
+        bool oil = particle.state2.z > 0.5;
+        ivec2 cell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
+        float other = 0.0;
+        for (int i = 0; i < 2; ++i) {
+            ivec2 c = cell + ivec2(0, i == 0 ? 0 : (oil ? 1 : -1));
+            if (blockedCell(c)) continue;
+            float share = imageLoad(oilTex, c).x;
+            other = max(other, imageLoad(liquidVolumeTex, c).x * (oil ? 1.0 - share : share));
+        }
+        float drive = clamp(2.0 * other / restVolume, 0.0, 1.0);
+        if (drive > 0.0) {
+            vec2 keptVelocity = velocity;
+            mat2 keptAffine = affine;
+            moveWithCollisions(position, keptVelocity, keptAffine, vec2(0.0, (oil ? 1.0 : -1.0) * oilDrift * drive * dt), 0.0);
+        }
+    }
 
     particle.state0 = vec4(position, velocity);
     particle.state1.zw = vec2(affine[0][0], affine[0][1]);

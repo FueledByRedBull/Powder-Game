@@ -20,6 +20,7 @@ layout(std430, binding = 7) buffer DebugCounters {
 uniform ivec2 gridSize;
 uniform float liquidPhiThreshold;
 uniform float gravityDelta;
+uniform float sandLeak;
 
 bool cellInBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
@@ -30,6 +31,13 @@ bool blocked(ivec2 coord) {
         return true;
     }
     return imageLoad(boundaryTex, coord).r != 0u;
+}
+
+// A face between sand and water (no painted solid) moves with the sand and conducts at a fraction of an open face's rate.
+bool sandFace(ivec2 a, ivec2 b) {
+    uint maskA = imageLoad(boundaryTex, a).r;
+    uint maskB = imageLoad(boundaryTex, b).r;
+    return maskA != 1u && maskB != 1u && (maskA >= 2u || maskB >= 2u);
 }
 
 float pressureAt(ivec2 coord) {
@@ -60,6 +68,8 @@ void main() {
             float p_left = pressureAt(left_cell);
             float p_right = pressureAt(right_cell);
             face_u = imageLoad(waterUFaceSrc, coord).x - (p_right - p_left);
+        } else if (coord.x > 0 && coord.x < gridSize.x && sandFace(left_cell, right_cell)) {
+            face_u = imageLoad(waterUFaceSrc, coord).x - sandLeak * (pressureAt(right_cell) - pressureAt(left_cell));
         }
         imageStore(waterUFaceDst, coord, vec4(checkedHalf(face_u), 0.0, 0.0, 0.0));
     }
@@ -72,6 +82,8 @@ void main() {
             float p_down = pressureAt(down_cell);
             float p_up = pressureAt(up_cell);
             face_v = imageLoad(waterVFaceSrc, coord).x + gravityDelta - (p_up - p_down);
+        } else if (coord.y > 0 && coord.y < gridSize.y && sandFace(down_cell, up_cell)) {
+            face_v = imageLoad(waterVFaceSrc, coord).x - sandLeak * (pressureAt(up_cell) - pressureAt(down_cell));
         }
         imageStore(waterVFaceDst, coord, vec4(checkedHalf(face_v), 0.0, 0.0, 0.0));
     }

@@ -2,67 +2,82 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D rhsTex;
-layout(r32f, binding = 1) uniform readonly image2D pressureSrc;
-layout(r32f, binding = 2) uniform writeonly image2D pressureDst;
-layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+layout(r32f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 1) uniform coherent image2D pressureTex;
+layout(r8ui, binding = 3) uniform readonly uimage2D kindTex;
 
 uniform ivec2 gridSize;
 uniform int boundaryScale;
+// Red-black Gauss-Seidel in place: a sweep updates only cells with (x + y) % 2 == parity,
+// and those read only cells of the other colour.
+uniform int parity;
+// The top edge is open air (zero pressure) instead of a wall.
+uniform int openTop;
+// Conductance of a face into porous sand (kind 4), toward zero pressure; as in the water solve (kSandLeak), it
+// keeps gas sealed inside sand from forming a singular system.
+uniform float sandLeak;
+// Nonzero only for the bottom level, which must fit one 16x16 workgroup.
+uniform int bottomSweeps;
 
-// 0: fluid, 1: physical solid/outside, 2: omitted mixed correction footprint.
-int cellKind(ivec2 coord) {
-    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x || coord.y >= gridSize.y) {
-        return 1;
-    }
-    ivec2 fineMin = coord * boundaryScale;
-    ivec2 fineMax = fineMin + ivec2(boundaryScale);
-    if (any(greaterThan(fineMax, imageSize(boundaryTex)))) {
-        return 1;
-    }
-    bool solid = false;
-    bool fluid = false;
-    for (int y = fineMin.y; y < fineMax.y; ++y) {
-        for (int x = fineMin.x; x < fineMax.x; ++x) {
-            bool occupied = imageLoad(boundaryTex, ivec2(x, y)).r != 0u;
-            solid = solid || occupied;
-            fluid = fluid || !occupied;
-        }
-    }
-    return solid ? (fluid ? 2 : 1) : 0;
+// Height of the finest grid: with an open top it holds zero pressure at its ghost row, fineHeight + 0.5.
+uniform int fineHeight;
+
+// Open top: a level with spacing h reaches that zero from its top centres, (top + 0.5) h fine cells up, so the
+// ghost weighs h / distance (1 on the finest grid; odd levels whose top row straddles the edge weigh more).
+float openTopWeight(int top) {
+    float h = float(boundaryScale);
+    return h / max(float(fineHeight) + 0.5 - (float(top) + 0.5) * h, 0.5);
 }
 
-void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
-    if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
-        return;
-    }
-    if (cellKind(coord) != 0) {
-        imageStore(pressureDst, coord, vec4(0.0));
-        return;
-    }
+// 0: fluid, 1: physical solid/outside, 2: omitted mixed correction footprint.
+// 3: open top (zero pressure).
+uint cellKind(ivec2 coord) {
+    if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x) return 1u;
+    if (coord.y >= gridSize.y) return openTop != 0 ? 3u : 1u;
+    return imageLoad(kindTex, coord).r;
+}
 
+void relaxCell(ivec2 coord, int colour) {
+    if (coord.x >= gridSize.x || coord.y >= gridSize.y || ((coord.x + coord.y) & 1) != colour) {
+        return;
+    }
+    if (cellKind(coord) != 0u) {
+        imageStore(pressureTex, coord, vec4(0.0));
+        return;
+    }
     const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
     float pressure_sum = 0.0;
     float diagonal = 0.0;
     for (int i = 0; i < 4; ++i) {
         ivec2 neighbor = coord + offsets[i];
-        int kind = cellKind(neighbor);
-        if (kind == 0) {
-            pressure_sum += imageLoad(pressureSrc, neighbor).x;
+        uint kind = cellKind(neighbor);
+        if (kind == 0u) {
+            pressure_sum += imageLoad(pressureTex, neighbor).x;
         }
-        // A removed fluid footprint has zero correction, not a new Neumann wall.
-        if (kind != 1) {
+        if (kind == 3u) {
+            diagonal += openTopWeight(gridSize.y - 1);
+        } else if (kind == 0u) {
             diagonal += 1.0;
+        } else if (kind == 4u) {
+            diagonal += sandLeak;
         }
     }
-    float rhs = imageLoad(rhsTex, coord).x;
-    float h = float(boundaryScale);
-    float pressure = 0.0;
-    if (diagonal > 0.0) {
-        float jacobi = (pressure_sum - rhs * h * h) / diagonal;
-        // Damping removes the two-cycle of pure Jacobi on closed fluid regions.
-        pressure = mix(imageLoad(pressureSrc, coord).x, jacobi, 2.0 / 3.0);
+    // Every level uses the unscaled 5-point operator; restriction (weights summing to 4) carries the h^2.
+    float pressure = diagonal > 0.0 ? (pressure_sum - imageLoad(rhsTex, coord).x) / diagonal : 0.0;
+    imageStore(pressureTex, coord, vec4(pressure, 0.0, 0.0, 0.0));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (bottomSweeps == 0) {
+        relaxCell(coord, parity);
+        return;
     }
-    imageStore(pressureDst, coord, vec4(pressure, 0.0, 0.0, 0.0));
+    // Bottom level (one workgroup covers it): bottomSweeps red-black pairs, then as many black-red pairs so the
+    // sequence is symmetric, all in one dispatch.
+    for (int step = 0; step < 4 * bottomSweeps; ++step) {
+        relaxCell(coord, (step & 1) ^ (step < 2 * bottomSweeps ? 0 : 1));
+        memoryBarrierImage();
+        barrier();
+    }
 }

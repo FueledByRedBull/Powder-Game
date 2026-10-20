@@ -3,6 +3,12 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16f, binding = 0) uniform writeonly image2D sandOccupancyTex;
+// Sleeping grains per cell (sand_pack.comp).
+layout(r8ui, binding = 1) uniform readonly uimage2D packedTex;
+// Mean moisture of the cell's sand (moving and packed), drawn darker by composite.frag.
+layout(r8, binding = 2) uniform writeonly image2D sandMoistureTex;
+// Sleeping grains' mean stretch; .z is their mean moisture (sand_pack.comp).
+layout(rgba16f, binding = 3) uniform readonly image2D packedFTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -15,8 +21,14 @@ layout(std430, binding = 0) readonly buffer SandGridMass {
     uint gridMass[];
 };
 
+// Moisture-weighted mass of the occupancy transfer (sand_particle_p2g.comp).
+layout(std430, binding = 1) readonly buffer SandGridMoisture {
+    uint gridMoisture[];
+};
+
 uniform ivec2 gridSize;
 uniform float massScale;
+uniform float referenceDensity;
 
 int linearIndex(ivec2 coord) {
     return (coord.y + 1) * (gridSize.x + 2) + coord.x + 1;
@@ -33,17 +45,42 @@ void main() {
     }
 
     int index = linearIndex(coord);
+    // A packed grain draws like a loose grain anywhere in its cell: the quadratic kernel averaged over the cell,
+    // 1/6, 2/3, 1/6 per axis (a grain at the centre alone would give 1/8, 3/4, 1/8 and a blotchier surface).
+    const float kernel[3] = float[3](1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0);
+    float packedMass = 0.0;
+    float packedMoisture = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 n = coord + ivec2(i, j);
+            if (all(greaterThanEqual(n, ivec2(0))) && all(lessThan(n, gridSize))) {
+                uint count = imageLoad(packedTex, n).r;
+                if (count > 0u) {
+                    float mass = kernel[i + 1] * kernel[j + 1] * float(count);
+                    packedMass += mass;
+                    packedMoisture += mass * imageLoad(packedFTex, n).z;
+                }
+            }
+        }
+    }
     uint massAccum = gridMass[index];
-    if (massAccum == 0u) {
+    if (massAccum == 0u && packedMass == 0.0) {
         imageStore(sandOccupancyTex, coord, vec4(0.0));
+        imageStore(sandMoistureTex, coord, vec4(0.0));
         return;
     }
 
-    float occupancy = clamp(float(massAccum) / massScale, 0.0, 1.0);
-    if (invalid(occupancy)) {
+    // Mass over reference density, so a cell packed at rest density is 1.
+    float mass = float(massAccum) / massScale + packedMass;
+    float occupancy = clamp(mass / referenceDensity, 0.0, 1.0);
+    float movingMoisture = massAccum > 0u ? float(gridMoisture[index]) / massScale : 0.0;
+    float moisture = clamp((movingMoisture + packedMoisture) / mass, 0.0, 1.0);
+    if (invalid(occupancy) || invalid(moisture)) {
         atomicAdd(nanInfDetected, 1u);
         occupancy = 0.0;
+        moisture = 0.0;
     }
 
     imageStore(sandOccupancyTex, coord, vec4(occupancy, 0.0, 0.0, 0.0));
+    imageStore(sandMoistureTex, coord, vec4(moisture, 0.0, 0.0, 0.0));
 }

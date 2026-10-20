@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -47,12 +48,14 @@ struct SandFixture {
     std::vector<GLuint> textures;
     std::vector<GLuint> buffers;
     std::vector<GLuint> programs;
-    GLuint sdf, water, water_velocity, velocity;
-    GLuint particles, mass, momentum_x, momentum_y, counters;
+    GLuint sdf, water, water_velocity, velocity, packed, packed_f, moisture;
+    GLuint particles, mass, momentum_x, momentum_y, moisture_grid, counters;
     GLuint p2g, grid, step;
     int particle_count = 1;
-    float shear_modulus = 20.0F, lame_lambda = 30.0F, friction_alpha = 0.2F;
+    float shear_modulus = 20.0F, lame_lambda = 30.0F, friction_alpha = 0.2F, reference_density = 2.0F;
+    float cohesion = 0.0F, friction_rate_gain = 0.0F;
     float gravity = 0.0F, wall_friction = 0.0F;
+    float drag = 0.0F, buoyancy = 0.0F, water_full_volume = 1.0F;
 
     GLuint Texture(GLenum format, GLenum external, float value = 0.0F, int width = kSize, int height = kSize) {
         GLuint texture = 0;
@@ -87,9 +90,25 @@ struct SandFixture {
         sdf = Texture(GL_R16F, GL_RED, 16.0F);
         water = Texture(GL_R16F, GL_RED);
         water_velocity = Texture(GL_RG16F, GL_RG);
-        velocity = Texture(GL_RG16F, GL_RG, 0.0F, kTransferSize, kTransferSize);
+        velocity = Texture(GL_RG32F, GL_RG, 0.0F, kTransferSize, kTransferSize);
+        // No sleeping sand in these fixtures (sand_pack.comp is exercised by the app lifecycle tests).
+        glGenTextures(1, &packed);
+        textures.push_back(packed);
+        glBindTexture(GL_TEXTURE_2D, packed);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8UI, kSize, kSize);
+        const std::vector<GLubyte> no_packed(kCells, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kSize, kSize, GL_RED_INTEGER, GL_UNSIGNED_BYTE, no_packed.data());
+        glGenTextures(1, &packed_f);
+        textures.push_back(packed_f);
+        glBindTexture(GL_TEXTURE_2D, packed_f);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, kSize, kSize);
+        const std::vector<float> no_stretch(kCells * 4, 0.0F);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kSize, kSize, GL_RGBA, GL_FLOAT, no_stretch.data());
+        moisture = Texture(GL_R8, GL_RED);
         particles = Buffer(16);
         mass = Buffer(kTransferCells);
+        moisture_grid = Buffer(kTransferCells);
         momentum_x = Buffer(kTransferCells * 2);
         momentum_y = Buffer(kTransferCells * 2);
         counters = Buffer(4);
@@ -107,7 +126,6 @@ struct SandFixture {
     }
 
     void Upload(Particle particle) {
-        if (particle[10] == 0.0F) particle[10] = particle[5] / 2.0F;
         if (particle[12] == 0.0F && particle[13] == 0.0F && particle[14] == 0.0F && particle[15] == 0.0F) {
             particle[12] = particle[15] = 1.0F;
         }
@@ -134,11 +152,14 @@ struct SandFixture {
     void Scatter(float dt = 0.0F) {
         const GLuint zero = 0;
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-        for (GLuint buffer : {mass, momentum_x, momentum_y}) {
+        for (GLuint buffer : {mass, momentum_x, momentum_y, moisture_grid}) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
             glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
         }
         glUseProgram(p2g);
+        glUniform1f(glGetUniformLocation(p2g, "referenceDensity"), reference_density);
+        glUniform1i(glGetUniformLocation(p2g, "depositMoisture"), dt == 0.0F ? 1 : 0);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, moisture_grid);
         glUniform2i(glGetUniformLocation(p2g, "gridSize"), kSize, kSize);
         glUniform1i(glGetUniformLocation(p2g, "maxParticles"), particle_count);
         glUniform1f(glGetUniformLocation(p2g, "dt"), dt);
@@ -161,14 +182,17 @@ struct SandFixture {
         glUniform1f(glGetUniformLocation(grid, "dt"), dt);
         glUniform1f(glGetUniformLocation(grid, "gravity"), gravity);
         glUniform1f(glGetUniformLocation(grid, "damping"), damping);
-        glUniform1f(glGetUniformLocation(grid, "drag"), 0.0F);
+        glUniform1f(glGetUniformLocation(grid, "drag"), drag);
+        glUniform1f(glGetUniformLocation(grid, "buoyancy"), buoyancy);
+        glUniform1f(glGetUniformLocation(grid, "waterFullVolume"), water_full_volume);
         glUniform1f(glGetUniformLocation(grid, "wallFriction"), wall_friction);
         glUniform1f(glGetUniformLocation(grid, "massScale"), 4096.0F);
         glUniform1f(glGetUniformLocation(grid, "velocityScale"), 4096.0F);
         Image(0, sdf, GL_READ_ONLY, GL_R16F);
         Image(1, water, GL_READ_ONLY, GL_R16F);
         Image(2, water_velocity, GL_READ_ONLY, GL_RG16F);
-        Image(3, velocity, GL_WRITE_ONLY, GL_RG16F);
+        Image(3, velocity, GL_WRITE_ONLY, GL_RG32F);
+        Image(4, packed, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, momentum_x);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, momentum_y);
@@ -188,8 +212,17 @@ struct SandFixture {
         glUniform1f(glGetUniformLocation(step, "shearModulus"), shear_modulus);
         glUniform1f(glGetUniformLocation(step, "lameLambda"), lame_lambda);
         glUniform1f(glGetUniformLocation(step, "frictionAlpha"), friction_alpha);
+        glUniform1f(glGetUniformLocation(step, "frictionRateGain"), friction_rate_gain);
+        glUniform1f(glGetUniformLocation(step, "inertialI0"), 0.279F);
+        glUniform1f(glGetUniformLocation(step, "grainDiameter"), 0.08F);
+        glUniform1f(glGetUniformLocation(step, "referenceDensity"), reference_density);
+        glUniform1f(glGetUniformLocation(step, "cohesion"), cohesion);
+        glUniform1f(glGetUniformLocation(step, "maxDilation"), 0.15F);  // a round cap for the rheology checks
+        glUniform1f(glGetUniformLocation(step, "waterFullVolume"), water_full_volume);
         Image(0, sdf, GL_READ_ONLY, GL_R16F);
-        Image(1, velocity, GL_READ_ONLY, GL_RG16F);
+        Image(1, velocity, GL_READ_ONLY, GL_RG32F);
+        Image(2, packed, GL_READ_ONLY, GL_R8UI);
+        Image(3, water, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, counters);
         glDispatchCompute((particle_count + 255) / 256, 1, 1);
@@ -209,7 +242,7 @@ void Transfer() {
         SandFixture fixture;
         const Particle before{8.75F, 8.75F, 1.0F, -1.0F, 1.0F, 16.0F,
                               affine ? 0.25F : 0.0F, affine ? -0.5F : 0.0F,
-                              affine ? 0.5F : 0.0F, affine ? 0.25F : 0.0F, 1.0F, 0.0F};
+                              affine ? 0.5F : 0.0F, affine ? 0.25F : 0.0F, 0.0F, 0.0F};
         fixture.Upload(before);
         fixture.Scatter();
         fixture.Grid(1.0F / 60.0F, 1.0F);
@@ -218,7 +251,7 @@ void Transfer() {
         const std::string label = affine ? "affine support" : "constant support";
         std::cout << label << ": velocity=" << after[2] << ',' << after[3]
                   << " C=" << after[6] << ',' << after[7] << ',' << after[8] << ',' << after[9] << '\n';
-        // The reciprocal mass normalization and RG16F grid storage can introduce one half-float ULP.
+        // The reciprocal mass normalization and fixed-point transfer round at the 1e-3 level.
         for (int component : {2, 3, 6, 7, 8, 9}) Near(failures, after[component], before[component], 0.001F, label);
     }
     SandFixture quadratic;
@@ -294,7 +327,12 @@ void Support() {
             glUseProgram(raster);
             glUniform2i(glGetUniformLocation(raster, "gridSize"), kSize, kSize);
             glUniform1f(glGetUniformLocation(raster, "massScale"), 4096.0F);
+            glUniform1f(glGetUniformLocation(raster, "referenceDensity"), 2.0F);
             Image(0, occupancy, GL_WRITE_ONLY, GL_R16F);
+            Image(1, fixture.packed, GL_READ_ONLY, GL_R8UI);
+            Image(2, fixture.moisture, GL_WRITE_ONLY, GL_R8);
+            Image(3, fixture.packed_f, GL_READ_ONLY, GL_RGBA16F);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fixture.moisture_grid);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, fixture.mass);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, fixture.counters);
             glDispatchCompute(1, 1, 1);
@@ -304,7 +342,7 @@ void Support() {
             glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, rendered.data());
             for (int y = 0; y < kSize; ++y) {
                 for (int x = 0; x < kSize; ++x) {
-                    const float expected = std::min(grid_mass[(y + 1) * kTransferSize + x + 1] / 4096.0F, 1.0F);
+                    const float expected = std::min(grid_mass[(y + 1) * kTransferSize + x + 1] / 4096.0F / 2.0F, 1.0F);
                     Near(failures, rendered[y * kSize + x], expected, 0.001F, "physical raster coordinates");
                 }
             }
@@ -367,7 +405,8 @@ void Material() {
     };
     const auto upload = [](SandFixture& fixture, const std::array<float, 4>& f) {
         const MaterialParticle particle{8.5F, 8.5F, 0.0F, 0.0F, 1.0F, 1.0F,
-                                        0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, f[0], f[1], f[2], f[3]};
+                                        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, f[0], f[1], f[2], f[3]};
+        fixture.reference_density = 1.0F;  // unit rest area
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.particles);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(particle), particle.data(), GL_DYNAMIC_READ);
@@ -498,7 +537,8 @@ void Material() {
     MaterialParticle deformed{};
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, deforming.particles);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(deformed), deformed.data());
-    const std::array<float, 4> expected_f{0.796875F, 0.0015625F, 0.0015625F, 0.79375F};
+    // exp(dt grad v) * 0.8 I (the forward-Euler (I + dt grad v) * 0.8 I was 0.796875, 0.0015625, 0.79375).
+    const std::array<float, 4> expected_f{0.7968826F, 0.0015534F, 0.0015534F, 0.7937759F};
     for (int i = 0; i < 4; ++i) Near(failures, deformed[12 + i], expected_f[i], 0.00002F, "velocity-gradient deformation");
 
     for (float normal_velocity : {-4.0F, 4.0F}) {
@@ -547,7 +587,7 @@ void Material() {
     SandFixture dense;
     dense.particle_count = 262144;
     const Particle dense_particle{8.5F, 8.5F, 72.0F, -72.0F, 1.0F, 1.0F,
-                                 0.0F, 0.0F, 0.0F, 0.0F, 0.5F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
+                                 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
     const std::vector<Particle> dense_particles(dense.particle_count, dense_particle);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, dense.particles);
     glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(dense_particles.size() * sizeof(Particle)),
@@ -576,7 +616,7 @@ void Pile() {
     const powder_config::SimulationConfig config;
     const auto make = [](float x, float y, float stretch = 1.0F) {
         return MaterialParticle{x, y, 0.0F, 0.0F, 1.0F, 0.5F, 0.0F, 0.0F,
-                                0.0F, 0.0F, 0.25F, 0.0F, stretch, 0.0F, 0.0F, stretch};
+                                0.0F, 0.0F, 0.0F, 0.0F, stretch, 0.0F, 0.0F, stretch};
     };
     const auto upload = [&](SandFixture& fixture, const std::vector<MaterialParticle>& particles) {
         fixture.particle_count = static_cast<int>(particles.size());
@@ -737,7 +777,7 @@ void Collisions() {
                 SandFixture fixture;
                 if (test.width != kSize) {
                     fixture.sdf = fixture.Texture(GL_R16F, GL_RED, 0.5F, test.width, kSize);
-                    fixture.velocity = fixture.Texture(GL_RG16F, GL_RG, 0.0F, test.width + 2, kTransferSize);
+                    fixture.velocity = fixture.Texture(GL_RG32F, GL_RG, 0.0F, test.width + 2, kTransferSize);
                     fixture.water = fixture.Texture(GL_R16F, GL_RED, 0.0F, test.width, kSize);
                     fixture.water_velocity = fixture.Texture(GL_RG16F, GL_RG, 0.0F, test.width, kSize);
                 }
@@ -785,6 +825,9 @@ void Collisions() {
                     Image(2, v, GL_READ_ONLY, GL_R16F);
                     Image(3, u, GL_READ_ONLY, GL_R16F);
                     Image(4, v, GL_READ_ONLY, GL_R16F);
+                    glUniform1f(glGetUniformLocation(program, "sandDrag"), 0.0F);
+                    Image(5, fixture.velocity, GL_READ_ONLY, GL_RG32F);
+                    Image(6, fixture.water, GL_READ_ONLY, GL_R16F);
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, fixture.particles);
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fixture.counters);
                     glDispatchCompute(1, 1, 1);
@@ -818,17 +861,275 @@ void Collisions() {
     Require(failures.str().empty(), "particle collision mismatch:" + failures.str());
 }
 
+// Submerged sand sinks slower (buoyancy plus drag) and flowing water carries it. The grid applies
+// v' = (v + a dt) exp(-k dt), so the sinking checks compare against that recurrence.
+void Coupling() {
+    std::ostringstream failures;
+    constexpr float dt = 0.001F, gravity = 240.0F, rate = 12.0F, buoyancy = 0.5F;
+    constexpr int steps = 200;
+    const auto run = [&](bool wet, float drag, float flow_x, float g) {
+        SandFixture fixture;
+        fixture.gravity = g;
+        fixture.drag = drag;
+        fixture.buoyancy = buoyancy;
+        if (wet) {
+            fixture.water = fixture.Texture(GL_R16F, GL_RED, 1.0F);
+            fixture.water_velocity = fixture.Texture(GL_RG16F, GL_RG);
+            std::vector<float> flow(static_cast<std::size_t>(kCells * 2), 0.0F);
+            for (int i = 0; i < kCells; ++i) flow[static_cast<std::size_t>(2 * i)] = flow_x;
+            glBindTexture(GL_TEXTURE_2D, fixture.water_velocity);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kSize, kSize, GL_RG, GL_FLOAT, flow.data());
+        }
+        fixture.Upload({8.5F, 12.5F, 0.0F, 0.0F, 1.0F, 1.0F});
+        for (int step = 0; step < steps; ++step) {
+            fixture.Scatter(dt);
+            fixture.Grid(dt, 1.0F);
+            fixture.Step(dt, 1000.0F);
+        }
+        return fixture.Read();
+    };
+    const auto sink_speed = [&](float acceleration, float k) {
+        float speed = 0.0F;
+        for (int step = 0; step < steps; ++step) speed = (speed + acceleration * dt) * std::exp(-k * dt);
+        return speed;
+    };
+    const auto air = run(false, rate, 0.0F, gravity);
+    const auto buoyant = run(true, 0.0F, 0.0F, gravity);
+    const auto sinking = run(true, rate, 0.0F, gravity);
+    const auto carried = run(true, rate, 10.0F, 0.0F);
+    std::cout << "coupling vy air/buoyancy-only/drag+buoyancy=" << air[3] << '/' << buoyant[3] << '/' << sinking[3]
+              << " carried vx=" << carried[2] << '\n';
+    Near(failures, air[3], -gravity * steps * dt, 0.3F, "dry sand ignores the drag");
+    Near(failures, buoyant[3], -gravity * (1.0F - buoyancy) * steps * dt, 0.3F, "buoyancy alone halves the weight");
+    Near(failures, sinking[3], -sink_speed(gravity * (1.0F - buoyancy), rate), 0.2F, "buoyancy and drag follow the recurrence");
+    if (std::abs(sinking[3]) > 0.25F * std::abs(air[3])) failures << " [submerged sand must sink at under a quarter of the dry speed]";
+    Near(failures, carried[2], 10.0F * (1.0F - std::exp(-rate * steps * dt)), 0.1F, "water carries sand toward its velocity");
+    Require(failures.str().empty(), "sand/water grid coupling mismatch:" + failures.str());
+}
+
+// A thin wall removes only the motion into it: sand leaving the wall keeps its speed.
+void ThinWall() {
+    std::ostringstream failures;
+    for (const float vx : {-5.0F, 5.0F}) {
+        SandFixture fixture;
+        std::vector<float> distance(kCells, 0.5F);
+        for (int y = 0; y < kSize; ++y) distance[static_cast<std::size_t>(y * kSize + 8)] = -0.5F;
+        glBindTexture(GL_TEXTURE_2D, fixture.sdf);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kSize, kSize, GL_RED, GL_FLOAT, distance.data());
+        fixture.Upload({7.5F, 8.5F, vx, 0.0F, 1.0F, 1.0F});
+        fixture.Scatter();
+        fixture.Grid(1.0F / 60.0F, 1.0F);
+        std::array<float, kTransferCells * 2> grid{};
+        glBindTexture(GL_TEXTURE_2D, fixture.velocity);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_FLOAT, grid.data());
+        const float wall_node = grid[static_cast<std::size_t>((9 * kTransferSize + 9) * 2)];
+        std::cout << "thin wall node vx=" << wall_node << " for sand velocity " << vx << '\n';
+        Near(failures, wall_node, vx < 0.0F ? vx : 0.0F, 0.01F,
+             vx < 0.0F ? "sand leaving a thin wall keeps its speed" : "sand entering a thin wall stops");
+    }
+    Require(failures.str().empty(), "thin wall separation mismatch:" + failures.str());
+}
+
+// Occupancy is mass over rest density: a cell packed at rest density reads 1 and a lone grain well under half.
+void Occupancy() {
+    std::ostringstream failures;
+    for (const bool packed : {true, false}) {
+        SandFixture fixture;
+        std::vector<Particle> particles;
+        if (packed) {
+            for (int y = 3; y < 13; ++y)
+                for (int x = 3; x < 13; ++x) {
+                    particles.push_back({x + 0.25F, y + 0.25F, 0.0F, 0.0F, 1.0F, 1.0F, 0, 0, 0, 0, 0.5F, 0, 1.0F, 0.0F, 0.0F, 1.0F});
+                    particles.push_back({x + 0.75F, y + 0.75F, 0.0F, 0.0F, 1.0F, 1.0F, 0, 0, 0, 0, 0.5F, 0, 1.0F, 0.0F, 0.0F, 1.0F});
+                }
+        } else {
+            particles.push_back({8.5F, 8.5F, 0.0F, 0.0F, 1.0F, 1.0F, 0, 0, 0, 0, 0.5F, 0, 1.0F, 0.0F, 0.0F, 1.0F});
+        }
+        fixture.particle_count = static_cast<int>(particles.size());
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.particles);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(particles.size() * sizeof(Particle)), particles.data(),
+                     GL_DYNAMIC_READ);
+        fixture.Scatter();
+        const GLuint occupancy = fixture.Texture(GL_R16F, GL_RED);
+        const GLuint raster = fixture.Program("sand_rasterize.comp");
+        glUseProgram(raster);
+        glUniform2i(glGetUniformLocation(raster, "gridSize"), kSize, kSize);
+        glUniform1f(glGetUniformLocation(raster, "massScale"), 4096.0F);
+        glUniform1f(glGetUniformLocation(raster, "referenceDensity"), 2.0F);
+        Image(0, occupancy, GL_WRITE_ONLY, GL_R16F);
+        Image(1, fixture.packed, GL_READ_ONLY, GL_R8UI);
+        Image(2, fixture.moisture, GL_WRITE_ONLY, GL_R8);
+        Image(3, fixture.packed_f, GL_READ_ONLY, GL_RGBA16F);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, fixture.moisture_grid);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, fixture.mass);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, fixture.counters);
+        glDispatchCompute(1, 1, 1);
+        Barrier();
+        std::array<float, kCells> field{};
+        glBindTexture(GL_TEXTURE_2D, occupancy);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, field.data());
+        const float centre = field[8 * kSize + 8];
+        std::cout << (packed ? "packed" : "lone grain") << " centre occupancy=" << centre << '\n';
+        if (packed) Near(failures, centre, 1.0F, 0.03F, "a cell at rest density is full");
+        else Near(failures, centre, 0.5625F / 2.0F, 0.005F, "a lone grain fills under a third of its cell");
+    }
+    Require(failures.str().empty(), "sand occupancy units mismatch:" + failures.str());
+}
+
+// An inverted deformation is counted, reset to its rotation and the particle keeps moving; its mass still
+// reaches the grid.
+void Repair() {
+    SandFixture fixture;
+    fixture.Upload({8.5F, 8.5F, 2.0F, 0.0F, 1.0F, 1.0F, 0, 0, 0, 0, 0.5F, 0, 1.0F, 0.0F, 0.0F, -1.0F});
+    fixture.Scatter(0.001F);
+    std::array<GLuint, kTransferCells> grid_mass{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.mass);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(grid_mass), grid_mass.data());
+    double mass = 0.0;
+    for (GLuint value : grid_mass) mass += value / 4096.0;
+    fixture.Grid(0.001F, 1.0F);
+    fixture.Step(0.001F, 1000.0F);
+    Particle particle{};
+    std::array<GLuint, 4> counters{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.particles);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(particle), particle.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.counters);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counters), counters.data());
+    std::cout << "repair mass=" << mass << " x=" << particle[0] << " F=" << particle[12] << ',' << particle[13] << ','
+              << particle[14] << ',' << particle[15] << " counted=" << counters[0] << '\n';
+    std::ostringstream failures;
+    Near(failures, static_cast<float>(mass), 1.0F, 0.002F, "inverted particle keeps its grid mass");
+    Near(failures, particle[0], 8.502F, 0.0005F, "inverted particle still advances");
+    Near(failures, particle[12] * particle[15] - particle[13] * particle[14], 1.0F, 0.0001F, "repaired deformation is a rotation");
+    if (particle[4] < 0.5F || counters[0] != 2U) failures << " [repair must keep the particle and count both events: " << counters[0] << ']';
+    Require(failures.str().empty(), "sand deformation repair mismatch:" + failures.str());
+}
+
+// A grain hitting a resting pile at the realism-pass speeds sees dt |grad v| above 1 within one advective substep:
+// the forward-Euler update I + dt grad(v) inverted F (24 counted failures in the sand replay). The exponential
+// update keeps det F = exp(dt trace) > 0.
+void Impact() {
+    SandFixture fixture;
+    fixture.shear_modulus = 196000.0F;
+    fixture.lame_lambda = 196000.0F;
+    fixture.friction_alpha = 0.6F;
+    std::vector<float> velocity(kTransferCells * 2, 0.0F);
+    for (int y = 0; y < kTransferSize; ++y)
+        for (int x = 0; x < kTransferSize; ++x) velocity[static_cast<std::size_t>(2 * (y * kTransferSize + x))] = x <= 9 ? 1500.0F : -1500.0F;
+    glBindTexture(GL_TEXTURE_2D, fixture.velocity);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kTransferSize, kTransferSize, GL_RG, GL_FLOAT, velocity.data());
+    fixture.Upload({8.5F, 8.5F, 1500.0F, 0.0F, 1.0F, 1.0F});
+    const float dt = 1.0F / 60.0F / 23.0F;  // the default 23 wave substeps
+    fixture.Step(dt, 2400.0F);
+    const Particle particle = fixture.Read();  // requires finite state, a live particle and zero counters
+    const float det = particle[12] * particle[15] - particle[13] * particle[14];
+    std::cout << "impact dt*dvx/dx=" << dt * -1500.0F << " F=" << particle[12] << ',' << particle[13] << ','
+              << particle[14] << ',' << particle[15] << " det=" << det << '\n';
+    Require(det > 0.0F && det < 1.0F, "impact must compress F without inverting it");
+}
+
+// Volume correction and cohesion in the plastic projection (dt 0, so the trial state is the stored one). Dry sand pulled
+// apart is stress-free and remembers the dilation; recompressing first spends it. Damp sand separates like dry sand in
+// tension (tension cut-off) but holds a shear that dry sand yields under.
+void Rheology() {
+    std::ostringstream failures;
+    const auto project = [](float log_x, float log_y, float volume_correction, float moisture, float cohesion) {
+        SandFixture fixture;
+        fixture.cohesion = cohesion;
+        fixture.Upload({8.5F, 8.5F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, volume_correction, moisture,
+                        std::exp(log_x), 0.0F, 0.0F, std::exp(log_y)});
+        fixture.Step(0.0F, 1000.0F);
+        return fixture.Read();
+    };
+    const auto check = [&](const char* label, const Particle& p, float x, float y, float volume_correction) {
+        std::cout << "rheology " << label << ": F=" << p[12] << ',' << p[15] << " volume correction=" << p[10] << '\n';
+        Near(failures, p[12], x, 1e-5F, std::string(label) + " F xx");
+        Near(failures, p[15], y, 1e-5F, std::string(label) + " F yy");
+        Near(failures, p[10], volume_correction, 1e-5F, std::string(label) + " volume correction");
+    };
+    check("dry tension", project(0.02F, 0.02F, 0.0F, 0.0F, 0.06F), 1.0F, 1.0F, 0.04F);
+    check("dilation memory is capped", project(0.2F, 0.2F, 0.0F, 0.0F, 0.06F), 1.0F, 1.0F, 0.15F);
+    check("recompression spends dilation", project(-0.01F, -0.01F, 0.04F, 0.0F, 0.06F), 1.0F, 1.0F, 0.02F);
+    check("compression past dilation", project(-0.03F, -0.03F, 0.04F, 0.0F, 0.06F), std::exp(-0.01F), std::exp(-0.01F), 0.0F);
+    check("damp tension separates", project(0.02F, 0.02F, 0.0F, 0.5F, 0.06F), 1.0F, 1.0F, 0.04F);
+    // Trace -0.04, deviatoric norm 0.028: dry allows (lambda + mu) / mu alpha 0.04 = 0.02, damp 0.05.
+    check("damp shear holds", project(0.0F, -0.04F, 0.0F, 0.5F, 0.06F), 1.0F, std::exp(-0.04F), 0.0F);
+    const Particle dry = project(0.0F, -0.04F, 0.0F, 0.0F, 0.06F);
+    Near(failures, std::log(dry[12]) - std::log(dry[15]), 0.02F * std::sqrt(2.0F), 1e-4F, "dry shear yields to the cone");
+    const Particle saturated = project(0.0F, -0.04F, 0.0F, 0.999F, 0.06F);
+    if (std::log(saturated[12]) - std::log(saturated[15]) > 0.03F) failures << " [saturated sand kept its cohesion]";
+    const Particle trait = project(0.0F, 0.0F, 0.0F, -3.0F + 0.25F, 0.0F);
+    Near(failures, trait[11], -2.75F, 0.0F, "trait and moisture packing survives the step");
+    Require(failures.str().empty(), "sand rheology mismatch:" + failures.str());
+}
+
+// A swept contact's hit point can round a few ulps into the next cell (ulp 6e-5 at x 512-1024), which may be a wall:
+// the grain then starts its next move inside it and freezes. Grains in a one-cell wall checkerboard at x >= 600 aim
+// diagonally at a cell corner, where the two crossing times differ by rounding only; none may end inside a wall.
+void WallRounding() {
+    constexpr int width = 1000, count = 4096;
+    std::vector<float> boundary(static_cast<std::size_t>(width * kSize));
+    const auto solid = [](int x, int y) { return y < 1 || y >= kSize - 1 || (x >= 600 && (x + y) % 2 == 0); };
+    for (int y = 0; y < kSize; ++y)
+        for (int x = 0; x < width; ++x) boundary[static_cast<std::size_t>(y * width + x)] = solid(x, y) ? -0.5F : 0.5F;
+    int stuck = 0, moved = 0;
+    std::uint32_t seed = 12345U;
+    const auto next = [&]() { seed = seed * 1664525U + 1013904223U; return static_cast<float>(seed >> 8) / 16777216.0F; };
+    for (int direction = 0; direction < 4; ++direction) {
+        const float sx = direction % 2 == 0 ? 1.0F : -1.0F, sy = direction < 2 ? 1.0F : -1.0F;
+        SandFixture fixture;
+        fixture.particle_count = count;
+        fixture.sdf = fixture.Texture(GL_R16F, GL_RED, 0.5F, width, kSize);
+        glBindTexture(GL_TEXTURE_2D, fixture.sdf);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, kSize, GL_RED, GL_FLOAT, boundary.data());
+        const float vx = 30.0F * sx, vy = 30.0F * sy;
+        fixture.velocity = fixture.Texture(GL_RG32F, GL_RG, 0.0F, width + 2, kTransferSize);
+        std::vector<float> field(static_cast<std::size_t>((width + 2) * kTransferSize * 2));
+        for (std::size_t i = 0; i < field.size(); i += 2) { field[i] = vx; field[i + 1] = vy; }
+        glBindTexture(GL_TEXTURE_2D, fixture.velocity);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width + 2, kTransferSize, GL_RG, GL_FLOAT, field.data());
+        std::vector<Particle> particles;
+        while (static_cast<int>(particles.size()) < count) {
+            const int cx = 600 + static_cast<int>(next() * 399.0F), cy = 1 + static_cast<int>(next() * 14.0F);
+            if (solid(cx, cy)) continue;
+            // Aim at the cell's corner along the diagonal: both crossings fall at the same exact time.
+            const float u = 0.05F + 0.9F * next();
+            const float x = static_cast<float>(cx + (sx > 0.0F ? 1 : 0)) - sx * u;
+            const float y = static_cast<float>(cy + (sy > 0.0F ? 1 : 0)) - sy * u;
+            particles.push_back({x, y, vx, vy, 1.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F});
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.particles);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(particles.size() * sizeof(Particle)), particles.data(),
+                     GL_DYNAMIC_READ);
+        fixture.Step(1.0F / 30.0F, 1000000.0F, 1.0F, 0.0F, width);
+        std::vector<Particle> result(particles.size());
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, fixture.particles);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(result.size() * sizeof(Particle)), result.data());
+        for (std::size_t i = 0; i < result.size(); ++i) {
+            const auto& p = result[i];
+            Require(std::isfinite(p[0]) && std::isfinite(p[1]) && p[4] > 0.5F, "wall rounding fixture lost a grain");
+            stuck += solid(static_cast<int>(std::floor(p[0])), static_cast<int>(std::floor(p[1])));
+            moved += p[0] != particles[i][0] || p[1] != particles[i][1];
+        }
+    }
+    std::cout << "wall rounding: grains inside a wall after one step=" << stuck << " moved=" << moved << '/' << 4 * count << '\n';
+    Require(moved > 2 * count, "the wall rounding grains must move");
+    Require(stuck == 0, "a swept sand grain finished inside a wall cell");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string selected = argc > 1 ? argv[1] : "all";
-    const std::array<std::pair<const char*, void (*)()>, 6> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 13> tests{{
         {"transfer", Transfer}, {"integration", Integration}, {"support", Support}, {"material", Material},
-        {"pile", Pile}, {"collisions", Collisions}}};
+        {"pile", Pile}, {"collisions", Collisions}, {"coupling", Coupling}, {"thin-wall", ThinWall},
+        {"occupancy", Occupancy}, {"repair", Repair}, {"impact", Impact}, {"rheology", Rheology}, {"wall-rounding", WallRounding}}};
     if (argc > 2 || (selected != "all" && std::none_of(tests.begin(), tests.end(), [&](const auto& test) {
                         return selected == test.first;
                     }))) {
-        std::cerr << "Usage: powder_sand_tests [all|transfer|integration|support|material|pile|collisions]\n";
+        std::cerr << "Usage: powder_sand_tests [all|transfer|integration|support|material|pile|collisions|coupling|thin-wall|occupancy|repair|impact|rheology|wall-rounding]\n";
         return 2;
     }
     GLFWwindow* window = nullptr;

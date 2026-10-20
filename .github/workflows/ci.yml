@@ -81,19 +81,17 @@ jobs:
             "- Double-click powder_game.exe",
             "",
             "Controls:",
-            "- 1: Sand brush",
-            "- 2: Water brush",
-            "- 3: Solid brush",
-            "- 4: Erase brush",
-            "- 5: Smoke brush",
-            "- 6: Fire brush",
-            "- [ / ]: Decrease / increase brush radius",
+            "- 1: Sand, 2: Water, 3: Solid, 4: Erase",
+            "- 5: Smoke, 6: Fire, 7: Wood, 8: Oil",
+            "- [ / ]: Decrease / increase brush radius (1 to 96)",
             "- Left mouse: paint",
+            "- H: show / hide the on-screen help",
+            "- F1: normal view; F2-F10: debug views",
             "- Esc: quit",
             "",
             "Notes:",
-            "- Keep the shaders/ folder next to powder_game.exe.",
-            "- Requires a GPU/driver with OpenGL 4.3+ support."
+            "- Keep the shaders/ folder and DLLs next to powder_game.exe.",
+            "- Requires OpenGL 4.3 and the resource limits listed in the source README."
           )
           $readme | Set-Content -Path (Join-Path $outDir "README.txt")
 

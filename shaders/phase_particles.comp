@@ -1,0 +1,109 @@
+#version 430
+
+// Phase changes of the liquid particles, one invocation per water record (oil is a water record with state2.z = 1).
+// A particle at the free surface under hot gas or flame leaves the pool: water evaporates into steam, oil burns into
+// fuel vapour. Both are explicit sinks: each removed record is counted in PhaseSinks. Evaporated water reaches its gas
+// cell (the one above the particle) through gasSources as steam; a lit oil record (state2.w) feeds that gas cell fuel
+// vapour every tick until it is consumed or goes out. Survivors are tallied per cell (oil and all)
+// for oil_field.comp.
+layout(local_size_x = 256) in;
+
+layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
+layout(r16f, binding = 1) uniform readonly image2D liquidVolumeTex;
+layout(r16f, binding = 2) uniform readonly image2D temperatureTex;  // gas grid
+layout(rg16f, binding = 3) uniform readonly image2D reactionTex;    // gas grid, y is the flame
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+// Per simulation cell: oil records, then all records.
+layout(std430, binding = 1) buffer PhaseCells {
+    uint cellCounts[];
+};
+
+// Per gas cell: evaporated water records, then lit oil records.
+layout(std430, binding = 2) buffer GasSources {
+    uint gasSources[];
+};
+
+// Cumulative since the last reset; the host reads them to account for the mass that left the pools.
+layout(std430, binding = 3) buffer PhaseSinks {
+    uint evaporatedWater;
+    uint burnedOil;
+};
+
+uniform ivec2 gridSize;
+uniform ivec2 gasSize;
+uniform int maxParticles;
+uniform float dt;
+uniform uint seed;
+uniform float evaporateRate;  // 1/s for surface water under gas at full heat
+uniform float burnRate;       // 1/s for surface oil above its ignition temperature
+uniform float ignitionTemperature;
+uniform float restVolume;  // liquid volume of a cell at rest density
+
+// Open air next to the particle: a cell that is neither wall nor liquid.
+bool airCell(ivec2 cell) {
+    return all(greaterThanEqual(cell, ivec2(0))) && all(lessThan(cell, gridSize)) &&
+           imageLoad(boundaryMaskTex, cell).x == 0u && imageLoad(liquidVolumeTex, cell).x < 0.3 * restVolume;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(maxParticles)) {
+        return;
+    }
+    WaterParticle particle = particles[index];
+    if (particle.state1.x < 0.5) {
+        return;
+    }
+    ivec2 cell = clamp(ivec2(floor(particle.state0.xy)), ivec2(0), gridSize - ivec2(1));
+    bool oil = particle.state2.z > 0.5;
+
+    // Exposed: open air above or beside it (the top of a pool, the edges of a falling stream).
+    bool lit = particle.state2.w > 0.5;
+    bool burning = false;
+    if (airCell(cell + ivec2(0, 1)) || airCell(cell + ivec2(1, 0)) || airCell(cell - ivec2(1, 0))) {
+        ivec2 gas = clamp((cell + ivec2(0, 2)) / 2, ivec2(0), gasSize - ivec2(1));
+        int gasLinear = gas.y * gasSize.x + gas.x;
+        // Heat and flame within four gas cells (8 cells, 4 cm) above: a flame heats the surface below it by radiation.
+        float hot = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 g = min(gas + ivec2(0, i), gasSize - ivec2(1));
+            hot = max(hot, max(imageLoad(temperatureTex, g).x, imageLoad(reactionTex, g).y));
+        }
+        // Oil catches at the ignition temperature and, once lit, burns while its flame keeps the gas above it hot;
+        // a lit record feeds its gas cell every tick (steam_update.comp), like burning wood.
+        burning = oil && hot >= ignitionTemperature - (lit ? 0.1 : 0.0);
+        if (burning) atomicAdd(gasSources[2 * gasLinear + 1], 1u);
+        float rate = oil ? (burning ? burnRate : 0.0) : evaporateRate * smoothstep(0.25, 0.7, hot);
+        if (rate > 0.0) {
+            // Hashed from the particle's own state, not its slot: slots are reordered nondeterministically.
+            uvec4 bits = floatBitsToUint(particle.state0);
+            uint h = bits.x * 747796405u + bits.y * 2891336453u + bits.z * 1664525u + bits.w * 22695477u + seed * 2654435761u;
+            h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+            if (float(h & 0xFFFFFFu) / 16777216.0 < 1.0 - exp(-rate * dt)) {
+                particles[index].state1.x = 0.0;
+                if (oil) {
+                    atomicAdd(burnedOil, 1u);
+                } else {
+                    atomicAdd(gasSources[2 * gasLinear], 1u);
+                    atomicAdd(evaporatedWater, 1u);
+                }
+                return;
+            }
+        }
+    }
+    // Covered (by liquid, sand or a wall) or cooled, a lit record goes out.
+    if (burning != lit) particles[index].state2.w = burning ? 1.0 : 0.0;
+    int linear = cell.y * gridSize.x + cell.x;
+    if (oil) atomicAdd(cellCounts[2 * linear], 1u);
+    atomicAdd(cellCounts[2 * linear + 1], 1u);
+}

@@ -24,6 +24,10 @@ uniform float residualThreshold;
 uniform int useLiquidMask;
 uniform float liquidPhiThreshold;
 uniform int collectStats;
+uniform float sandLeak;
+uniform int openTop;
+// Gas: dense sand (gas mask 3) conducts at sandLeak like the water solve's sand walls.
+uniform int porousSand;
 
 bool blockedCell(ivec2 coord) {
     if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x || coord.y >= gridSize.y) {
@@ -68,7 +72,17 @@ vec4 residualStats(ivec2 coord) {
     bool invalid_input = invalid(rhs) || invalid(pressure);
     for (int i = 0; i < 4; ++i) {
         ivec2 neighbor = coord + offsets[i];
+        // Open top (gas only): zero pressure beyond the top edge.
+        if (openTop != 0 && neighbor.y >= gridSize.y) {
+            diagonal += 1.0;
+            continue;
+        }
         if (blockedCell(neighbor)) {
+            // Water's sand walls leak (see pressure_cg.comp); the gas solve has none.
+            if ((useLiquidMask != 0 || porousSand != 0) && neighbor.x >= 0 && neighbor.y >= 0 && neighbor.x < gridSize.x &&
+                neighbor.y < gridSize.y && imageLoad(boundaryTex, neighbor).r >= 2u) {
+                diagonal += sandLeak;
+            }
             continue;
         }
         diagonal += 1.0;

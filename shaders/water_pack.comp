@@ -1,0 +1,155 @@
+#version 430
+
+// Calm-water packing per cell. A packed cell stores its particles as an integer count (bits 0-6); water_mac_build.comp
+// deposits it as rest-density water at rest. Each phase reads the previous state and writes only its own cell, so no rule has a
+// sideways order:
+//   0 (tick start, after water_sleep.comp): a cell holding the rest count +-1 of particles, all still, deep inside
+//     liquid (7x7 liquid, no wall or sand) is flagged to pack; compaction drops exactly its tallied particles.
+//   1 (after compaction): flagged cells store their count; cells flagged to wake (bit 7) turn back into particles.
+//   2 (after the tick's last projection): a packed cell is flagged to wake (bit 7) when a face of it moves faster than
+//     wakeSpeed or a non-liquid, wall or sand cell comes within 2 cells; it keeps the projected cell velocity.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r8ui, binding = 0) uniform uimage2D packedTex;
+layout(rg16f, binding = 1) uniform image2D wakeVelocityTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(r16f, binding = 3) uniform readonly image2D waterUFaceTex;
+layout(r16f, binding = 4) uniform readonly image2D waterVFaceTex;
+
+struct WaterParticle {
+    vec4 state0;
+    vec4 state1;
+    vec4 state2;
+};
+
+layout(std430, binding = 0) buffer WaterParticles {
+    WaterParticle particles[];
+};
+
+layout(std430, binding = 1) buffer WaterCellTally {
+    uint tally[];
+};
+
+// Particle-equivalents per cell (x weightScale) of the last particle-field build, packed cells included.
+layout(std430, binding = 2) readonly buffer WaterCellCounts {
+    uint counts[];
+};
+
+layout(std430, binding = 3) buffer WaterSpawnCursor {
+    uint spawnCursor;
+    uint fastestSpeedBits;
+};
+
+layout(std430, binding = 7) buffer DebugCounters {
+    uint nanInfDetected;
+    uint particleOverflowBlocked;
+    uint pressureNonconverged;
+    uint inactiveTileMisses;
+};
+
+uniform ivec2 gridSize;
+uniform int phase;
+uniform int restCount;
+uniform float liquidCount;  // x weightScale: a cell at least this full is liquid
+uniform float wakeSpeed;
+uniform float particleMass;
+uniform int maxParticles;
+uniform uint seed;
+
+const uint kPack = 1u << 31;
+const uint kWake = 128u;
+
+bool inside(ivec2 c) {
+    return all(greaterThanEqual(c, ivec2(0))) && all(lessThan(c, gridSize));
+}
+
+int cellIndex(ivec2 c) {
+    return c.y * gridSize.x + c.x;
+}
+
+bool liquid(ivec2 c) {
+    return inside(c) && imageLoad(boundaryTex, c).r == 0u && float(counts[cellIndex(c)]) >= liquidCount;
+}
+
+bool deepLiquid(ivec2 c, int radius) {
+    for (int j = -radius; j <= radius; ++j) {
+        for (int i = -radius; i <= radius; ++i) {
+            if (!liquid(c + ivec2(i, j))) return false;
+        }
+    }
+    return true;
+}
+
+uint hashBits(uvec3 v) {
+    uint h = v.x * 1664525u + v.y * 22695477u + v.z * 2654435761u + seed * 2246822519u;
+    h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+    return h;
+}
+
+vec2 uniform2(uvec3 v) {
+    uint h = hashBits(v);
+    return vec2(float(h & 65535u), float(h >> 16)) / 65536.0;
+}
+
+void decidePack(ivec2 c) {
+    uint t = tally[cellIndex(c)];
+    uint total = t & 4095u;
+    // Rest count +-1: settled water holds 3 to 5 particles in most cells (exactly 4 in under a third).
+    if (imageLoad(packedTex, c).r != 0u || abs(int(total) - restCount) > 1 || total == 0u || ((t >> 12) & 4095u) != total) return;
+    // One cell more margin than the wake test, so a cell that packs is not woken by the same surface.
+    if (deepLiquid(c, 3)) atomicOr(tally[cellIndex(c)], kPack);
+}
+
+void apply(ivec2 c) {
+    uint t = tally[cellIndex(c)];
+    uint value = imageLoad(packedTex, c).r;
+    if ((t & kPack) != 0u) {
+        imageStore(packedTex, c, uvec4(t & 4095u));
+        return;
+    }
+    if ((value & kWake) == 0u) return;
+    uint packed = value & 127u;
+    // All of the cell's particles or none: a full pool leaves it packed (no loss), counts the overflow and retries. One
+    // atomicAdd per cell (a compare-swap loop serialised mass wakes); slots a failed reservation leaves below the cap
+    // keep the inactive records compaction left there, and the host clamps the cursor to the pool.
+    uint slot = atomicAdd(spawnCursor, packed);
+    if (slot + packed > uint(maxParticles)) {
+        atomicAdd(particleOverflowBlocked, 1u);
+        return;
+    }
+    vec2 velocity = imageLoad(wakeVelocityTex, c).xy;
+    atomicMax(fastestSpeedBits, floatBitsToUint(length(velocity)));
+    for (uint i = 0u; i < packed; ++i) {
+        // One particle per quarter of the cell in turn, jittered within it: uniform positions would wake as the
+        // seeding noise the density correction then has to remove.
+        vec2 quarter = vec2(float(i & 1u), float((i >> 1) & 1u));
+        particles[slot + i].state0 = vec4(vec2(c) + 0.5 * (quarter + uniform2(uvec3(uvec2(c), i))), velocity);
+        particles[slot + i].state1 = vec4(1.0, particleMass, 0.0, 0.0);
+        particles[slot + i].state2 = vec4(0.0);
+    }
+    imageStore(packedTex, c, uvec4(0u));
+}
+
+void decideWake(ivec2 c) {
+    uint value = imageLoad(packedTex, c).r;
+    if (value == 0u || (value & kWake) != 0u) return;
+    float uLeft = imageLoad(waterUFaceTex, c).x;
+    float uRight = imageLoad(waterUFaceTex, c + ivec2(1, 0)).x;
+    float vDown = imageLoad(waterVFaceTex, c).x;
+    float vUp = imageLoad(waterVFaceTex, c + ivec2(0, 1)).x;
+    float fastest = max(max(abs(uLeft), abs(uRight)), max(abs(vDown), abs(vUp)));
+    if (fastest > wakeSpeed || !deepLiquid(c, 2)) {
+        imageStore(packedTex, c, uvec4(value | kWake));
+        imageStore(wakeVelocityTex, c, vec4(0.5 * (uLeft + uRight), 0.5 * (vDown + vUp), 0.0, 0.0));
+    }
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside(c)) {
+        return;
+    }
+    if (phase == 0) decidePack(c);
+    else if (phase == 1) apply(c);
+    else decideWake(c);
+}

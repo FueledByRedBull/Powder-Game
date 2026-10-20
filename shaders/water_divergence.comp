@@ -7,6 +7,13 @@ layout(r16f, binding = 1) uniform readonly image2D waterVFaceTex;
 layout(r16f, binding = 2) uniform writeonly image2D divergenceTex;
 layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
 layout(r16f, binding = 4) uniform readonly image2D liquidPhiTex;
+// Packed calm water (water_pack.comp, bits 0-6 a count): packed cells and their neighbours, whose counts the packed
+// deposit shapes, take no density correction, so packing is not itself a density error that drives flow.
+layout(r8ui, binding = 5) uniform readonly uimage2D waterPackedTex;
+
+layout(std430, binding = 0) readonly buffer WaterCellCounts {
+    uint counts[];
+};
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -18,17 +25,57 @@ layout(std430, binding = 7) buffer DebugCounters {
 uniform ivec2 gridSize;
 uniform float liquidPhiThreshold;
 uniform float gravityDelta;
+uniform float weightScale;
+// Particle mass per cell at rest, and the rate (1/s) at which a cell's density error is relaxed.
+uniform float restDensity;
+uniform float densityRate;
+
+// Largest density error (relative to rest) the correction acts on, so a source that overfills a cell is not blown out.
+const float kMaxDensityError = 0.5;
+// A cell is inside the bulk when every neighbour holds at least this share of the rest density (or is a wall).
+const float kBulkDensity = 0.75;
+
+bool nearPacked(ivec2 coord) {
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 n = clamp(coord + ivec2(i, j), ivec2(0), gridSize - ivec2(1));
+            if ((imageLoad(waterPackedTex, n).r & 127u) != 0u) return true;
+        }
+    }
+    return false;
+}
 
 bool liquidCell(ivec2 coord) {
     return imageLoad(liquidPhiTex, coord).x < liquidPhiThreshold;
 }
 
+float densityError(ivec2 coord) {
+    return float(counts[coord.y * gridSize.x + coord.x]) / (weightScale * restDensity) - 1.0;
+}
+
+// Liquid lies above (or a wall caps it): a deficit here is a void inside the body, an air pocket that splashes trap.
+// The free surface and sparse spray have air above, so they only ever expand. (Requiring every neighbour to be
+// nearly full, as before, left clusters of entrained voids at real gravity: a dam break kept 24% voids.)
+bool bulkCell(ivec2 coord) {
+    ivec2 above = coord + ivec2(0, 1);
+    if (above.y >= gridSize.y || imageLoad(boundaryTex, above).r != 0u) {
+        return true;
+    }
+    return densityError(above) + 1.0 >= kBulkDensity;
+}
+
 float forcedV(ivec2 face) {
-    if (face.y == 0 || face.y == gridSize.y ||
-        imageLoad(boundaryTex, face - ivec2(0, 1)).r != 0u || imageLoad(boundaryTex, face).r != 0u) {
+    if (face.y == 0 || face.y == gridSize.y) {
         return 0.0;
     }
-    return imageLoad(waterVFaceTex, face).x + gravityDelta;
+    uint below = imageLoad(boundaryTex, face - ivec2(0, 1)).r;
+    uint above = imageLoad(boundaryTex, face).r;
+    if (below == 1u || above == 1u) {
+        return 0.0;
+    }
+    // A face of moving sand keeps the sand velocity water_mac_build gave it; gravity acts only on open faces.
+    float stored = imageLoad(waterVFaceTex, face).x;
+    return below != 0u || above != 0u ? stored : stored + gravityDelta;
 }
 
 void main() {
@@ -48,6 +95,11 @@ void main() {
     float v_up = forcedV(ivec2(coord.x, coord.y + 1));
 
     float divergence = (u_right - u_left) + (v_up - v_down);
+    // Particles drift out of a divergence-free flow's volume. A cell holding too many is asked to expand (a positive target
+    // divergence, so a negative term here) and a void inside the bulk to contract, which also pins the pool level to the
+    // particle count. The free surface only ever expands: its partly filled cells are not voids.
+    float error = clamp(densityError(coord), bulkCell(coord) ? -kMaxDensityError : 0.0, kMaxDensityError);
+    if (!nearPacked(coord)) divergence -= densityRate * error;
     if (isnan(divergence) || isinf(divergence) || abs(divergence) > 65504.0) {
         atomicAdd(nanInfDetected, 1u);
         divergence = 0.0;

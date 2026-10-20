@@ -5,7 +5,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
 layout(r16f, binding = 1) uniform readonly image2D waterAmountTex;
 layout(rg16f, binding = 2) uniform readonly image2D waterVelocityTex;
-layout(rg16f, binding = 3) uniform writeonly image2D sandVelocityTex;
+layout(rg32f, binding = 3) uniform writeonly image2D sandVelocityTex;
+// Sleeping grains per cell (sand_pack.comp): a packed cell is a wall to the moving sand.
+layout(r8ui, binding = 4) uniform readonly uimage2D packedTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -27,10 +29,17 @@ layout(std430, binding = 2) readonly buffer SandGridMomentumY {
 };
 
 uniform ivec2 gridSize;
+// First node of the dispatched box (the host covers the live grains' box); zero dispatches from the halo corner.
+uniform ivec2 nodeOrigin;
 uniform float dt;
 uniform float gravity;
 uniform float damping;
+// Rate (1/s) at which fully submerged sand relaxes toward the water velocity.
 uniform float drag;
+// Water density over sand density: the share of its weight submerged sand loses.
+uniform float buoyancy;
+// Liquid volume of a cell that counts as full of water.
+uniform float waterFullVolume;
 uniform float wallFriction;
 uniform float massScale;
 uniform float velocityScale;
@@ -41,6 +50,12 @@ int linearIndex(ivec2 coord) {
 
 ivec2 clampCell(ivec2 coord) {
     return clamp(coord, ivec2(0), gridSize - ivec2(1));
+}
+
+// Static walls and packed sand as -0.5, open cells as 0.5; the domain edge is handled separately.
+float packedField(ivec2 cell) {
+    ivec2 c = clampCell(cell);
+    return imageLoad(boundarySdfTex, c).x <= 0.0 || imageLoad(packedTex, c).r > 0u ? -0.5 : 0.5;
 }
 
 bool invalid(float value) {
@@ -60,7 +75,7 @@ void separate(inout vec2 velocity, vec2 normal) {
 }
 
 void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 coord = nodeOrigin + ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(coord, gridSize + ivec2(2)))) {
         return;
     }
@@ -77,12 +92,30 @@ void main() {
 
     float invMass = massScale / float(max(massAccum, 1u));
     vec2 velocity = vec2(momentum(gridMomentumX[index]), momentum(gridMomentumY[index])) * (invMass / velocityScale);
-    velocity.y -= gravity * dt;
 
-    float waterAmount = imageLoad(waterAmountTex, clampCell(cell)).x;
-    vec2 waterVelocity = imageLoad(waterVelocityTex, clampCell(cell)).xy;
-    float dragAlpha = clamp(drag * waterAmount * dt, 0.0, 1.0);
-    velocity = mix(velocity, waterVelocity, dragAlpha);
+    // Water around the node. A dense body's own cells hold no liquid, so its surface nodes see the
+    // neighbouring cells: the fullest sets the submersion, the volume-weighted velocities the flow.
+    float wettest = 0.0;
+    float volume = 0.0;
+    vec2 flow = vec2(0.0);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 sampleCell = clampCell(cell + ivec2(i, j));
+            float amount = imageLoad(waterAmountTex, sampleCell).x;
+            if (amount > 0.0) {
+                wettest = max(wettest, amount);
+                volume += amount;
+                flow += amount * imageLoad(waterVelocityTex, sampleCell).xy;
+            }
+        }
+    }
+    float submerged = clamp(wettest / waterFullVolume, 0.0, 1.0);
+
+    velocity.y -= gravity * dt * (1.0 - buoyancy * submerged);
+    if (submerged > 0.0) {
+        // Exponential relaxation is stable at any dt; the water side of the exchange is water_particle_step.
+        velocity = mix(velocity, flow / volume, 1.0 - exp(-drag * submerged * dt));
+    }
 
     // Damping is the velocity retained over one 1/60-second reference step.
     velocity *= pow(damping, dt * 60.0);
@@ -100,16 +133,29 @@ void main() {
             if (length(normal) > 0.00001) {
                 separate(velocity, normalize(normal));
             } else {
-                // Thin walls can have equal distances on both sides: constrain their blocked axis.
+                // A thin wall has open cells on both sides: its normal faces the side holding more sand, so
+                // only motion into the wall is removed. An even split blocks both ways.
                 bool openX = left > 0.0 || right > 0.0;
                 bool openY = down > 0.0 || up > 0.0;
-                if (openX) separate(velocity, vec2(-sign(velocity.x), 0.0));
-                if (openY) separate(velocity, vec2(0.0, -sign(velocity.y)));
+                int stride = gridSize.x + 2;
+                if (openX) {
+                    float side = sign(float(gridMass[index - 1]) - float(gridMass[index + 1]));
+                    if (side != 0.0) separate(velocity, vec2(-side, 0.0)); else velocity.x = 0.0;
+                }
+                if (openY) {
+                    float side = sign(float(gridMass[index - stride]) - float(gridMass[index + stride]));
+                    if (side != 0.0) separate(velocity, vec2(0.0, -side)); else velocity.y = 0.0;
+                }
                 if (!openX && !openY) velocity = vec2(0.0);
             }
+        } else if (!halo && imageLoad(packedTex, cell).r > 0u) {
+            vec2 normal = vec2(packedField(cell + ivec2(1, 0)) - packedField(cell + ivec2(-1, 0)),
+                               packedField(cell + ivec2(0, 1)) - packedField(cell + ivec2(0, -1)));
+            if (length(normal) > 0.0) separate(velocity, normalize(normal));
+            else velocity = vec2(0.0);
         }
     }
-    // Validate the final stressed/forced velocity against its binary16 storage range.
+    // Reject non-finite or absurd (beyond 65504 cells/s) velocities; the particle step caps speed anyway.
     if (invalid(velocity.x) || invalid(velocity.y) || any(greaterThan(abs(velocity), vec2(65504.0)))) {
         atomicAdd(nanInfDetected, 1u);
         velocity = vec2(0.0);

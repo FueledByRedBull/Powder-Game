@@ -5,6 +5,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r16f, binding = 0) uniform writeonly image2D waterUFaceTex;
 layout(r16f, binding = 1) uniform writeonly image2D waterVFaceTex;
 layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(rg32f, binding = 3) uniform readonly image2D sandVelocityTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -29,19 +30,58 @@ layout(std430, binding = 3) readonly buffer VFaceVelocitySums {
     ivec2 vVelocitySums[];
 };
 
+// Packed calm water (water_pack.comp): a packed cell deposits here as rest-density water at rest, whatever count it
+// stores (packing admits the rest count +-1), so it asks the solve for no density correction.
+layout(r8ui, binding = 4) uniform readonly uimage2D waterPackedTex;
+
+layout(std430, binding = 4) buffer WaterCellCounts {
+    uint cellCounts[];
+};
+
 uniform ivec2 gridSize;
 uniform float weightScale;
 uniform float velocityScale;
+uniform float restMass;  // particle mass of a cell at rest density
 
-bool cellInBounds(ivec2 coord) {
-    return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
+// A packed cell's particles sit anywhere in it, so it deposits the P2G kernels averaged over the cell: the quadratic
+// face kernel convolved with the cell is the cubic B-spline (1/48, 23/48 across the face axis by cell offset, 1/6, 2/3
+// along it), the bilinear cell kernel becomes 1/8, 3/4, 1/8.
+shared uint packedTile[20][20];
+
+uint packedAt(ivec2 cell) {
+    ivec2 local = cell - ivec2(gl_WorkGroupID.xy) * 16 + ivec2(2);
+    return packedTile[local.y][local.x];
 }
 
-bool blocked(ivec2 coord) {
-    if (!cellInBounds(coord)) {
-        return true;
+float cubicAcross(int offset) {
+    return (offset == 0 || offset == -1) ? 23.0 / 48.0 : 1.0 / 48.0;
+}
+
+float cubicAlong(int offset) {
+    return offset == 0 ? 2.0 / 3.0 : 1.0 / 6.0;
+}
+
+// Packed particle weight on the u face at (face.x, face.y + 0.5); the v face swaps the axes.
+float packedFaceWeight(ivec2 face, bool vertical) {
+    float weight = 0.0;
+    for (int along = -1; along <= 1; ++along) {
+        for (int across = -2; across <= 1; ++across) {
+            ivec2 cell = vertical ? face + ivec2(along, across) : face + ivec2(across, along);
+            weight += float(packedAt(cell)) * cubicAcross(across) * cubicAlong(along);
+        }
     }
-    return imageLoad(boundaryTex, coord).r != 0u;
+    return weight * restMass;
+}
+
+// Velocity component of the wall on a face between in-bounds cells a and b, at least one of them blocked. Painted
+// solids (mask 1) rest; sand (mask 2 and 3) moves with the sand grid, so the pressure solve pushes water out of its way.
+float wallVelocity(ivec2 a, ivec2 b, int axis) {
+    uint maskA = imageLoad(boundaryTex, a).r;
+    uint maskB = imageLoad(boundaryTex, b).r;
+    if (maskA == 1u || maskB == 1u || (maskA != 0u && maskB != 0u)) {
+        return 0.0;
+    }
+    return imageLoad(sandVelocityTex, (maskA != 0u ? a : b) + ivec2(1))[axis];
 }
 
 int uFaceIndex(ivec2 face) {
@@ -67,15 +107,37 @@ float checkedHalf(float value) {
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(2);
+    for (uint i = gl_LocalInvocationIndex; i < 400u; i += 256u) {
+        ivec2 cell = tileOrigin + ivec2(int(i % 20u), int(i / 20u));
+        bool inGrid = all(greaterThanEqual(cell, ivec2(0))) && all(lessThan(cell, gridSize));
+        packedTile[i / 20u][i % 20u] = inGrid ? min(imageLoad(waterPackedTex, cell).r & 127u, 1u) : 0u;
+    }
+    barrier();
+
+    if (coord.x < gridSize.x && coord.y < gridSize.y) {
+        float packedCount = 0.0;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                packedCount += float(packedAt(coord + ivec2(i, j))) * (i == 0 ? 0.75 : 0.125) * (j == 0 ? 0.75 : 0.125);
+            }
+        }
+        uint deposit = uint(round(packedCount * restMass * weightScale));
+        if (deposit > 0u) cellCounts[coord.y * gridSize.x + coord.x] += deposit;
+    }
 
     if (coord.x <= gridSize.x && coord.y < gridSize.y) {
         float face_u = 0.0;
-        if (coord.x > 0 && coord.x < gridSize.x && !blocked(ivec2(coord.x - 1, coord.y)) && !blocked(ivec2(coord.x, coord.y))) {
-            int index = uFaceIndex(coord);
-            uint weight = uWeights[index];
-            if (weight > 0u) {
-                float face_weight = float(weight) / weightScale;
-                face_u = (momentum(uVelocitySums[index]) / velocityScale) / face_weight;
+        if (coord.x > 0 && coord.x < gridSize.x) {
+            ivec2 left = ivec2(coord.x - 1, coord.y);
+            if (imageLoad(boundaryTex, left).r != 0u || imageLoad(boundaryTex, coord).r != 0u) {
+                face_u = wallVelocity(left, coord, 0);
+            } else {
+                int index = uFaceIndex(coord);
+                float face_weight = float(uWeights[index]) / weightScale + packedFaceWeight(coord, false);
+                if (face_weight > 0.0) {
+                    face_u = (momentum(uVelocitySums[index]) / velocityScale) / face_weight;
+                }
             }
         }
         imageStore(waterUFaceTex, coord, vec4(checkedHalf(face_u), 0.0, 0.0, 0.0));
@@ -83,12 +145,16 @@ void main() {
 
     if (coord.x < gridSize.x && coord.y <= gridSize.y) {
         float face_v = 0.0;
-        if (coord.y > 0 && coord.y < gridSize.y && !blocked(ivec2(coord.x, coord.y - 1)) && !blocked(ivec2(coord.x, coord.y))) {
-            int index = vFaceIndex(coord);
-            uint weight = vWeights[index];
-            if (weight > 0u) {
-                float face_weight = float(weight) / weightScale;
-                face_v = (momentum(vVelocitySums[index]) / velocityScale) / face_weight;
+        if (coord.y > 0 && coord.y < gridSize.y) {
+            ivec2 down = ivec2(coord.x, coord.y - 1);
+            if (imageLoad(boundaryTex, down).r != 0u || imageLoad(boundaryTex, coord).r != 0u) {
+                face_v = wallVelocity(down, coord, 1);
+            } else {
+                int index = vFaceIndex(coord);
+                float face_weight = float(vWeights[index]) / weightScale + packedFaceWeight(coord, true);
+                if (face_weight > 0.0) {
+                    face_v = (momentum(vVelocitySums[index]) / velocityScale) / face_weight;
+                }
             }
         }
         imageStore(waterVFaceTex, coord, vec4(checkedHalf(face_v), 0.0, 0.0, 0.0));

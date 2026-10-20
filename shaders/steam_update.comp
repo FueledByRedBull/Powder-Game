@@ -1,0 +1,66 @@
+#version 430
+
+// Gas-grid side of phase_particles.comp, one gas cell per invocation; it clears the sources it consumes.
+// Burning oil: a gas cell above lit oil records gets hot fuel vapour and flame (max, like the fire brush and burning
+// wood), which the gas burns into flame, heat and smoke; that heat keeps the slick alight. Water and sand put it out
+// by covering the oil or cooling and starving the gas (coupling_fire.comp, coupling_heat.comp).
+// Steam: evaporated water records become a scalar carried by the gas velocity plus its own buoyant rise, which
+// condenses (decays) within a second or two. Steam is presentation and does not push the gas.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;  // cell centres, gas cells/s
+layout(r16f, binding = 1) uniform writeonly image2D steamDst;
+layout(r8ui, binding = 2) uniform readonly uimage2D gasMaskTex;
+layout(r16f, binding = 3) uniform image2D fuelTex;
+layout(r16f, binding = 4) uniform image2D temperatureTex;
+layout(rg16f, binding = 5) uniform image2D reactionTex;
+
+uniform sampler2D steamSrc;
+
+// Per gas cell: evaporated water records, then lit oil records under it.
+layout(std430, binding = 0) buffer GasSources {
+    uint gasSources[];
+};
+
+uniform ivec2 gasSize;
+uniform float dt;
+uniform float steamRise;      // gas cells/s relative to the gas
+uniform float steamCondense;  // 1/s
+uniform float steamPerParticle;
+
+bool blocked(ivec2 cell) {
+    return any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, gasSize)) || imageLoad(gasMaskTex, cell).r != 0u;
+}
+
+void main() {
+    ivec2 gas = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(gas, gasSize))) {
+        return;
+    }
+    int linear = gas.y * gasSize.x + gas.x;
+    uint steamCount = gasSources[2 * linear];
+    uint litOil = gasSources[2 * linear + 1];
+    gasSources[2 * linear] = 0u;
+    gasSources[2 * linear + 1] = 0u;
+    if (imageLoad(gasMaskTex, gas).r != 0u) {
+        imageStore(steamDst, gas, vec4(0.0));
+        return;
+    }
+
+    // Semi-Lagrangian: a trace that ends in a wall takes the cell's own value (no steam through walls).
+    vec2 here = vec2(gas) + 0.5;
+    vec2 back = here - (imageLoad(gasVelocityTex, gas).xy + vec2(0.0, steamRise)) * dt;
+    if (blocked(ivec2(floor(back)))) back = here;
+    float steam = textureLod(steamSrc, back / vec2(gasSize), 0.0).r;
+    steam = clamp(steam * exp(-steamCondense * dt) + float(steamCount) * steamPerParticle, 0.0, 1.0);
+    imageStore(steamDst, gas, vec4(steam));
+
+    if (litOil > 0u) {
+        // A gas cell sits over 2x2 cells, the top of up to eight lit records; two already make a full flame.
+        float feed = min(float(litOil) * 0.5, 1.0);
+        imageStore(fuelTex, gas, vec4(max(imageLoad(fuelTex, gas).x, 0.6 * feed)));
+        imageStore(temperatureTex, gas, vec4(max(imageLoad(temperatureTex, gas).x, 0.7 * feed)));
+        vec2 reaction = imageLoad(reactionTex, gas).xy;
+        imageStore(reactionTex, gas, vec4(reaction.x, max(reaction.y, 0.4 * feed), 0.0, 0.0));
+    }
+}
