@@ -14,10 +14,12 @@ layout(r8ui, binding = 2) uniform readonly uimage2D gasMaskTex;
 layout(r16f, binding = 3) uniform image2D fuelTex;
 layout(r16f, binding = 4) uniform image2D temperatureTex;
 layout(rg16f, binding = 5) uniform image2D reactionTex;
+layout(r16f, binding = 6) uniform writeonly image2D oxidizerTex;
 
 uniform sampler2D steamSrc;
 
-// Per gas cell: evaporated water records, then lit oil records under it.
+// Per gas cell: evaporated water records (bits 0-15) and records that flashed on burning oil at most four cells below
+// (bits 16-31), then lit oil records under it.
 layout(std430, binding = 0) buffer GasSources {
     uint gasSources[];
 };
@@ -38,7 +40,8 @@ void main() {
         return;
     }
     int linear = gas.y * gasSize.x + gas.x;
-    uint steamCount = gasSources[2 * linear];
+    uint steamCount = gasSources[2 * linear] & 0xFFFFu;
+    uint flashed = gasSources[2 * linear] >> 16u;
     uint litOil = gasSources[2 * linear + 1];
     gasSources[2 * linear] = 0u;
     gasSources[2 * linear + 1] = 0u;
@@ -55,7 +58,16 @@ void main() {
     steam = clamp(steam * exp(-steamCondense * dt) + float(steamCount) * steamPerParticle, 0.0, 1.0);
     imageStore(steamDst, gas, vec4(steam));
 
-    if (litOil > 0u) {
+    if (flashed > 0u) {
+        // Quench: one flashing record (a quarter of a 5 mm cell of water) takes about 70 J of latent heat, some hundred
+        // times what a 1 cm gas cell holds at flame temperature, and expands into some 50 cm^3 of steam, a hundred times
+        // a cell's volume, which displaces the air (steam smothering). The column of four gas cells over it is cooled to
+        // ambient and left without oxygen until fresh air mixes back in (fire_rd.comp), so the burning oil under it
+        // stops feeding it and goes out, its ignition window cold (phase_particles.comp).
+        imageStore(temperatureTex, gas, vec4(0.0));
+        imageStore(reactionTex, gas, vec4(imageLoad(reactionTex, gas).x, 0.0, 0.0, 0.0));
+        imageStore(oxidizerTex, gas, vec4(0.0));
+    } else if (litOil > 0u) {
         // A gas cell sits over 2x2 cells, the top of up to eight lit records; two already make a full flame.
         float feed = min(float(litOil) * 0.5, 1.0);
         imageStore(fuelTex, gas, vec4(max(imageLoad(fuelTex, gas).x, 0.6 * feed)));

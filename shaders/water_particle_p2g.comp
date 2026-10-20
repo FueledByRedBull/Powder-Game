@@ -95,14 +95,67 @@ int signedCarry(int previous, int delta) {
     return 0;
 }
 
+// Compaction sorts the records by bin, so a workgroup's particles usually sit in a small box. Such a workgroup sums its
+// deposits in shared memory and then adds each touched cell and face to the grid once. The sums are integers, so the
+// result is bit-identical to depositing every particle directly, which a workgroup spread wider than the box still does.
+// Every cell and face a particle in cell c touches lies in [c - 1, c + 2] on each axis.
+const int kTile = 24;
+const int kTileCells = kTile * kTile;
+shared uint tileCells[kTileCells];
+shared uint tileUWeights[kTileCells];
+shared uint tileVWeights[kTileCells];
+shared ivec2 tileUSums[kTileCells];
+shared ivec2 tileVSums[kTileCells];
+shared ivec2 tileMin;
+shared ivec2 tileMax;
+bool useTile = false;
+ivec2 tileOrigin = ivec2(0);
+
+int tileIndex(ivec2 coord) {
+    ivec2 local = coord - tileOrigin;
+    return local.y * kTile + local.x;
+}
+
+// kind 0: cell count, 1: u-face weight, 2: v-face weight.
+void addCount(uint count, int globalIndex, ivec2 coord, int kind) {
+    uint previous;
+    if (useTile) {
+        int t = tileIndex(coord);
+        if (kind == 0) previous = atomicAdd(tileCells[t], count);
+        else if (kind == 1) previous = atomicAdd(tileUWeights[t], count);
+        else previous = atomicAdd(tileVWeights[t], count);
+    } else {
+        if (kind == 0) previous = atomicAdd(cellCounts[globalIndex], count);
+        else if (kind == 1) previous = atomicAdd(uWeights[globalIndex], count);
+        else previous = atomicAdd(vWeights[globalIndex], count);
+    }
+    if (previous > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+}
+
+void addMomentum(int delta, int globalIndex, ivec2 coord, bool uFace) {
+    if (useTile) {
+        int t = tileIndex(coord);
+        if (uFace) {
+            int carry = signedCarry(atomicAdd(tileUSums[t].x, delta), delta);
+            if (carry != 0) atomicAdd(tileUSums[t].y, carry);
+        } else {
+            int carry = signedCarry(atomicAdd(tileVSums[t].x, delta), delta);
+            if (carry != 0) atomicAdd(tileVSums[t].y, carry);
+        }
+    } else if (uFace) {
+        int carry = signedCarry(atomicAdd(uVelocitySums[globalIndex].x, delta), delta);
+        if (carry != 0) atomicAdd(uVelocitySums[globalIndex].y, carry);
+    } else {
+        int carry = signedCarry(atomicAdd(vVelocitySums[globalIndex].x, delta), delta);
+        if (carry != 0) atomicAdd(vVelocitySums[globalIndex].y, carry);
+    }
+}
+
 void depositCell(ivec2 cell, float weight) {
     if (weight <= 0.0) {
         return;
     }
-
-    int index = cellIndex(cell);
-    uint count = uint(round(weight * weightScale));
-    if (atomicAdd(cellCounts[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    addCount(uint(round(weight * weightScale)), cellIndex(cell), cell, 0);
 }
 
 void depositU(ivec2 face, float weight, float value) {
@@ -120,12 +173,10 @@ void depositU(ivec2 face, float weight, float value) {
 
     int index = uFaceIndex(face);
     uint count = uint(round(weight * weightScale));
-    if (atomicAdd(uWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    addCount(count, index, face, 1);
     // Momentum uses the quantized weight, so a face average stays a convex mix of particle velocities even where
     // edge-of-support weights round to zero (a rounded-away weight with full momentum amplified sparse faces).
-    int delta = int(round(value * float(count) * (velocityScale / weightScale)));
-    int carry = signedCarry(atomicAdd(uVelocitySums[index].x, delta), delta);
-    if (carry != 0) atomicAdd(uVelocitySums[index].y, carry);
+    addMomentum(int(round(value * float(count) * (velocityScale / weightScale))), index, face, true);
 }
 
 void depositV(ivec2 face, float weight, float value) {
@@ -143,49 +194,54 @@ void depositV(ivec2 face, float weight, float value) {
 
     int index = vFaceIndex(face);
     uint count = uint(round(weight * weightScale));
-    if (atomicAdd(vWeights[index], count) > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+    addCount(count, index, face, 2);
     // Quantized-weight momentum, as in depositU.
-    int delta = int(round(value * float(count) * (velocityScale / weightScale)));
-    int carry = signedCarry(atomicAdd(vVelocitySums[index].x, delta), delta);
-    if (carry != 0) atomicAdd(vVelocitySums[index].y, carry);
+    addMomentum(int(round(value * float(count) * (velocityScale / weightScale))), index, face, false);
 }
 
-void main() {
-    uint index = gl_GlobalInvocationID.x;
+// Reads and validates a record; false when it deposits nothing.
+bool loadParticle(uint index, out vec2 position, out vec2 velocity, out float mass, out mat2 affine) {
+    position = vec2(0.0);
+    velocity = vec2(0.0);
+    mass = 0.0;
+    affine = mat2(0.0);
     if (index >= uint(maxParticles)) {
-        return;
+        return false;
     }
 
     WaterParticle particle = particles[index];
     if (invalidFloat(particle.state1.x)) {
         atomicAdd(nanInfDetected, 1u);
-        return;
+        return false;
     }
     if (particle.state1.x < 0.5) {
-        return;
+        return false;
     }
 
-    vec2 position = particle.state0.xy;
-    vec2 velocity = particle.state0.zw;
-    float mass = particle.state1.y;
-    mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
+    position = particle.state0.xy;
+    velocity = particle.state0.zw;
+    mass = particle.state1.y;
+    affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
     if (invalidVec2(position) || invalidVec2(velocity) || invalidMat2(affine) || invalidFloat(mass) || mass <= 0.0 ||
         any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, vec2(gridSize)))) {
         atomicAdd(nanInfDetected, 1u);
-        return;
+        return false;
     }
     // A particle caught inside sand or a wall waits for the step to free it; its zero-momentum weight would
     // brake the water around it.
     if (blockedCell(ivec2(floor(position)))) {
-        return;
+        return false;
     }
     vec2 maxMomentum = (abs(velocity) + 1.5 * (abs(affine[0]) + abs(affine[1]))) * mass * velocityScale;
     if (invalidVec2(maxMomentum) || any(greaterThan(maxMomentum, vec2(2147483520.0))) ||
         mass * weightScale > 4294967040.0) {
         atomicAdd(particleOverflowBlocked, 1u);
-        return;
+        return false;
     }
+    return true;
+}
 
+void deposit(vec2 position, vec2 velocity, float mass, mat2 affine) {
     vec2 cellSample = position - vec2(0.5);
     ivec2 cellBase = ivec2(floor(cellSample));
     vec2 cellFrac = fract(cellSample);
@@ -235,6 +291,79 @@ void main() {
             vec2 facePos = vec2(float(face.x) + 0.5, float(face.y));
             vec2 apicVelocity = velocity + affine * (facePos - position);
             depositV(face, mass * vWx[i] * vWy[j], apicVelocity.y);
+        }
+    }
+}
+
+void flushCount(uint count, int globalIndex, int kind) {
+    if (count == 0u) return;
+    uint previous;
+    if (kind == 0) previous = atomicAdd(cellCounts[globalIndex], count);
+    else if (kind == 1) previous = atomicAdd(uWeights[globalIndex], count);
+    else previous = atomicAdd(vWeights[globalIndex], count);
+    if (previous > 0xffffffffu - count) atomicAdd(particleOverflowBlocked, 1u);
+}
+
+// Adds a tile's (low word, wrap count) sum to the grid's, carrying the low word's wrap as a deposit does.
+void flushSum(ivec2 sum, int globalIndex, bool uFace) {
+    if (sum == ivec2(0)) return;
+    int carry = signedCarry(uFace ? atomicAdd(uVelocitySums[globalIndex].x, sum.x)
+                                  : atomicAdd(vVelocitySums[globalIndex].x, sum.x), sum.x);
+    int high = sum.y + carry;
+    if (high == 0) return;
+    if (uFace) atomicAdd(uVelocitySums[globalIndex].y, high);
+    else atomicAdd(vVelocitySums[globalIndex].y, high);
+}
+
+void main() {
+    uint local = gl_LocalInvocationIndex;
+    vec2 position, velocity;
+    float mass;
+    mat2 affine;
+    bool deposits = loadParticle(gl_GlobalInvocationID.x, position, velocity, mass, affine);
+
+    if (local == 0u) {
+        tileMin = ivec2(2147483647);
+        tileMax = ivec2(-2147483647);
+    }
+    for (int t = int(local); t < kTileCells; t += 256) {
+        tileCells[t] = 0u;
+        tileUWeights[t] = 0u;
+        tileVWeights[t] = 0u;
+        tileUSums[t] = ivec2(0);
+        tileVSums[t] = ivec2(0);
+    }
+    barrier();
+    if (deposits) {
+        ivec2 cell = ivec2(floor(position));
+        atomicMin(tileMin.x, cell.x);
+        atomicMin(tileMin.y, cell.y);
+        atomicMax(tileMax.x, cell.x);
+        atomicMax(tileMax.y, cell.y);
+    }
+    barrier();
+    ivec2 span = tileMax - tileMin;
+    if (span.x < 0) return;  // no particle deposits (uniform across the workgroup)
+    useTile = all(lessThanEqual(span, ivec2(kTile - 4)));
+    tileOrigin = tileMin - ivec2(1);
+
+    if (deposits) deposit(position, velocity, mass, affine);
+    if (!useTile) return;  // uniform
+    barrier();
+
+    for (int t = int(local); t < kTileCells; t += 256) {
+        ivec2 coord = tileOrigin + ivec2(t % kTile, t / kTile);
+        // Only entries a deposit reached are nonzero, and deposits check their own ranges.
+        flushCount(tileCells[t], cellIndex(coord), 0);
+        if (tileUWeights[t] != 0u || tileUSums[t] != ivec2(0)) {
+            int index = uFaceIndex(coord);
+            flushCount(tileUWeights[t], index, 1);
+            flushSum(tileUSums[t], index, true);
+        }
+        if (tileVWeights[t] != 0u || tileVSums[t] != ivec2(0)) {
+            int index = vFaceIndex(coord);
+            flushCount(tileVWeights[t], index, 2);
+            flushSum(tileVSums[t], index, false);
         }
     }
 }

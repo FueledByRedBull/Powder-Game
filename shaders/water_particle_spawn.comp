@@ -42,6 +42,11 @@ uniform uint spawnSeed;
 uniform float velocitySpread;
 // 1 tags the records as oil (state2.z), which floats on water and burns (phase_particles.comp).
 uniform float oilFlag;
+// A brush emits continuously, so each record is born a random age a in [0, tickDt) before the tick starts and has
+// already flown ballistically for it: x += v0 a + g a^2 / 2, v += g a. Emitting every record at the tick's start made
+// one slab per tick, v dt apart, and a held small brush poured a string of beads.
+uniform float tickDt;
+uniform vec2 gravity;
 
 // PCG-style integer hash: per-particle jitter that varies with the cell, the particle and the tick (spawnSeed).
 uint hashBits(uvec3 v) {
@@ -53,6 +58,11 @@ uint hashBits(uvec3 v) {
 vec2 uniform2(uvec3 v) {
     uint h = hashBits(v);
     return vec2(float(h & 65535u), float(h >> 16)) / 65536.0;  // [0, 1): stays inside the cell
+}
+
+bool blocked(vec2 p) {
+    ivec2 c = ivec2(floor(p));
+    return any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize)) || imageLoad(boundaryTex, c).r != 0u;
 }
 
 bool insideBrush(ivec2 coord) {
@@ -99,7 +109,20 @@ void main() {
             atomicAdd(particleOverflowBlocked, 1u);
             return;
         }
-        particles[slot].state0 = vec4(vec2(coord) + vec2(0.5) + jitter, spawnVelocity + spread);
+        vec2 position = vec2(coord) + vec2(0.5) + jitter;
+        vec2 velocity = spawnVelocity + spread;
+        // The flight before the tick, kept only if its straight path (at most a few cells, sampled every quarter cell)
+        // stays in open cells; a record that would have met a wall is born at the brush instead.
+        float age = uniform2(uvec3(coord, uint(2 * count + i))).x * tickDt;
+        vec2 flown = position + velocity * age + 0.5 * gravity * age * age;
+        int samples = int(ceil(length(flown - position) * 4.0));
+        bool clear = true;
+        for (int s = 1; s <= samples && clear; ++s) clear = !blocked(mix(position, flown, float(s) / float(samples)));
+        if (clear) {
+            position = flown;
+            velocity += gravity * age;
+        }
+        particles[slot].state0 = vec4(position, velocity);
         particles[slot].state1 = vec4(1.0, particleMass, 0.0, 0.0);
         particles[slot].state2 = vec4(0.0, 0.0, oilFlag, 0.0);
     }

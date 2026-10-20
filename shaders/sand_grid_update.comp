@@ -8,6 +8,13 @@ layout(rg16f, binding = 2) uniform readonly image2D waterVelocityTex;
 layout(rg32f, binding = 3) uniform writeonly image2D sandVelocityTex;
 // Sleeping grains per cell (sand_pack.comp): a packed cell is a wall to the moving sand.
 layout(r8ui, binding = 4) uniform readonly uimage2D packedTex;
+// Mean volume ratio J of a packed cell's grains (.x, sand_pack.comp).
+layout(rgba32f, binding = 5) uniform readonly image2D packedFTex;
+
+// sand_particle_p2g.comp's deposit tiles; each workgroup is one tile (nodeOrigin is tile-aligned) and resets its flag.
+layout(std430, binding = 3) buffer SandTileFlags {
+    uint tileFlags[];
+};
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -20,17 +27,22 @@ layout(std430, binding = 0) readonly buffer SandGridMass {
     uint gridMass[];
 };
 
-layout(std430, binding = 1) readonly buffer SandGridMomentumX {
+// Writable: a node zeroes its momentum once read (no other node reads it); the particle step zeroes the mass.
+layout(std430, binding = 1) buffer SandGridMomentumX {
     ivec2 gridMomentumX[];
 };
 
-layout(std430, binding = 2) readonly buffer SandGridMomentumY {
+layout(std430, binding = 2) buffer SandGridMomentumY {
     ivec2 gridMomentumY[];
 };
 
 uniform ivec2 gridSize;
 // First node of the dispatched box (the host covers the live grains' box); zero dispatches from the halo corner.
 uniform ivec2 nodeOrigin;
+uniform int tileStride;
+// 1 skips tiles without deposits (their nodes hold no mass); the host clears it on the tick's last substep, so the
+// velocity field other passes read covers the whole box.
+uniform int skipEmptyTiles;
 uniform float dt;
 uniform float gravity;
 uniform float damping;
@@ -43,6 +55,14 @@ uniform float waterFullVolume;
 uniform float wallFriction;
 uniform float massScale;
 uniform float velocityScale;
+// Packed grains push on the nodes around their cell with the isotropic Hencky stress of their mean J.
+uniform float shearModulus;
+uniform float lameLambda;
+uniform float referenceDensity;
+// sand_particle_step.comp's friction alpha and wet-sand cohesion, for damp packed cells' bonds.
+uniform float frictionAlpha;
+uniform float cohesion;
+uniform float cohesionSoftening;
 
 int linearIndex(ivec2 coord) {
     return coord.y * (gridSize.x + 2) + coord.x;
@@ -66,6 +86,40 @@ float momentum(ivec2 value) {
     return float(value.x) + 4294967296.0 * float(value.y);
 }
 
+// Impulse (momentum change) the packed cells around a node would give it as frozen grains: P2G's stress term,
+// -dt V tau grad(w), with the quadratic weight and its gradient averaged over the packed cell (weights 1/6, 2/3, 1/6;
+// gradients -1/2, 0, 1/2 per axis) and the isotropic Kirchhoff stress (lambda + mu) ln J, compression only. contact
+// receives the same sum without the stress (the direction away from the packed sand), bond the shear impulse damp packed
+// grains hold at zero pressure: the cohesion-widened cone's sqrt(2) alpha (lambda + mu) times the bond
+// (sand_particle_step.comp's cohesion times capillary(moisture) exp(-q / softening), from the cell's means).
+vec2 packedImpulse(ivec2 node, out vec2 contact, out float bond) {
+    const float kWeight[3] = float[3](1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0);
+    const float kGradient[3] = float[3](-0.5, 0.0, 0.5);
+    vec2 impulse = vec2(0.0);
+    contact = vec2(0.0);
+    bond = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 c = node + ivec2(i, j);
+            if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) continue;
+            uint count = imageLoad(packedTex, c).r;
+            if (count == 0u) continue;
+            vec4 mean = imageLoad(packedFTex, c);
+            float stress = (lameLambda + shearModulus) * min(log(max(mean.x, 1e-3)), 0.0);
+            ivec2 o = ivec2(1) - ivec2(i, j);  // the node's offset from the cell, as an index into the averages
+            vec2 gradient = vec2(kGradient[o.x] * kWeight[o.y], kWeight[o.x] * kGradient[o.y]);
+            float volume = dt * float(count) / referenceDensity;
+            impulse -= volume * stress * gradient;
+            contact += float(count) * gradient;
+            float q = 4.0 * mean.y / max(1.0 - mean.y, 1e-4);  // sand_particle_step.comp's hardening fraction
+            float capillary = clamp(10.0 * mean.z, 0.0, 1.0) * clamp(10.0 * (1.0 - mean.z), 0.0, 1.0);
+            bond += volume * 1.41421356 * frictionAlpha * (lameLambda + shearModulus) * cohesion * capillary *
+                    exp(-q / cohesionSoftening) * length(gradient);
+        }
+    }
+    return impulse;
+}
+
 void separate(inout vec2 velocity, vec2 normal) {
     float inward = dot(velocity, normal);
     if (inward >= 0.0) return;
@@ -74,8 +128,17 @@ void separate(inout vec2 velocity, vec2 normal) {
     if (tangentSpeed > 0.0) velocity *= max(0.0, 1.0 + wallFriction * inward / tangentSpeed);
 }
 
+shared uint tileActive;
+
 void main() {
     ivec2 coord = nodeOrigin + ivec2(gl_GlobalInvocationID.xy);
+    int tile = (nodeOrigin.y / 16 + int(gl_WorkGroupID.y)) * tileStride + nodeOrigin.x / 16 + int(gl_WorkGroupID.x);
+    if (gl_LocalInvocationIndex == 0u) tileActive = tileFlags[tile];
+    barrier();
+    bool deposited = tileActive != 0u;
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && deposited) tileFlags[tile] = 0u;
+    if (skipEmptyTiles == 1 && !deposited) return;
     if (any(greaterThanEqual(coord, gridSize + ivec2(2)))) {
         return;
     }
@@ -86,12 +149,18 @@ void main() {
     uint massAccum = gridMass[index];
     float sdf = halo ? 1.0 : imageLoad(boundarySdfTex, cell).x;
     if (massAccum == 0u) {
+        // A far stencil weight can round to zero mass but not to zero momentum.
+        gridMomentumX[index] = ivec2(0);
+        gridMomentumY[index] = ivec2(0);
         imageStore(sandVelocityTex, coord, vec4(0.0));
         return;
     }
+    vec2 summed = vec2(momentum(gridMomentumX[index]), momentum(gridMomentumY[index]));
+    gridMomentumX[index] = ivec2(0);
+    gridMomentumY[index] = ivec2(0);
 
     float invMass = massScale / float(max(massAccum, 1u));
-    vec2 velocity = vec2(momentum(gridMomentumX[index]), momentum(gridMomentumY[index])) * (invMass / velocityScale);
+    vec2 velocity = summed * (invMass / velocityScale);
 
     // Water around the node. A dense body's own cells hold no liquid, so its surface nodes see the
     // neighbouring cells: the fullest sets the submersion, the volume-weighted velocities the flow.
@@ -120,10 +189,32 @@ void main() {
     // Damping is the velocity retained over one 1/60-second reference step.
     velocity *= pow(damping, dt * 60.0);
     if (dt > 0.0) {
-        if (cell.x <= 0) separate(velocity, vec2(1.0, 0.0));
-        if (cell.x >= gridSize.x - 1) separate(velocity, vec2(-1.0, 0.0));
-        if (cell.y <= 0) separate(velocity, vec2(0.0, 1.0));
-        if (cell.y >= gridSize.y - 1) separate(velocity, vec2(0.0, -1.0));
+        // Packed cells are walls at their own nodes, but frozen grains also pushed on the next node out (the stencil
+        // overlap); without it the first moving layer bore its load alone, compressed and packed denser, and packed
+        // piles came out 20% denser and flatter. The push is a reaction: it cancels motion into the packed sand up to
+        // the stored stress and never launches a grain, with the packed nodes' Coulomb friction (sand_friction_coefficient
+        // 0.62, about tan of the 31.5 degree repose: a layer sliding on a static bed of the same sand); frictionless, the
+        // layer slid off and the pile spread flat.
+        vec2 contact;
+        float bond;
+        vec2 push = packedImpulse(cell, contact, bond) * massScale / float(massAccum);
+        float pushSpeed = length(push);
+        if (pushSpeed > 0.0 || bond > 0.0) {
+            vec2 away = pushSpeed > 0.0 ? push / pushSpeed : (length(contact) > 0.0 ? normalize(contact) : vec2(0.0));
+            float reaction = min(pushSpeed, max(-dot(velocity, away), 0.0));
+            velocity += reaction * away;
+            vec2 tangent = velocity - dot(velocity, away) * away;
+            float tangentSpeed = length(tangent);
+            // Damp packed grains also hold the layer by their capillary bonds, without load: a damp clump's packed core keeps
+            // its moving rim instead of letting it peel off.
+            float grip = wallFriction * reaction + bond * massScale / float(massAccum);
+            if (tangentSpeed > 0.0) velocity -= min(grip, tangentSpeed) / tangentSpeed * tangent;
+        }
+        // The halo nodes are the domain wall, as a painted wall's own cells are: grains rest against the domain's face.
+        if (cell.x < 0) separate(velocity, vec2(1.0, 0.0));
+        if (cell.x >= gridSize.x) separate(velocity, vec2(-1.0, 0.0));
+        if (cell.y < 0) separate(velocity, vec2(0.0, 1.0));
+        if (cell.y >= gridSize.y) separate(velocity, vec2(0.0, -1.0));
         if (!halo && sdf <= 0.0) {
             float left = imageLoad(boundarySdfTex, clampCell(cell + ivec2(-1, 0))).x;
             float right = imageLoad(boundarySdfTex, clampCell(cell + ivec2(1, 0))).x;

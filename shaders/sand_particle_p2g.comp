@@ -30,6 +30,12 @@ layout(std430, binding = 4) buffer SandGridMoisture {
     uint gridMoisture[];
 };
 
+// Node tiles (kWorkgroupSize squared, in halo node coordinates) a stress transfer deposits into: sand_grid_update.comp
+// skips the others. Plain stores of 1 (all writers agree), reset by the grid update.
+layout(std430, binding = 5) buffer SandTileFlags {
+    uint tileFlags[];
+};
+
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
     uint particleOverflowBlocked;
@@ -49,6 +55,7 @@ uniform float viscosity;
 // A grain's rest area is its mass over the reference density (state2.z holds its volume correction).
 uniform float referenceDensity;
 uniform int depositMoisture;
+uniform int tileStride;
 
 bool validCell(ivec2 coord) {
     // Retain the full material stencil. Grid contact supplies the obstacle reaction.
@@ -179,6 +186,15 @@ void main() {
     quadraticWeights(fx.y, wy);
     vec3 dx = vec3(fx.x - 1.5, -2.0 * (fx.x - 1.0), fx.x - 0.5);
     vec3 dy = vec3(fx.y - 1.5, -2.0 * (fx.y - 1.0), fx.y - 0.5);
+    if (depositMoisture == 0) {
+        // The stencil covers nodes base + 1 to base + 3 (halo coordinates): at most two tiles per axis.
+        ivec2 first = (base + ivec2(1)) / 16;
+        ivec2 last = (base + ivec2(3)) / 16;
+        tileFlags[first.y * tileStride + first.x] = 1u;
+        tileFlags[first.y * tileStride + last.x] = 1u;
+        tileFlags[last.y * tileStride + first.x] = 1u;
+        tileFlags[last.y * tileStride + last.x] = 1u;
+    }
 
     for (int j = 0; j < 3; ++j) {
         for (int i = 0; i < 3; ++i) {

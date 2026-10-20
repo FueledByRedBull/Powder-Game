@@ -14,12 +14,10 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
 
 cmake --build "$BUILD_DIR" -j
 
+# Start from an empty folder so an older bundle's shaders/ and DLLs are not zipped again.
+rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 cp "$BUILD_DIR/powder_game.exe" "$DIST_DIR/"
-while IFS= read -r library; do
-  if [[ -n "$library" ]]; then cp "$library" "$DIST_DIR/"; fi
-done < "$BUILD_DIR/runtime-dlls.txt"
-cp -r "$BUILD_DIR/shaders" "$DIST_DIR/"
 
 cat > "$DIST_DIR/README.txt" <<'TXT'
 Powder Game (Windows 11 x64)
@@ -50,7 +48,8 @@ it that hides itself after a few seconds. The brush is a ring and a warm lantern
 light over the simulation.
 
 Notes:
-- Keep the shaders/ folder and the DLLs next to powder_game.exe.
+- powder_game.exe is self-contained (shaders built in, MinGW runtime linked
+  statically); run it from any folder.
 - Requires OpenGL 4.3 core with at least 18 image units, 18 compute image
   uniforms, 19 combined shader output resources, 8 SSBO bindings and 16
   fragment texture units; the app checks the first four at startup.

@@ -5,6 +5,13 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(r32f, binding = 0) uniform readonly image2D rhsTex;
 layout(r32f, binding = 1) uniform coherent image2D pressureTex;
 layout(r8ui, binding = 3) uniform readonly uimage2D kindTex;
+// Fused smoothing (smoothSteps > 0) reads pressureTex and writes the result here, so neighbouring workgroups never
+// see each other's updates; the pre-smoothing also writes its residual and the post-smoothing first adds the coarse
+// correction (gas_pressure_restrict.comp's pass 0 and gas_pressure_prolongate.comp, same arithmetic).
+layout(r32f, binding = 2) uniform writeonly image2D smoothedTex;
+layout(r32f, binding = 4) uniform writeonly image2D residualTex;
+layout(r32f, binding = 5) uniform readonly image2D coarsePressureTex;
+layout(r8ui, binding = 6) uniform readonly uimage2D coarseKindTex;
 
 uniform ivec2 gridSize;
 uniform int boundaryScale;
@@ -18,6 +25,12 @@ uniform int openTop;
 uniform float sandLeak;
 // Nonzero only for the bottom level, which must fit one 16x16 workgroup.
 uniform int bottomSweeps;
+// Fused smoothing: the colour steps of one workgroup's 16x16 tile run in shared memory over a halo that shrinks a cell
+// per step, the first colour `parity`, alternating. prolongate (post-smoothing) first adds the coarse correction; the
+// pre-smoothing (prolongate 0) also writes the residual, which needs one more valid cell.
+uniform int smoothSteps;
+uniform int prolongate;
+uniform ivec2 coarseSize;
 
 // Height of the finest grid: with an open top it holds zero pressure at its ghost row, fineHeight + 0.5.
 uniform int fineHeight;
@@ -67,17 +80,151 @@ void relaxCell(ivec2 coord, int colour) {
     imageStore(pressureTex, coord, vec4(pressure, 0.0, 0.0, 0.0));
 }
 
+const int halo = 5;  // smoothSteps + 1 at most
+const int span = 16 + 2 * halo;
+shared float stagedPressure[span * span];
+shared float stagedRhs[span * span];
+shared float stagedDiagonal[span * span];
+shared uint stagedKind[span * span];
+shared uint stagedFluid[span * span];  // of a fluid cell: bit n, neighbour n (-x, +x, -y, +y) is fluid; bit 4 set
+const int coarseSpan = span / 2 + 3;
+shared float coarseValue[coarseSpan * coarseSpan];
+shared bool coarseIsFluid[coarseSpan * coarseSpan];
+
+// One thread covers the cells local + 16 * (i & 1, i >> 1) of the staged block.
+ivec2 stagedCell(int i) { return ivec2(gl_LocalInvocationID.xy) + 16 * ivec2(i & 1, i >> 1); }
+
+// Staged cells at least `margin` from the edge of the staged block.
+bool within(ivec2 at, int margin) { return all(greaterThanEqual(at, ivec2(margin))) && all(lessThan(at, ivec2(span - margin))); }
+
+// `whole`: the bottom level, which this one workgroup covers, smoothed in place with all its cells valid at every
+// step (nothing lies beyond the domain to go stale): steps / 2 red-black steps, then black-red ones.
+void fusedSmooth(int stepCount, bool whole) {
+    bool addCoarse = !whole && prolongate != 0;
+    const int steps[4] = int[4](-1, 1, -span, span);
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * 16 - halo;
+    float topWeight = openTopWeight(gridSize.y - 1);
+    // The coarse cells any staged fine cell interpolates from: the parents and one donor on each side.
+    ivec2 coarseOrigin = (origin >> 1) - 1;
+    if (addCoarse) {
+        ivec2 at = ivec2(gl_LocalInvocationID.xy);
+        if (all(lessThan(at, ivec2(coarseSpan)))) {
+            ivec2 c = coarseOrigin + at;
+            bool inside = all(greaterThanEqual(c, ivec2(0))) && all(lessThan(c, coarseSize));
+            float value = imageLoad(coarsePressureTex, c).x;
+            uint kind = imageLoad(coarseKindTex, c).r;
+            coarseValue[at.y * coarseSpan + at.x] = inside ? value : 0.0;
+            coarseIsFluid[at.y * coarseSpan + at.x] = inside && kind == 0u;
+        }
+        barrier();
+    }
+    for (int i = 0; i < 4; ++i) {
+        ivec2 at = stagedCell(i);
+        if (!within(at, 0)) continue;
+        ivec2 coord = origin + at;
+        int k = at.y * span + at.x;
+        // Independent loads (zero outside the image), selected by the kind afterwards.
+        float pressure = imageLoad(pressureTex, coord).x;
+        float rhs = imageLoad(rhsTex, coord).x;
+        uint kind = cellKind(coord);
+        float value = 0.0;
+        if (kind == 0u) {
+            value = pressure;
+            if (addCoarse) {
+                ivec2 parent = (coord >> 1) - coarseOrigin;
+                ivec2 toward = ivec2(coord.x & 1, coord.y & 1) * 2 - 1;
+                for (int n = 0; n < 4; ++n) {
+                    ivec2 offset = ivec2(n & 1, n >> 1);
+                    ivec2 donor = parent + offset * toward;
+                    float weight = (offset.x == 0 ? 0.75 : 0.25) * (offset.y == 0 ? 0.75 : 0.25);
+                    int d = donor.y * coarseSpan + donor.x;
+                    value += weight * coarseValue[coarseIsFluid[d] ? d : parent.y * coarseSpan + parent.x];
+                }
+            }
+        }
+        stagedPressure[k] = value;
+        stagedRhs[k] = kind == 0u ? rhs : 0.0;
+        stagedKind[k] = kind;
+        stagedFluid[k] = 0u;
+    }
+    barrier();
+    // The operator row of each fluid cell, its diagonal summed in the order of relaxCell.
+    for (int i = 0; i < 4; ++i) {
+        ivec2 at = stagedCell(i);
+        int k = at.y * span + at.x;
+        if (!within(at, 1) || stagedKind[k] != 0u) continue;
+        float diagonal = 0.0;
+        uint fluid = 16u;
+        for (int n = 0; n < 4; ++n) {
+            uint kind = stagedKind[k + steps[n]];
+            if (kind == 3u) {
+                diagonal += topWeight;
+            } else if (kind == 0u) {
+                diagonal += 1.0;
+                fluid |= 1u << uint(n);
+            } else if (kind == 4u) {
+                diagonal += sandLeak;
+            }
+        }
+        stagedDiagonal[k] = diagonal;
+        stagedFluid[k] = fluid;
+    }
+    barrier();
+    // Each step is valid one cell further in. Same-colour cells never read each other, so updates land in place.
+    for (int step = 0; step < stepCount; ++step) {
+        int colour = whole ? (step & 1) ^ (step < stepCount / 2 ? 0 : 1) : parity ^ (step & 1);
+        int margin = whole ? 1 : step + 1;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 at = stagedCell(i);
+            ivec2 coord = origin + at;
+            int k = at.y * span + at.x;
+            if (!within(at, margin) || ((coord.x + coord.y) & 1) != colour) continue;
+            uint fluid = stagedFluid[k];
+            if (fluid == 0u) continue;
+            float pressure_sum = 0.0;
+            for (int n = 0; n < 4; ++n) {
+                if ((fluid & (1u << uint(n))) != 0u) pressure_sum += stagedPressure[k + steps[n]];
+            }
+            float diagonal = stagedDiagonal[k];
+            stagedPressure[k] = diagonal > 0.0 ? (pressure_sum - stagedRhs[k]) / diagonal : 0.0;
+        }
+        barrier();
+    }
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    ivec2 coord = origin + halo + local;
+    if (any(greaterThanEqual(coord, gridSize))) return;
+    int k = (local.y + halo) * span + local.x + halo;
+    if (whole) {
+        imageStore(pressureTex, coord, vec4(stagedPressure[k], 0.0, 0.0, 0.0));
+        return;
+    }
+    imageStore(smoothedTex, coord, vec4(stagedPressure[k], 0.0, 0.0, 0.0));
+    if (prolongate != 0) return;
+    // The residual of the smoothed pressure (gas_pressure_restrict.comp's residualAt).
+    float residual = 0.0;
+    uint fluid = stagedFluid[k];
+    if (fluid != 0u) {
+        float pressure_sum = 0.0;
+        for (int n = 0; n < 4; ++n) {
+            if ((fluid & (1u << uint(n))) != 0u) pressure_sum += stagedPressure[k + steps[n]];
+        }
+        float lap = pressure_sum - stagedDiagonal[k] * stagedPressure[k];
+        residual = stagedRhs[k] - lap;
+    }
+    imageStore(residualTex, coord, vec4(residual));
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (smoothSteps > 0) {
+        fusedSmooth(smoothSteps, false);
+        return;
+    }
     if (bottomSweeps == 0) {
         relaxCell(coord, parity);
         return;
     }
     // Bottom level (one workgroup covers it): bottomSweeps red-black pairs, then as many black-red pairs so the
-    // sequence is symmetric, all in one dispatch.
-    for (int step = 0; step < 4 * bottomSweeps; ++step) {
-        relaxCell(coord, (step & 1) ^ (step < 2 * bottomSweeps ? 0 : 1));
-        memoryBarrierImage();
-        barrier();
-    }
+    // sequence is symmetric, all in one dispatch and in shared memory.
+    fusedSmooth(4 * bottomSweeps, true);
 }

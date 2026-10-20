@@ -1,0 +1,177 @@
+#version 430
+
+// Sealed pockets of a pressure system. A 4-connected region of solve cells with no Dirichlet neighbour (water: an air
+// cell; gas: the open top) and no porous-sand face is bounded by Neumann walls alone, so its Laplacian is singular with
+// the constant as null space and L p = b has a solution only when b sums to zero over the region (the compatibility
+// condition, Bridson 2015, ch. 5). Wall faces carry no flux, so the velocity divergence sums to zero there up to
+// rounding, but a density correction (water) or an expansion source (burning gas) need not, and CG stalled on that
+// remainder. Each such pocket's mean is removed from its right-hand side, the projection of b onto the range of L: the
+// pocket redistributes volume inside itself but keeps its total. A one-cell pocket (a pinhole walled in on all four
+// sides, diagonal 0 in pressure_cg.comp) gets 0. PCG on the resulting consistent singular system converges
+// (Kaasschieter 1988).
+// Pocket labels are a concurrent union-find over the grid (Playne and Hawick 2018, with path halving): 0 labels each
+// 16x16 tile in shared memory and points every cell at its tile-local root, 1 unites across tile borders, 2 flags
+// pockets with a grounding neighbour, 3 counts and sums the right-hand side of the others in 64-bit fixed point (order
+// independent, so repeats are bit exact), 4 removes the mean. Labelling tiles first leaves an eighth of the cells to
+// unite globally (one solve's pass was 26 us per dispatch over a 500x500 gas grid that is all fluid).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform image2D rhs16;
+layout(r32f, binding = 1) uniform image2D rhs32;
+layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;  // water: the full mask; gas: level-0 footprint kinds
+layout(r16f, binding = 3) uniform image2D liquidPhiTex;  // water only
+
+// Per cell: parent, then for a root the sum's low and high words and its cell count, whose
+// top bit marks a grounded pocket.
+layout(std430, binding = 0) coherent buffer Pockets { uvec4 pockets[]; };
+
+uniform ivec2 gridSize;
+uniform int phase;
+uniform int gas;      // 1: boundaryTex holds gas kinds (0 fluid, 4 porous sand); else water mask and phi
+uniform int openTop;  // gas: zero pressure above the top row
+uniform int wide;     // 1: the right-hand side is rhs32, else rhs16
+uniform float liquidPhiThreshold;
+
+const uint kGrounded = 0x80000000u;
+const float kFixedScale = 1024.0;
+
+// 0 a wall (no flux), 1 a cell of the system, 2 a neighbour that grounds the pocket (Dirichlet or porous sand).
+int cellClass(ivec2 c) {
+    if (gas != 0 && openTop != 0 && c.y >= gridSize.y) return 2;
+    if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) return 0;
+    uint mask = imageLoad(boundaryTex, c).r;
+    if (gas != 0) return mask == 0u ? 1 : (mask == 4u ? 2 : 0);
+    if (mask != 0u) return mask >= 2u ? 2 : 0;
+    float phi = imageLoad(liquidPhiTex, c).x;
+    if (isnan(phi) || isinf(phi)) return 0;  // invalid input fails the solve on its own
+    return phi < liquidPhiThreshold ? 1 : 2;
+}
+
+uint cellIndex(ivec2 c) { return uint(c.y * gridSize.x + c.x); }
+
+uint findRoot(uint i) {
+    uint parent = pockets[i].x;
+    while (parent != i) {
+        uint grand = pockets[parent].x;
+        if (grand != parent) pockets[i].x = grand;  // path halving: grand is an ancestor of i
+        i = parent;
+        parent = grand;
+    }
+    return i;
+}
+
+// Hook the larger root under the smaller until both share a root; a lost race retries from the root that won it.
+void unite(uint a, uint b) {
+    for (;;) {
+        a = findRoot(a);
+        b = findRoot(b);
+        if (a == b) return;
+        if (a < b) {
+            uint t = a;
+            a = b;
+            b = t;
+        }
+        uint old = atomicMin(pockets[a].x, b);
+        if (old == a) return;
+        a = old;
+    }
+}
+
+float loadRhs(ivec2 c) { return wide != 0 ? imageLoad(rhs32, c).x : imageLoad(rhs16, c).x; }
+
+shared uint localParent[256];
+
+uint localRoot(uint i) {
+    uint parent = localParent[i];
+    while (parent != i) {
+        i = parent;
+        parent = localParent[i];
+    }
+    return i;
+}
+
+void localUnite(uint a, uint b) {
+    for (;;) {
+        a = localRoot(a);
+        b = localRoot(b);
+        if (a == b) return;
+        if (a < b) {
+            uint t = a;
+            a = b;
+            b = t;
+        }
+        uint old = atomicMin(localParent[a], b);
+        if (old == a) return;
+        a = old;
+    }
+}
+
+// Phase 0: the tile's union-find in shared memory; every cell then points at its tile-local root.
+void labelTile(ivec2 coord) {
+    uint lane = gl_LocalInvocationIndex;
+    bool cell = all(lessThan(coord, gridSize)) && cellClass(coord) == 1;
+    localParent[lane] = lane;
+    barrier();
+    if (cell && gl_LocalInvocationID.x < 15u && cellClass(coord + ivec2(1, 0)) == 1) localUnite(lane, lane + 1u);
+    if (cell && gl_LocalInvocationID.y < 15u && cellClass(coord + ivec2(0, 1)) == 1) localUnite(lane, lane + 16u);
+    barrier();
+    if (!cell) return;
+    uint root = localRoot(lane);
+    ivec2 rootCoord = ivec2(gl_WorkGroupID.xy) * 16 + ivec2(int(root % 16u), int(root / 16u));
+    pockets[cellIndex(coord)] = uvec4(cellIndex(rootCoord), 0u, 0u, 0u);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (phase == 0) {
+        labelTile(coord);
+        return;
+    }
+    if (any(greaterThanEqual(coord, gridSize)) || cellClass(coord) != 1) return;
+    uint index = cellIndex(coord);
+    if (phase == 1) {
+        if (gl_LocalInvocationID.x == 15u && cellClass(coord + ivec2(1, 0)) == 1) unite(index, index + 1u);
+        if (gl_LocalInvocationID.y == 15u && cellClass(coord + ivec2(0, 1)) == 1) unite(index, index + uint(gridSize.x));
+        return;
+    }
+    if (phase == 2) {
+        // Every phase finds the root again: writing it into the parent here could overwrite another invocation's
+        // path-halving write and the other way round, leaving a non-root as a label. Halving keeps the paths short.
+        uint root = findRoot(index);
+        bool grounded = cellClass(coord + ivec2(1, 0)) == 2 || cellClass(coord - ivec2(1, 0)) == 2 ||
+                        cellClass(coord + ivec2(0, 1)) == 2 || cellClass(coord - ivec2(0, 1)) == 2;
+        // Most cells of a grounded pool find the flag already set and skip the atomic.
+        if (grounded && (pockets[root].w & kGrounded) == 0u) atomicOr(pockets[root].w, kGrounded);
+        return;
+    }
+    uint root = findRoot(index);
+    if ((pockets[root].w & kGrounded) != 0u) return;
+    float rhs = loadRhs(coord);
+    if (phase == 3) {
+        atomicAdd(pockets[root].w, 1u);
+        if (isnan(rhs) || isinf(rhs)) return;
+        int fixedValue = int(round(clamp(rhs, -2.0e6, 2.0e6) * kFixedScale));
+        uint low = uint(fixedValue);
+        uint high = fixedValue < 0 ? 0xFFFFFFFFu : 0u;
+        uint before = atomicAdd(pockets[root].y, low);
+        if (before + low < before) high += 1u;  // carry out of the low word
+        if (high != 0u) atomicAdd(pockets[root].z, high);
+        return;
+    }
+    uvec4 pocket = pockets[root];
+    double sum = double(int(pocket.z)) * 4294967296.0 + double(pocket.y);
+    float mean = float(sum / (double(pocket.w) * double(kFixedScale)));
+    if (wide != 0) {
+        imageStore(rhs32, coord, vec4(rhs - mean, 0.0, 0.0, 0.0));
+    } else {
+        imageStore(rhs16, coord, vec4(rhs - mean, 0.0, 0.0, 0.0));
+    }
+    // Water: the root, an air cell for this solve (the next field build restores phi), pins the pocket's pressure to
+    // zero. With the mean removed every other equation keeps its exact solution, the root's own being minus the sum of
+    // the others, so the root absorbs only rounding and the leftover residual. Without the pin the multigrid
+    // preconditioner, whose coarse cells turn to air where a pocket's wall is thinner than they are, amplified the
+    // null space: a sealed tank's pressure drifted to 4e5 within one solve, where float rounding alone failed the
+    // residual gate. The gas solve needs no pin: its coarse levels merge such walls into fluid, and with its R32F
+    // right-hand side a sealed fire burned for 30 s with bounded pressure and clean counters (app-gas-sealed-pocket).
+    if (gas == 0 && index == root) imageStore(liquidPhiTex, coord, vec4(liquidPhiThreshold + 1.0));
+}

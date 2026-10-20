@@ -1,20 +1,32 @@
 #include "GLUtil.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
+namespace glutil {
+// Defined in the EmbeddedShaders.cpp that cmake/EmbedShaders.cmake generates; empty for an unknown name.
+std::string_view FindEmbeddedShader(std::string_view name);
+}  // namespace glutil
+
 namespace {
+
+struct ShaderText {
+    std::string label;
+    std::string source;
+};
 
 std::string PathText(const std::filesystem::path& path) {
     const auto utf8 = path.generic_u8string();
     return std::string(utf8.begin(), utf8.end());
 }
 
-GLuint CompileShader(GLenum type, const std::string& source, const std::filesystem::path& path) {
+GLuint CompileShader(GLenum type, const ShaderText& text) {
     const GLuint shader = glCreateShader(type);
-    const char* source_ptr = source.c_str();
+    const char* source_ptr = text.source.c_str();
     glShaderSource(shader, 1, &source_ptr, nullptr);
     glCompileShader(shader);
 
@@ -32,7 +44,7 @@ GLuint CompileShader(GLenum type, const std::string& source, const std::filesyst
     }
 
     std::ostringstream error;
-    error << "Shader compilation failed: " << PathText(path) << "\n" << log.data();
+    error << "Shader compilation failed: " << text.label << "\n" << log.data();
     glDeleteShader(shader);
     throw std::runtime_error(error.str());
 }
@@ -69,6 +81,43 @@ GLuint LinkProgram(const std::vector<GLuint>& shaders) {
     throw std::runtime_error(error.str());
 }
 
+GLuint BuildProgram(const ShaderText& vertex, const ShaderText& fragment) {
+    const GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex);
+    GLuint fragment_shader = 0;
+    try {
+        fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment);
+    } catch (...) {
+        glDeleteShader(vertex_shader);
+        throw;
+    }
+
+    return LinkProgram({vertex_shader, fragment_shader});
+}
+
+GLuint BuildComputeProgram(const ShaderText& compute) {
+    return LinkProgram({CompileShader(GL_COMPUTE_SHADER, compute)});
+}
+
+ShaderText LoadShader(const std::string& name) {
+#ifdef _WIN32
+    const wchar_t* directory = _wgetenv(L"POWDER_SHADER_DIR");  // wide, so Unicode directories survive
+#else
+    const char* directory = std::getenv("POWDER_SHADER_DIR");
+#endif
+    if (directory != nullptr) {
+        if (*directory == 0) {
+            throw std::runtime_error("POWDER_SHADER_DIR is set but empty");
+        }
+        const std::filesystem::path path = std::filesystem::path(directory) / name;
+        return {PathText(path), glutil::ReadTextFile(path)};
+    }
+    const std::string_view source = glutil::FindEmbeddedShader(name);
+    if (source.empty()) {
+        throw std::runtime_error("Shader not embedded in the executable: " + name);
+    }
+    return {"embedded " + name, std::string(source)};
+}
+
 }  // namespace
 
 namespace glutil {
@@ -85,25 +134,20 @@ std::string ReadTextFile(const std::filesystem::path& path) {
 }
 
 GLuint CreateProgramFromFiles(const std::filesystem::path& vertex_path, const std::filesystem::path& fragment_path) {
-    const std::string vertex_source = ReadTextFile(vertex_path);
-    const std::string fragment_source = ReadTextFile(fragment_path);
-
-    const GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex_source, vertex_path);
-    GLuint fragment_shader = 0;
-    try {
-        fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_source, fragment_path);
-    } catch (...) {
-        glDeleteShader(vertex_shader);
-        throw;
-    }
-
-    return LinkProgram({vertex_shader, fragment_shader});
+    return BuildProgram({PathText(vertex_path), ReadTextFile(vertex_path)},
+                        {PathText(fragment_path), ReadTextFile(fragment_path)});
 }
 
 GLuint CreateComputeProgramFromFile(const std::filesystem::path& compute_path) {
-    const std::string compute_source = ReadTextFile(compute_path);
-    const GLuint compute_shader = CompileShader(GL_COMPUTE_SHADER, compute_source, compute_path);
-    return LinkProgram({compute_shader});
+    return BuildComputeProgram({PathText(compute_path), ReadTextFile(compute_path)});
+}
+
+GLuint CreateProgram(const std::string& vertex_name, const std::string& fragment_name) {
+    return BuildProgram(LoadShader(vertex_name), LoadShader(fragment_name));
+}
+
+GLuint CreateComputeProgram(const std::string& compute_name) {
+    return BuildComputeProgram(LoadShader(compute_name));
 }
 
 }  // namespace glutil

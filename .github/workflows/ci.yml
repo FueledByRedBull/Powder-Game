@@ -65,14 +65,7 @@ jobs:
           $exe = Get-ChildItem build -Recurse -Filter "powder_game.exe" | Select-Object -First 1
           if (-not $exe) { throw "powder_game.exe not found" }
 
-          $shaderDir = Join-Path $exe.Directory.FullName "shaders"
-          if (-not (Test-Path $shaderDir)) { throw "shaders directory not found next to executable" }
-
           Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
-          Get-Content (Join-Path $exe.Directory.FullName "runtime-dlls.txt") | Where-Object { $_ } | ForEach-Object {
-            Copy-Item -LiteralPath $_ -Destination $outDir -Force
-          }
-          Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
 
           $readme = @(
             "Powder Game (Windows 11 x64)",
@@ -90,13 +83,14 @@ jobs:
             "- Esc: quit",
             "",
             "Notes:",
-            "- Keep the shaders/ folder and DLLs next to powder_game.exe.",
+            "- powder_game.exe is self-contained (shaders built in, static runtime); run it from any folder.",
             "- Requires OpenGL 4.3 and the resource limits listed in the source README."
           )
           $readme | Set-Content -Path (Join-Path $outDir "README.txt")
 
           New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
           Compress-Archive -Path "$outDir/*" -DestinationPath "dist/win11/PowderGame-win11-x64.zip" -Force
+          ./.github/check-package.ps1 -Zip "dist/win11/PowderGame-win11-x64.zip" -Exe $exe.FullName -Expected "README.txt", "powder_game.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

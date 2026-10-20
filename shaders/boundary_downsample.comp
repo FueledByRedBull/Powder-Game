@@ -4,10 +4,16 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r8ui, binding = 0) uniform readonly uimage2D srcBoundaryTex;
 layout(r8ui, binding = 1) uniform writeonly uimage2D dstBoundaryTex;
+layout(r16f, binding = 2) uniform readonly image2D liquidVolumeTex;  // water plus oil volume per source cell
+layout(rg16f, binding = 3) uniform readonly image2D oilTex;          // x: oil share of that liquid (oil_field.comp)
 
 uniform ivec2 srcSize;
 uniform ivec2 dstSize;
 uniform int scale;
+// Water (not oil) volume per source cell from which a gas cell counts as under water: a filled gas cell is closed to
+// the gas like dense sand, so smoke and flame cannot pass through a pool and smoke that reaches it is washed out.
+// Zero (unset) leaves water open.
+uniform float waterBlockVolume;
 
 bool inBounds(ivec2 coord, ivec2 size) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < size.x && coord.y < size.y;
@@ -33,6 +39,16 @@ void main() {
             }
             if (source == 3u) blocked = 3u;
         }
+    }
+    // 3 as well when water fills every source cell the gas cell covers (not its one-cell halo, so the gas cell over a
+    // pool's surface stays open and the water there still meets the hot gas above it). Oil is fuel and stays open.
+    if (blocked == 0u && waterBlockVolume > 0.0) {
+        bool submerged = true;
+        for (int i = 0; i < scale * scale && submerged; ++i) {
+            ivec2 cell = min(dst * scale + ivec2(i % scale, i / scale), srcSize - 1);
+            submerged = imageLoad(liquidVolumeTex, cell).x * (1.0 - imageLoad(oilTex, cell).x) >= waterBlockVolume;
+        }
+        if (submerged) blocked = 3u;
     }
 
     imageStore(dstBoundaryTex, dst, uvec4(blocked, 0u, 0u, 0u));

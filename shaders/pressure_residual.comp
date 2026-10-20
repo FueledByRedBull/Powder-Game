@@ -3,6 +3,7 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 4) uniform readonly image2D rhsWideTex;  // the gas right-hand side
 uniform sampler2D pressureTex;
 layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
 layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
@@ -25,6 +26,7 @@ uniform int useLiquidMask;
 uniform float liquidPhiThreshold;
 uniform int collectStats;
 uniform float sandLeak;
+uniform int wideRhs;  // 1: the right-hand side is rhsWideTex
 uniform int openTop;
 // Gas: dense sand (gas mask 3) conducts at sandLeak like the water solve's sand walls.
 uniform int porousSand;
@@ -64,7 +66,7 @@ vec4 residualStats(ivec2 coord) {
         }
     }
 
-    float rhs = imageLoad(rhsTex, coord).x;
+    float rhs = wideRhs != 0 ? imageLoad(rhsWideTex, coord).x : imageLoad(rhsTex, coord).x;
     float pressure = texelFetch(pressureTex, coord, 0).x;
     const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
     float pressure_sum = 0.0;

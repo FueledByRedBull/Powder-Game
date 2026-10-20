@@ -44,10 +44,12 @@ uniform float advectionCfl;
 // sample one velocity and can never separate, so in such a cell each takes a small swept random step.
 uniform float clumpVolume;
 uniform uint jitterSeed;
-// Oil (state2.z records) is lighter than water. oilBuoyancy (cells/s^2) is (1 - rho_oil / rho_water) g: every record
-// gets it in proportion to the local oil share, a Boussinesq body force on the mixture, so oil bodies rise as a whole
-// while water flows around them. oilDrift (cells/s) separates the two liquids within a cell, which the shared grid
-// velocity cannot. Both 0 when no oil exists.
+// Oil (state2.z records) is lighter than water. The shared solve treats all liquid as water, so its pressure gradient
+// accelerates oil too little: oilBuoyancy is rho_water / rho_oil - 1, and every record gains that times the local oil
+// share times the pressure acceleration -grad p / rho_water (grid acceleration minus gravity), the variable-density
+// correction on the mixture. In a pool that is about +g, so oil bodies rise while water flows around them; in open air
+// and in free fall the pressure gradient is zero and oil falls at g like water. oilDrift (cells/s) separates the two
+// liquids within a cell, which the shared grid velocity cannot, scaled the same way. Both 0 when no oil exists.
 uniform float oilBuoyancy;
 uniform float oilDrift;
 uniform float restVolume;  // liquid volume of a cell at rest density
@@ -65,23 +67,11 @@ bool blockedCell(ivec2 cell) {
            imageLoad(boundaryMaskTex, cell).x != 0u;
 }
 
+// The domain edge is a wall like a painted one (blockedCell is true outside the grid): particles sweep to its face, as
+// sand does, instead of stopping half a cell short of it.
 float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 lastCell) {
     float hitTime = 1.0;
     hitNormal = vec2(0.0);
-    for (int axis = 0; axis < 2; ++axis) {
-        if (displacement[axis] == 0.0) {
-            continue;
-        }
-        float edge = displacement[axis] > 0.0 ? float(gridSize[axis]) - 0.5 : 0.5;
-        float time = (edge - position[axis]) / displacement[axis];
-        if (time <= hitTime) {
-            if (time < hitTime) {
-                hitNormal = vec2(0.0);
-            }
-            hitNormal[axis] = -sign(displacement[axis]);
-            hitTime = time;
-        }
-    }
 
     ivec2 cell = ivec2(floor(position));
     lastCell = cell;
@@ -167,12 +157,9 @@ void escapeSand(inout vec2 position, inout vec2 velocity) {
 
 void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 affine,
                         vec2 displacement, float bounce) {
-    position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
+    position = clamp(position, vec2(0.0), vec2(gridSize) - vec2(1.0 / 256.0));
     if (imageLoad(boundaryMaskTex, ivec2(floor(position))).x >= 2u) {
         escapeSand(position, velocity);
-        // The escape keeps the place within the cell, which in an edge cell can lie beyond the clamp; the domain
-        // sweep below needs a start inside it (else its hit time is negative and the move runs backward).
-        position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
     }
     // A particle still inside painted geometry waits for the brush's explicit clearing.
     if (blockedCell(ivec2(floor(position)))) {
@@ -418,6 +405,14 @@ void main() {
 
     vec2 position = particle.state0.xy;
     vec2 velocity = particle.state0.zw;
+    if (fract(particle.state2.z) == 0.0) {
+        // A per-record tag in the fraction of state2.z, below 0.5 so the oil test (state2.z > 0.5) is unchanged: hashed
+        // once from the record's first position (records start apart; spawn and unpacking write 0 or 1).
+        uvec2 b = floatBitsToUint(position);
+        uint h = b.x * 2654435761u ^ b.y * 2246822519u;
+        h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+        particle.state2.z += (float(h & 65535u) + 1.0) / 131074.0;
+    }
     mat2 affine = mat2(vec2(particle.state1.z, particle.state1.w), vec2(particle.state2.x, particle.state2.y));
     if (invalidVec2(position) || invalidVec2(velocity) || invalidMat2(affine)) {
         atomicAdd(nanInfDetected, 1u);
@@ -430,6 +425,11 @@ void main() {
     affine = gatherGridVelocity(position, pic_velocity, prev_grid_velocity);
     vec2 flip_velocity = velocity + (pic_velocity - prev_grid_velocity);
     velocity = mix(pic_velocity, flip_velocity, clamp(flipBlend, 0.0, 1.0));
+    // -grad p / rho_water: the grid's acceleration this substep less gravity. Zero in free fall and open air, about -g
+    // (upward) in a resting pool; support is its size relative to g.
+    float g = max(length(gravity), 1.0);
+    vec2 pressureAcceleration = (pic_velocity - prev_grid_velocity) / dt - gravity;
+    float support = clamp(length(pressureAcceleration) / g, 0.0, 1.0);
 
     // Drag toward the sand: the equal and opposite exchange of sand_grid_update's water drag.
     vec2 sandVelocity;
@@ -450,12 +450,12 @@ void main() {
             ivec2 c = clamp(c0 + o, ivec2(0), gridSize - ivec2(1));
             share += imageLoad(oilTex, c).x * (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
         }
-        velocity.y += oilBuoyancy * share * dt;
+        // Capped at 2 g: an impact's pressure spike must not fling the oil.
+        float magnitude = length(pressureAcceleration);
+        velocity += oilBuoyancy * share * dt * pressureAcceleration * min(1.0, 2.0 * g / max(magnitude, 1e-6));
     }
 
     if (bulkDamping > 0.0) {
-        float g = max(length(gravity), 1.0);
-        float support = clamp(length((pic_velocity - prev_grid_velocity) / dt - gravity) / g, 0.0, 1.0);
         velocity *= exp(-bulkDamping * support * dt);
     }
 
@@ -497,8 +497,12 @@ void main() {
     ivec2 finalCell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
     if (clumpVolume > 0.0 && imageLoad(liquidVolumeTex, finalCell).x > clumpVolume) {
         // Hashed from the particle's own state, not its slot: slots are reordered nondeterministically.
+        // The record tag keeps coincident records apart: once FLIP has made their velocities equal too (the 0.97 blend
+        // shrinks a difference below float precision within seconds), the state alone drew one jitter for all of them
+        // and a converged clump (95 records in one cell of a calm dam break) never dissolved.
         uvec4 bits = floatBitsToUint(vec4(position, velocity));
-        uint h = bits.x * 747796405u + bits.y * 2891336453u + bits.z * 1664525u + bits.w * 22695477u + jitterSeed * 2654435761u;
+        uint h = bits.x * 747796405u + bits.y * 2891336453u + bits.z * 1664525u + bits.w * 22695477u +
+                 jitterSeed * 2654435761u + floatBitsToUint(particle.state2.z) * 3266489917u;
         h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
         vec2 jitter = (vec2(float(h & 65535u), float(h >> 16)) / 65536.0 - 0.5) * 0.5;
         vec2 keptVelocity = velocity;  // a position-only correction: contacts must not change the velocity
@@ -507,9 +511,9 @@ void main() {
     }
     if (oilDrift > 0.0) {
         // Drift-flux separation: oil slips up through water and water slips down through oil, relative to the shared
-        // flow, at a fixed speed scaled by how much of the other liquid is in this cell or the one it moves into.
-        // A position-only move, like the clump step. (The buoyancy applied to oil records alone instead built
-        // per-record slip under FLIP and shot oil jets out of the pool.)
+        // flow, at a fixed speed scaled by how much of the other liquid is in this cell or the one it moves into, and
+        // by the support: in free fall nothing separates them. A position-only move, like the clump step. (The buoyancy
+        // applied to oil records alone instead built per-record slip under FLIP and shot oil jets out of the pool.)
         bool oil = particle.state2.z > 0.5;
         ivec2 cell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
         float other = 0.0;
@@ -519,7 +523,7 @@ void main() {
             float share = imageLoad(oilTex, c).x;
             other = max(other, imageLoad(liquidVolumeTex, c).x * (oil ? 1.0 - share : share));
         }
-        float drive = clamp(2.0 * other / restVolume, 0.0, 1.0);
+        float drive = clamp(2.0 * other / restVolume, 0.0, 1.0) * support;
         if (drive > 0.0) {
             vec2 keptVelocity = velocity;
             mat2 keptAffine = affine;

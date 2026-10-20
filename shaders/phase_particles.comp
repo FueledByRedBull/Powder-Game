@@ -12,6 +12,7 @@ layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
 layout(r16f, binding = 1) uniform readonly image2D liquidVolumeTex;
 layout(r16f, binding = 2) uniform readonly image2D temperatureTex;  // gas grid
 layout(rg16f, binding = 3) uniform readonly image2D reactionTex;    // gas grid, y is the flame
+layout(rg16f, binding = 4) uniform readonly image2D oilFieldTex;    // x: oil share per cell (oil_field.comp, last tick)
 
 struct WaterParticle {
     vec4 state0;
@@ -28,7 +29,8 @@ layout(std430, binding = 1) buffer PhaseCells {
     uint cellCounts[];
 };
 
-// Per gas cell: evaporated water records, then lit oil records.
+// Per gas cell: evaporated water records (bits 0-15) and records that flashed on burning oil at most four cells below
+// (bits 16-31), then lit oil records.
 layout(std430, binding = 2) buffer GasSources {
     uint gasSources[];
 };
@@ -48,6 +50,20 @@ uniform float evaporateRate;  // 1/s for surface water under gas at full heat
 uniform float burnRate;       // 1/s for surface oil above its ignition temperature
 uniform float ignitionTemperature;
 uniform float restVolume;  // liquid volume of a cell at rest density
+// Water meeting burning oil (oil under it, and in its own cell unless open air is beside or above it, with gas at the
+// ignition temperature over it) boils at once: the slick is far above 100 C, so water that lands on it or sinks through
+// it flashes to steam instead of resting under it. The pool under a slick (water below) does not.
+uniform float flashRate;  // 1/s
+
+// Hottest temperature or flame in `span` gas cells from `gas` up.
+float heatAbove(ivec2 gas, int span) {
+    float hot = 0.0;
+    for (int i = 0; i < span; ++i) {
+        ivec2 g = min(gas + ivec2(0, i), gasSize - ivec2(1));
+        hot = max(hot, max(imageLoad(temperatureTex, g).x, imageLoad(reactionTex, g).y));
+    }
+    return hot;
+}
 
 // Open air next to the particle: a cell that is neither wall nor liquid.
 bool airCell(ivec2 cell) {
@@ -70,20 +86,28 @@ void main() {
     // Exposed: open air above or beside it (the top of a pool, the edges of a falling stream).
     bool lit = particle.state2.w > 0.5;
     bool burning = false;
-    if (airCell(cell + ivec2(0, 1)) || airCell(cell + ivec2(1, 0)) || airCell(cell - ivec2(1, 0))) {
-        ivec2 gas = clamp((cell + ivec2(0, 2)) / 2, ivec2(0), gasSize - ivec2(1));
-        int gasLinear = gas.y * gasSize.x + gas.x;
+    bool exposed = airCell(cell + ivec2(0, 1)) || airCell(cell + ivec2(1, 0)) || airCell(cell - ivec2(1, 0));
+    ivec2 gas = clamp((cell + ivec2(0, 2)) / 2, ivec2(0), gasSize - ivec2(1));
+    int gasLinear = gas.y * gasSize.x + gas.x;
+    float rate = 0.0;
+    if (exposed) {
         // Heat and flame within four gas cells (8 cells, 4 cm) above: a flame heats the surface below it by radiation.
-        float hot = 0.0;
-        for (int i = 0; i < 4; ++i) {
-            ivec2 g = min(gas + ivec2(0, i), gasSize - ivec2(1));
-            hot = max(hot, max(imageLoad(temperatureTex, g).x, imageLoad(reactionTex, g).y));
-        }
+        float hot = heatAbove(gas, 4);
         // Oil catches at the ignition temperature and, once lit, burns while its flame keeps the gas above it hot;
         // a lit record feeds its gas cell every tick (steam_update.comp), like burning wood.
         burning = oil && hot >= ignitionTemperature - (lit ? 0.1 : 0.0);
         if (burning) atomicAdd(gasSources[2 * gasLinear + 1], 1u);
-        float rate = oil ? (burning ? burnRate : 0.0) : evaporateRate * smoothstep(0.25, 0.7, hot);
+        rate = oil ? (burning ? burnRate : 0.0) : evaporateRate * smoothstep(0.25, 0.7, hot);
+    }
+    bool flash = false;
+    if (!oil && flashRate > 0.0) {
+        bool onOil = imageLoad(oilFieldTex, max(cell - ivec2(0, 1), ivec2(0))).x > 0.25 &&
+                     (exposed || imageLoad(oilFieldTex, cell).x > 0.25);
+        // From the record's own gas cell up 12 cells (6 cm): water a few cells down in a slick still meets its flame.
+        flash = onOil && heatAbove(clamp(cell / 2, ivec2(0), gasSize - ivec2(1)), 6) >= ignitionTemperature;
+        if (flash) rate = max(rate, flashRate);
+    }
+    {
         if (rate > 0.0) {
             // Hashed from the particle's own state, not its slot: slots are reordered nondeterministically.
             uvec4 bits = floatBitsToUint(particle.state0);
@@ -96,6 +120,8 @@ void main() {
                 } else {
                     atomicAdd(gasSources[2 * gasLinear], 1u);
                     atomicAdd(evaporatedWater, 1u);
+                    // Its steam fills the column whose heat lights the oil below (heatAbove(gas, 4)): quench all of it.
+                    for (int k = 0; flash && k < 4 && gas.y + k < gasSize.y; ++k) atomicAdd(gasSources[2 * (gasLinear + k * gasSize.x)], 65536u);
                 }
                 return;
             }

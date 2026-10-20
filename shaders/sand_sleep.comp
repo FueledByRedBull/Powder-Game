@@ -5,7 +5,7 @@ layout(local_size_x = 256) in;
 
 struct SandParticle {
     vec4 state0;
-    vec4 state1;  // x: 0 inactive, else 1 + ticks the grain has been slower than sleepSpeed
+    vec4 state1;  // x: 0 inactive, else 1 + ticks the grain has been slower than sleepSpeed + hardening fraction
     vec4 state2;
     vec4 state3;
 };
@@ -19,8 +19,8 @@ layout(std430, binding = 1) buffer SandCellTally {
     uint tally[];
 };
 
-// Per cell: sums of the ready grains' left stretch V = F R^T (column-major, moisture in place of the symmetric [1][0]),
-// times 4096.
+// Per cell: sums of the ready grains' volume ratio J = det F, hardening fraction (state1.x's) and moisture, times 4096
+// (.w spare).
 layout(std430, binding = 2) buffer SandCellFSum {
     int fsum[];
 };
@@ -50,23 +50,23 @@ void main() {
     }
     float speed = length(particle.state0.zw);
     float still = speed < sleepSpeed ? min(floor(particle.state1.x - 1.0) + 1.0, 255.0) : 0.0;
-    particles[index].state1.x = 1.0 + still;
+    // The fraction is the grain's friction hardening (sand_particle_step.comp).
+    particles[index].state1.x = 1.0 + still + fract(particle.state1.x);
 
     mat2 deformation = mat2(particle.state3.xy, particle.state3.zw);
     float volume = determinant(deformation);
+    // Damp grains pack too: packed cells keep their mean hardening and moisture, hold the moving grains beside them by
+    // those capillary bonds (sand_grid_update.comp) and restore them on wake.
     bool ready = still >= float(sleepTicks) && particle.state1.y == 1.0 && volume > 0.0 && volume < 64.0;
     ivec2 cell = ivec2(floor(position));
     int cellIndex = cell.y * gridSize.x + cell.x;
     atomicAdd(tally[cellIndex], ready ? 4097u : 1u);
     if (ready) {
-        // The left stretch V = F R^T: averaging whole F would average the grains' rotations too, shrinking the mean
-        // (det of a mean rotation < 1) into a spurious compression. V keeps the stress the grain holds.
-        vec2 rotation = normalize(vec2(deformation[0][0] + deformation[1][1], deformation[0][1] - deformation[1][0]));
-        mat2 stretch = deformation * transpose(mat2(rotation, vec2(-rotation.y, rotation.x)));
-        // V is symmetric, so its [1][0] slot carries the grain's moisture (sand_particle_step.comp's state2.w fraction).
-        vec4 packedStretch = vec4(stretch[0], particle.state2.w - floor(particle.state2.w), stretch[1][1]);
-        for (int k = 0; k < 4; ++k) {
-            atomicAdd(fsum[4 * cellIndex + k], int(round(packedStretch[k] * 4096.0)));
+        // Woken grains restart isotropic at the mean J (sand_pack.comp), so J is all of F a packed cell keeps; the
+        // hardening and moisture fractions come back with them (sand_particle_step.comp's record layout).
+        vec3 kept = vec3(volume, fract(particle.state1.x), particle.state2.w - floor(particle.state2.w));
+        for (int k = 0; k < 3; ++k) {
+            atomicAdd(fsum[4 * cellIndex + k], int(round(kept[k] * 4096.0)));
         }
     }
 }

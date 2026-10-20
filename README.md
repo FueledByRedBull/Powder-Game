@@ -26,7 +26,7 @@ cmake --build build-msvc --config Release --parallel
 .\build-msvc\Release\powder_game.exe
 ```
 
-Keep the generated `shaders` folder and the copied DLLs next to the executable; the app loads that copy of the shaders, whatever the working directory. `PYTHONUTF8` stops the pinned GLAD generator misreading its bundled OpenGL specification under non-UTF-8 Windows locales. `runtime-dlls.txt` in the output folder lists the libraries to ship.
+`powder_game.exe` is self-contained: the shaders are compiled into it and the C/C++ runtime is linked statically (`/MT`), so the executable alone runs from any folder without the VC++ redistributable. To try shader edits without rebuilding, set `POWDER_SHADER_DIR` to a folder holding every shader (for example the repository's `shaders`); the app then loads all of them from there and fails, naming the file, if one is missing. A `shaders` folder beside the executable is ignored. `PYTHONUTF8` stops the pinned GLAD generator misreading its bundled OpenGL specification under non-UTF-8 Windows locales.
 
 ### Linux
 
@@ -73,9 +73,9 @@ Over the simulation the cursor is a lantern: a soft warm light that lights the c
 
 Experimental. It has been built and checked on one machine (Windows 11, Radeon RX 7800 XT).
 
-- In the latest validation run all 80 CTest cases and all six scripted replay scenes passed; see [VALIDATION.md](VALIDATION.md).
-- The real-time benchmark (1000 x 1000, 100,000 water and 50,000 sand particles plus smoke and fire, two simulation ticks per frame) fails. Frame times fit the 30 FPS budget (combined GPU mean 21 to 23 ms, p95 27 to 28 ms, with a Unity editor sharing the GPU), but on every run two pressure solves early on miss their convergence gate. The preferred 60 FPS combined target is not met.
-- Matter limits: up to 2,097,152 moving water particles and 1,048,576 moving sand grains at once (the pools take about 320 MB of GPU memory; the app refuses to start if the driver's storage-block limit is smaller). Settled sand goes to sleep as per-cell grain counts and calm deep water packs the same way; both leave their pools, so how much can sit on screen is bounded by cells, and both wake when disturbed.
+- In the latest validation run all 93 CTest cases and all six scripted replay scenes passed; see [VALIDATION.md](VALIDATION.md).
+- The real-time benchmark (1000 x 1000, 100,000 water and 50,000 sand particles plus smoke and fire, two simulation ticks per frame) passes: combined GPU mean about 18 ms (55 FPS), p95 about 28 ms, idle about 2.4 ms, with clean failure counters and a Unity editor open. The preferred 60 FPS combined target is not quite met.
+- Matter limits: up to 2,097,152 moving water particles and 1,048,576 moving sand grains at once (the pools take about 320 MB of GPU memory; the app refuses to start if the driver's storage-block limit is smaller). Settled sand goes to sleep as per-cell grain counts and calm deep water packs the same way; both leave their pools, so how much can sit on screen is bounded by cells, and both wake when disturbed. Moving water fills about half the screen at the cap; when the water pool is that full the water and oil brushes simply stop adding liquid (a sixteenth of the pool stays free for packed water that wakes) until some of it packs, evaporates or is erased.
 - Live mouse painting, the `H` key in a real window, HiDPI displays and temporal flicker have not been checked by hand.
 - Linux and MinGW builds have not been run in the validation environment, and no other GPU has been tried.
 
@@ -83,7 +83,7 @@ Experimental. It has been built and checked on one machine (Windows 11, Radeon R
 
 ## Tests
 
-CTest registers 80 cases: configuration parsing, GPU and sand fixtures, application lifecycle scenes, the shader-package check and two replay scenes. The GPU tests open hidden windows but still need a real OpenGL 4.3 context. Run them serially:
+CTest registers 93 cases: configuration parsing, GPU and sand fixtures, application lifecycle scenes, the shader-package check and two replay scenes. The GPU tests open hidden windows but still need a real OpenGL 4.3 context. Run them serially:
 
 ```powershell
 ctest --test-dir build-msvc -C Release --output-on-failure -j 1
@@ -97,7 +97,7 @@ The second command runs the scripted replay scenes (`water`, `gas`, `sand`, `bou
 - `src/`: the app (`PowderApp`), environment configuration, fixed-step clock, shader loader and the HUD bitmap font
 - `shaders/`: GLSL compute passes, plus `composite.frag` for the scene and `hud.frag` for the overlay
 - `tests/`: configuration, GPU, sand and application tests, and the shader-package check
-- `docs/`: the screenshot above
+- `docs/`: the screenshot above and [ALGORITHMS.md](docs/ALGORITHMS.md), a per-pass reference of the numerical methods, constants and their sources
 - [PLAN.md](PLAN.md): architecture as implemented
 - [VALIDATION.md](VALIDATION.md): commands, tests and measured results
 - [ROADMAP.md](ROADMAP.md): handoff and evidence history

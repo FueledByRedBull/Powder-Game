@@ -1,6 +1,7 @@
 #include "Config.hpp"
 #include "FixedStepClock.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -79,11 +80,12 @@ constexpr FloatSetting kFloatSettings[] = {
     {"POWDER_SAND_MAX_VELOCITY", &SimulationConfig::sand_max_velocity, 2400.0F, FloatDomain::Nonnegative},
     {"POWDER_SAND_FRICTION", &SimulationConfig::sand_friction_coefficient, 0.62F, FloatDomain::Nonnegative},
     {"POWDER_SAND_REFERENCE_DENSITY", &SimulationConfig::sand_reference_density, 2.0F, FloatDomain::Positive},
-    {"POWDER_SAND_SHEAR_MODULUS", &SimulationConfig::sand_shear_modulus, 196000.0F, FloatDomain::Positive},
-    {"POWDER_SAND_LAME_LAMBDA", &SimulationConfig::sand_lame_lambda, 196000.0F, FloatDomain::Nonnegative},
-    {"POWDER_SAND_FRICTION_ALPHA", &SimulationConfig::sand_friction_alpha, 0.6F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_SHEAR_MODULUS", &SimulationConfig::sand_shear_modulus, 784000.0F, FloatDomain::Positive},
+    {"POWDER_SAND_LAME_LAMBDA", &SimulationConfig::sand_lame_lambda, 784000.0F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_FRICTION_ALPHA", &SimulationConfig::sand_friction_alpha, 0.5F, FloatDomain::Nonnegative},
     {"POWDER_SAND_FRICTION_RATE_GAIN", &SimulationConfig::sand_friction_rate_gain, 0.68F, FloatDomain::Nonnegative},
-    {"POWDER_SAND_COHESION", &SimulationConfig::sand_cohesion, 0.3F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_COHESION", &SimulationConfig::sand_cohesion, 0.15F, FloatDomain::Nonnegative},
+    {"POWDER_SAND_COHESION_SOFTENING", &SimulationConfig::sand_cohesion_softening, 0.5F, FloatDomain::Positive},
     {"POWDER_SAND_MAX_DILATION", &SimulationConfig::sand_max_dilation, 0.14F, FloatDomain::Nonnegative},
     {"POWDER_SAND_CFL", &SimulationConfig::sand_cfl_limit, 0.4F, FloatDomain::Positive},
     {"POWDER_SAND_ADVECTION_CFL", &SimulationConfig::sand_advection_cfl, 1.0F, FloatDomain::Positive},
@@ -93,6 +95,7 @@ constexpr FloatSetting kFloatSettings[] = {
     {"POWDER_SAND_CONTACT_DAMPING", &SimulationConfig::sand_contact_damping, 6.0F, FloatDomain::Nonnegative},
     {"POWDER_SAND_SLEEP_SPEED", &SimulationConfig::sand_sleep_speed, 4.0F, FloatDomain::Nonnegative},
     {"POWDER_SAND_WAKE_IMPACT_SPEED", &SimulationConfig::sand_wake_impact_speed, 60.0F, FloatDomain::Positive},
+    {"POWDER_SAND_WAKE_PRESS_SPEED", &SimulationConfig::sand_wake_press_speed, 20.0F, FloatDomain::Positive},
     {"POWDER_SAND_WAKE_WATER_SPEED", &SimulationConfig::sand_wake_water_speed, 40.0F, FloatDomain::Positive},
     {"POWDER_WATER_SLEEP_SPEED", &SimulationConfig::water_sleep_speed, 2.0F, FloatDomain::Nonnegative},
     {"POWDER_WATER_WAKE_SPEED", &SimulationConfig::water_wake_speed, 5.0F, FloatDomain::Positive},
@@ -167,35 +170,58 @@ void CheckSimulationConfig(const Run& run) {
             }
             Require(steps >= 599 && steps <= 600, "ten elapsed seconds must produce 600 ticks within one tick");
         }
-        // Below 40 Hz every frame counts as an overrun: one tick per frame, the rest dropped (documented slow motion).
+        // A slow display with cheap ticks catches up two ticks per frame and keeps real time.
         FixedStepClock slow_display;
         int slow_steps = 0;
         for (int frame = 0; frame < 300; ++frame) slow_steps += slow_display.Advance(1.0 / 30.0, dt);
-        Require(slow_steps == 300, "a 30 Hz frame rate runs one tick per frame");
+        Require(slow_steps == 600, "a 30 Hz frame rate with cheap ticks runs two ticks per frame");
         FixedStepClock clock;
         Require(clock.Advance(dt * 0.5, dt) == 0 && clock.Advance(dt * 0.5, dt) == 1,
                 "sub-frame elapsed time must carry into the next frame");
         Require(clock.Advance(dt * 0.9, dt) == 0 && clock.Advance(dt * 1.2, dt) == 2,
                 "a frame that kept up may catch up two ticks");
-        Require(clock.Advance(10.0, dt) == 1 && clock.Advance(0.0, dt) == 1 && clock.Advance(0.0, dt) == 0,
-                "a stall runs one tick and keeps at most one tick of backlog");
+        Require(clock.Advance(10.0, dt) == 2 && clock.Advance(0.0, dt) == 1 && clock.Advance(0.0, dt) == 0,
+                "a stall runs at most two ticks and keeps at most one tick of backlog");
         Require(clock.Advance(-1.0, dt) == 0, "clock rollback must not advance or rewind the simulation");
+        clock.MeasureTicks(0.010, 1);
+        Require(clock.Advance(10.0, dt) == 1, "a measured tick too costly to double up runs once per frame");
     });
     run("fixed simulation clock cannot death-spiral when a tick costs more than its duration", [] {
         const double dt = 1.0 / 60.0;
         for (double tick_cost : {0.020, 0.050, 0.200}) {
             FixedStepClock clock;
             double frame = dt;
-            int most = 0;
             for (int i = 0; i < 200; ++i) {
                 const int steps = clock.Advance(frame, dt);
                 Require(steps >= 1 || frame < dt, "a frame of at least one tick must advance the simulation");
-                Require(frame <= 1.5 * dt ? steps <= 2 : steps <= 1, "an overrun frame must be followed by one tick");
-                if (i > 0) most = std::max(most, steps);
+                Require(i == 0 || steps == 1, "a measured tick longer than a frame must run once per frame");
+                clock.MeasureTicks(steps * tick_cost, steps);
                 frame = 0.002 + steps * tick_cost;  // the next frame waits for this one's ticks plus rendering
             }
-            // 20 ms ticks overrun only after a two-tick catch-up; slower ticks overrun every frame.
-            Require(most == (tick_cost < 1.5 * dt ? 2 : 1), "catch-up must stop at the first overrun");
+        }
+    });
+    run("fixed simulation clock keeps the display rate when one tick fits a frame", [] {
+        // A 60 Hz display that misses its interval by 2 ms every tenth frame. A 12 ms tick plus 3 ms of rendering fits a
+        // refresh; two ticks do not. The old 1.5-tick rule doubled up whenever the drift added up to a tick, and those
+        // 27 ms frames halved the frame rate. Ticks of 5 ms still catch up and keep real time.
+        const double dt = 1.0 / 60.0;
+        for (double tick_cost : {0.012, 0.005}) {
+            FixedStepClock clock;
+            double frame = dt, wall = 0.0;
+            int ticks = 0, long_frames = 0;
+            for (int i = 0; i < 600; ++i) {
+                const int steps = clock.Advance(frame, dt);
+                clock.MeasureTicks(steps * tick_cost, steps);
+                ticks += steps;
+                wall += frame;
+                const double work = 0.003 + steps * tick_cost;
+                if (i > 0 && work > dt) ++long_frames;
+                frame = std::max(dt, work) + (i % 10 == 9 ? 0.002 : 0.0);
+            }
+            Require(long_frames == 0, "a tick that fits a frame must never be doubled into a long frame");
+            const double sim_rate = ticks * dt / wall;
+            Require(tick_cost > 0.01 ? sim_rate > 0.95 && sim_rate <= 1.0 : sim_rate > 0.99,
+                    "the simulation must stay near real time while the frame rate holds");
         }
     });
     run("substep count respects finite inputs before narrowing", [] {
@@ -321,7 +347,7 @@ void CheckSimulationConfig(const Run& run) {
     // Zero disables sleep-packing; the still-tick timer saturates at 255.
     run("sand sleep ticks domain", [] {
         ClearConfigEnvironment();
-        Require(powder_config::LoadConfigFromEnvironment().sand_sleep_ticks == 12, "POWDER_SAND_SLEEP_TICKS default");
+        Require(powder_config::LoadConfigFromEnvironment().sand_sleep_ticks == 60, "POWDER_SAND_SLEEP_TICKS default");
         for (const char* value : {"0", "255"}) {
             SetValue(value, "POWDER_SAND_SLEEP_TICKS");
             Require(powder_config::LoadConfigFromEnvironment().sand_sleep_ticks == std::atoi(value),

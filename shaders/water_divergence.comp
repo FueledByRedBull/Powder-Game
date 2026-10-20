@@ -32,7 +32,8 @@ uniform float densityRate;
 
 // Largest density error (relative to rest) the correction acts on, so a source that overfills a cell is not blown out.
 const float kMaxDensityError = 0.5;
-// A cell is inside the bulk when every neighbour holds at least this share of the rest density (or is a wall).
+// A cell is inside the bulk when the cell above holds at least this share of the rest density (or is a wall or the
+// domain top); see bulkCell.
 const float kBulkDensity = 0.75;
 
 bool nearPacked(ivec2 coord) {
@@ -84,6 +85,8 @@ void main() {
         return;
     }
 
+    // Sealed pockets, down to a pinhole walled in on all four sides, get their right-hand side's mean removed afterwards
+    // (pressure_pockets.comp).
     if (imageLoad(boundaryTex, coord).r != 0u || !liquidCell(coord)) {
         imageStore(divergenceTex, coord, vec4(0.0));
         return;

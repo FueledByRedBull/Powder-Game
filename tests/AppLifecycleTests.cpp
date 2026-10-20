@@ -20,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -151,13 +152,13 @@ struct AppLifecycleTests {
         cursor = std::max(cursor, static_cast<GLuint>(particles.size()));
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(cursor), &cursor);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        if (water) app.water_state_.record_bound = std::max(app.water_state_.record_bound, cursor);
+        GLuint& bound = water ? app.water_state_.record_bound : app.sand_state_.record_bound;
+        bound = std::max(bound, cursor);
     }
 
-    // Relaxation dispatches per gas V-cycle: red and black sweeps before and after each coarser level, plus one
+    // Relaxation dispatches per gas V-cycle: one fused smoothing before and one after each coarser level, plus one
     // dispatch for the whole bottom solve.
-    static constexpr int kGasRelaxPerCycle =
-        4 * PowderApp::kGasSmoothSweeps * (PowderApp::kGasLevels - 1) + 1;
+    static constexpr int kGasRelaxPerCycle = 2 * (PowderApp::kGasLevels - 1) + 1;
     static void BoundaryLifecycle(PowderApp& app) {
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         app.InitializeState();
@@ -680,6 +681,33 @@ struct AppLifecycleTests {
                 "source-free water must conserve total stored particle mass");
     }
 
+    // A water stamp that might not fit below the wake reserve is skipped whole on the host, never cut short on the GPU.
+    static void WaterPoolFull(PowderApp& app) {
+        app.config_ = {};
+        app.InitializeState();
+        app.brush_mode_ = PowderApp::BrushMode::Water;
+        app.brush_x_ = app.brush_y_ = 500;
+        app.brush_radius_ = 12;
+        const auto stamp_from = [&](GLuint record_bound) {
+            app.water_state_.record_bound = record_bound;
+            app.StampBrush(app.BuildBrushConfig());
+            GLuint cursor = 0;
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, app.water_state_.spawn_cursor);
+            glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(cursor), &cursor);
+            return std::pair{cursor, app.water_state_.record_bound};
+        };
+        const auto [full_cursor, full_bound] = stamp_from(PowderApp::kMaxWaterParticles - PowderApp::kWaterWakeReserve);
+        const auto [open_cursor, open_bound] = stamp_from(0U);
+        app.water_state_.record_bound = 0U;
+        std::cout << "water-pool-full: cursor full/open=" << full_cursor << '/' << open_cursor << " bound=" << full_bound << '/'
+                  << open_bound << '\n';
+        Require(full_cursor == 0U && full_bound == PowderApp::kMaxWaterParticles - PowderApp::kWaterWakeReserve,
+                "a stamp that might pass the reserve must spawn nothing");
+        Require(open_cursor > 0U && open_cursor <= open_bound, "a stamp below the reserve must spawn");
+        Require(app.ReadDebugCounters()[1] == 0U, "a skipped stamp must not count overflow");
+    }
+
     static void BenchmarkPressure(PowderApp& app) {
         constexpr int width = PowderApp::kGridWidth, height = PowderApp::kGridHeight;
         constexpr std::size_t cells = static_cast<std::size_t>(width) * height;
@@ -906,9 +934,9 @@ struct AppLifecycleTests {
                 glUniform1i(glGetUniformLocation(program, "pressureTex"), 0);
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, app.gas_state_.pressure_a);
-                glBindImageTexture(0, app.gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+                glUniform1i(glGetUniformLocation(program, "wideRhs"), 1);
+                glBindImageTexture(4, app.gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
                 glBindImageTexture(2, app.boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-                glBindImageTexture(3, app.gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
                 const GLuint zero = 0;
                 glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, app.gas_state_.pressure_check);
@@ -926,6 +954,7 @@ struct AppLifecycleTests {
                 std::array<GLuint, 4> counters{};
                 glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
                 glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counters), counters.data());
+                glUniform1i(glGetUniformLocation(program, "wideRhs"), 0);  // the water solve's right-hand side is R16F
                 Require(counters[0] == 0, "residual timing probe must remain finite");
                 std::cout << "gas residual-only " << (zero_pressure ? "initial" : "solved")
                           << " threshold=" << (threshold == 0.004F ? "strict" : "no-fail")
@@ -1800,13 +1829,28 @@ struct AppLifecycleTests {
                    0.25F * block_hash(cell_x, cell_y, 3, 101U)[0] + 0.20F * block_hash(cell_x, cell_y, 4, 202U)[1];
         };
         const auto cave_albedo = [&](int cell_x, int cell_y) {
-            constexpr Rgb cave{0.210F, 0.195F, 0.225F};
-            const float tone = stone_tone(cell_x, cell_y);
-            return Rgb{cave[0] * (0.45F + 1.1F * tone), cave[1] * (0.45F + 1.1F * tone), cave[2] * (0.45F + 1.1F * tone)};
+            constexpr Rgb cave{0.125F, 0.118F, 0.150F};
+            const float tone = 0.40F * block_hash(cell_x, cell_y, 2, 11U)[0] + 0.35F * block_hash(cell_x, cell_y, 3, 101U)[0] +
+                               0.25F * block_hash(cell_x, cell_y, 4, 202U)[1];
+            return Rgb{cave[0] * (0.70F + 0.60F * tone), cave[1] * (0.70F + 0.60F * tone), cave[2] * (0.70F + 0.60F * tone)};
+        };
+        // Open cells next to solids: x is the drop shadow from a solid up to four cells up-left, y a solid 4-neighbour.
+        const auto solid_shade = [&](int cell_x, int cell_y, const auto& solid_at) {
+            const auto solid = [&](int x, int y) {
+                return solid_at(std::clamp(x, 0, PowderApp::kGridWidth - 1), std::clamp(y, 0, PowderApp::kGridHeight - 1));
+            };
+            const float touch = solid(cell_x + 1, cell_y) || solid(cell_x - 1, cell_y) || solid(cell_x, cell_y + 1) || solid(cell_x, cell_y - 1) ? 1.0F : 0.0F;
+            float shadow = touch;
+            for (int k = 1; k <= 4; ++k)
+                if (solid(cell_x - k, cell_y + k)) {
+                    shadow = std::max(shadow, static_cast<float>(5 - k) / 4.0F);
+                    break;
+                }
+            return std::array<float, 2>{shadow, touch};
         };
         const auto rock_albedo = [&](int cell_x, int cell_y, const auto& solid_at) {
-            constexpr Rgb dark{0.21F, 0.24F, 0.32F}, mid{0.38F, 0.43F, 0.53F}, light{0.60F, 0.66F, 0.78F}, moss_color{0.34F, 0.38F, 0.17F};
-            constexpr Rgb crust_top{0.80F, 0.86F, 0.94F}, crust_side{0.60F, 0.66F, 0.76F};
+            constexpr Rgb dark{0.30F, 0.32F, 0.39F}, mid{0.46F, 0.49F, 0.57F}, light{0.62F, 0.66F, 0.75F}, moss_color{0.36F, 0.40F, 0.18F};
+            constexpr Rgb crust_top{0.88F, 0.91F, 0.96F}, crust_side{0.66F, 0.70F, 0.79F};
             const auto fine = block_hash(cell_x, cell_y, 0, 0U);
             const float tone = stone_tone(cell_x, cell_y);
             const float moss = smoothstep(0.70F, 0.78F, 0.6F * block_hash(cell_x, cell_y, 3, 303U)[0] + 0.4F * block_hash(cell_x, cell_y, 1, 404U)[1]);
@@ -1825,7 +1869,7 @@ struct AppLifecycleTests {
             for (std::size_t channel = 0; channel < 3; ++channel) {
                 float value = mix(mix(dark[channel], mid[channel], smoothstep(0.30F, 0.50F, tone)), light[channel], smoothstep(0.60F, 0.80F, tone));
                 value = mix(value, moss_color[channel], 0.7F * moss);
-                value *= mix(0.62F, 1.0F, std::max(std::max(rim_top, rim_bottom), rim_side));
+                value *= mix(0.80F, 1.0F, std::max(std::max(rim_top, rim_bottom), rim_side));
                 value = mix(value, mix(crust_top[channel], moss_color[channel] * 1.7F, 0.5F * moss) * crust_tone, 0.95F * top);
                 value = mix(value, crust_side[channel] * crust_tone, 0.55F * side * (1.0F - top));
                 color[channel] = value * (1.0F - 0.35F * bottom * (1.0F - top));
@@ -1878,6 +1922,8 @@ struct AppLifecycleTests {
                 if (skip_at(grid_x)) continue;
                 const bool solid = solid_at(sx, sy);
                 Rgb color = solid ? rock_albedo(sx, sy, solid_at) : cave_albedo(sx, sy);
+                const auto shade = solid ? std::array<float, 2>{} : solid_shade(sx, sy, solid_at);
+                for (float& value : color) value *= 1.0F - 0.60F * shade[0];
                 if (solid) {
                     const float top = solid_at(sx, std::min(sy + 1, PowderApp::kGridHeight - 1)) ? 0.0F : 1.0F;
                     const float bottom = solid_at(sx, std::max(sy - 1, 0)) ? 0.0F : 1.0F;
@@ -1898,6 +1944,7 @@ struct AppLifecycleTests {
                         color[channel] = mix(color[channel], mix(relaxed[channel], compressed[channel], stress) * grain * wet, cover);
                     coverage.partial_sand += cover < 1.0F;
                 }
+                for (float& value : color) value *= 1.0F - 0.30F * shade[1];
                 ++coverage.classes[(cover > 0.0F ? 2U : 0U) + (solid ? 1U : 0U)];
                 const float dither = (hash(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y))[0] - 0.5F) / 255.0F;
                 for (int channel = 0; channel < 4; ++channel) {
@@ -2157,8 +2204,20 @@ struct AppLifecycleTests {
             Require(brightest > minimum, "emission level " + std::to_string(level) + " must carry the fire's light: " + std::to_string(brightest));
         }
 
-        // Nothing in a frame depends on time or on previous frames.
+        // A frame depends on the state and the simulation clock only: rendered again it is identical. Lit fire moves with
+        // the clock (tongues, sparks, heat shimmer); unlit frames, which the pixel oracles use, do not.
         Require(render(true, true) == burning, "a lit frame must be deterministic");
+        {
+            const Image unlit_now = render(false, true);
+            const std::uint32_t tick = app.frame_index_;
+            app.frame_index_ = tick + 7U;
+            const Image later = render(true, true), unlit_later = render(false, true);
+            app.frame_index_ = tick;
+            std::size_t changed = 0;
+            for (std::size_t i = 0; i < later.size(); ++i) changed += later[i] != burning[i];
+            Require(changed > 2000, "lit fire must animate with the simulation clock: " + std::to_string(changed) + " bytes changed");
+            Require(unlit_later == unlit_now, "unlit frames must not depend on the simulation clock");
+        }
 
         // The lantern: interactive (letterboxed) frames with the cursor over the simulation only.
         fill_cold();
@@ -2183,6 +2242,17 @@ struct AppLifecycleTests {
         const Image unlit_with = render(false, true);
         app.cursor_in_sim_ = false;
         Require(render(false, true) == unlit_with, "lighting off must switch the lantern off too");
+        // Painted rock is the foreground: a rock band hanging in open space is much brighter than the back wall
+        // beside it under the same moonlight.
+        {
+            std::vector<GLuint> band(rock.size(), 0U);
+            for (int y = 480; y < 520; ++y) for (int x = 200; x < 800; ++x) band[static_cast<std::size_t>(y * PowderApp::kGridWidth + x)] = 2U;
+            glBindTexture(GL_TEXTURE_2D, app.CurrentMaterial());
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PowderApp::kGridWidth, PowderApp::kGridHeight, GL_RED_INTEGER, GL_UNSIGNED_INT, band.data());
+            const Image banded = render(true, true);
+            const double rock_luma = luma(mean_at(banded, 500, 500)), wall_luma = luma(mean_at(banded, 500, 400));
+            Require(rock_luma > 2.5 * wall_luma, "rock must stand out from the back wall: " + std::to_string(rock_luma) + " against " + std::to_string(wall_luma));
+        }
         app.InitializeState();
         std::cout << "lighting: dark but not black, vignette, warm glow near fire against far and against unlit, mipped emission, lantern radius/off states and determinism pass\n";
     }
@@ -2629,6 +2699,338 @@ struct AppLifecycleTests {
         app.replay_mode_ = false;
         if (audit_pressure) std::cout << "pressure audit total water/gas failing cells=" << pressure_failures[0] << '/' << pressure_failures[1] << '\n';
         Require(failures.str().empty(), failures.str());
+    }
+
+    // Deterministic per-pass GPU profile of four scripted scenes, one tick plus Render(true) and DrawHud per frame in a
+    // 1766x1210 window: sweep (water brush 24 at 400 cells/s), pour (water brush 48 at 800 cells/s across the grid),
+    // combined (the benchmark's 100,000 water and 50,000 sand with its fire/smoke source) and user (sand bed under a water
+    // pool, rock strokes, two wood bowls of burning oil). Not a CTest case. POWDER_PROFILE_SCENE selects one scene,
+    // POWDER_PROFILE_FRAMES the measured frames (default 600, after 60 warm-up frames).
+    static void BenchmarkProfile(PowderApp& app) {
+        app.config_ = powder_config::LoadConfigFromEnvironment();
+        const char* scene_env = std::getenv("POWDER_PROFILE_SCENE");
+        const std::string filter = scene_env != nullptr ? scene_env : "";
+        const char* frames_env = std::getenv("POWDER_PROFILE_FRAMES");
+        const int measured = frames_env != nullptr ? std::atoi(frames_env) : 600;
+        constexpr int warmup = 60;
+        static PFNGLDISPATCHCOMPUTEPROC native_dispatch = glad_glDispatchCompute;
+        static PFNGLDISPATCHCOMPUTEINDIRECTPROC native_indirect = glad_glDispatchComputeIndirect;
+        static PFNGLUSEPROGRAMPROC native_use = glad_glUseProgram;
+        static int dispatches = 0;
+        static GLuint current_program = 0;
+        // POWDER_PROFILE_DISPATCH: a timestamp pair around every dispatch (perturbing), summed per program.
+        static std::vector<GLuint> pool;
+        static std::vector<std::pair<GLuint, std::size_t>> pending;  // program, first query of its pair
+        static std::vector<GLuint> pending_groups;                   // workgroups of each timed dispatch, 0 indirect
+        static GLuint dispatch_groups = 0;
+        static const bool by_groups = std::getenv("POWDER_PROFILE_GROUPS") != nullptr;
+        static const bool per_dispatch = std::getenv("POWDER_PROFILE_DISPATCH") != nullptr;
+        if (per_dispatch && pool.empty()) {
+            pool.resize(1 << 15);
+            glGenQueries(static_cast<GLsizei>(pool.size()), pool.data());
+        }
+        static const auto timed = [](const auto& dispatch) {
+            ++dispatches;
+            if (!per_dispatch || 2 * pending.size() + 2 > pool.size()) return dispatch();
+            const std::size_t first = 2 * pending.size();
+            glQueryCounter(pool[first], GL_TIMESTAMP);
+            dispatch();
+            glQueryCounter(pool[first + 1], GL_TIMESTAMP);
+            pending.push_back({current_program, first});
+            pending_groups.push_back(dispatch_groups);
+        };
+        // CPU time blocked in readbacks and fences, so the tick's CPU submission time is its wall time minus this.
+        static PFNGLGETBUFFERSUBDATAPROC native_get_buffer = glad_glGetBufferSubData;
+        static PFNGLCLIENTWAITSYNCPROC native_wait = glad_glClientWaitSync;
+        static PFNGLMAPBUFFERRANGEPROC native_map = glad_glMapBufferRange;
+        static PFNGLGETTEXIMAGEPROC native_get_tex = glad_glGetTexImage;
+        static double blocked_ms = 0.0;
+        static int blocking_calls = 0;
+        static const auto blocked = [](const auto& call) {
+            const auto begin = std::chrono::steady_clock::now();
+            const auto result = call();
+            blocked_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            ++blocking_calls;
+            return result;
+        };
+        glad_glGetBufferSubData = [](GLenum t, GLintptr o, GLsizeiptr s, void* d) {
+            blocked([&] { native_get_buffer(t, o, s, d); return 0; });
+        };
+        glad_glClientWaitSync = [](GLsync sync, GLbitfield flags, GLuint64 timeout) {
+            return blocked([&] { return native_wait(sync, flags, timeout); });
+        };
+        glad_glMapBufferRange = [](GLenum t, GLintptr o, GLsizeiptr l, GLbitfield a) {
+            return blocked([&] { return native_map(t, o, l, a); });
+        };
+        glad_glGetTexImage = [](GLenum t, GLint l, GLenum f, GLenum ty, void* d) {
+            blocked([&] { native_get_tex(t, l, f, ty, d); return 0; });
+        };
+        glad_glUseProgram = [](GLuint p) { current_program = p; native_use(p); };
+        glad_glDispatchCompute = [](GLuint x, GLuint y, GLuint z) {
+            dispatch_groups = x * y * z;
+            timed([&] { native_dispatch(x, y, z); });
+        };
+        glad_glDispatchComputeIndirect = [](GLintptr offset) {
+            dispatch_groups = 0;
+            timed([&] { native_indirect(offset); });
+        };
+        struct Restore {
+            ~Restore() {
+                glad_glDispatchCompute = native_dispatch;
+                glad_glDispatchComputeIndirect = native_indirect;
+                glad_glUseProgram = native_use;
+                glad_glGetBufferSubData = native_get_buffer;
+                glad_glClientWaitSync = native_wait;
+                glad_glMapBufferRange = native_map;
+                glad_glGetTexImage = native_get_tex;
+            }
+        } restore;
+        // Scripted input only: glfwPollEvents delivered the real cursor over the shown window into the stroke trail, so
+        // pour and sweep spawned extra water in some runs (920k-2.1M records where every run now matches).
+        struct DetachedInput {
+            GLFWwindow* window;
+            GLFWcursorposfun cursor;
+            GLFWmousebuttonfun button;
+            GLFWkeyfun key;
+            ~DetachedInput() {
+                glfwSetCursorPosCallback(window, cursor);
+                glfwSetMouseButtonCallback(window, button);
+                glfwSetKeyCallback(window, key);
+            }
+        } detached{app.window_, glfwSetCursorPosCallback(app.window_, nullptr), glfwSetMouseButtonCallback(app.window_, nullptr),
+                   glfwSetKeyCallback(app.window_, nullptr)};
+        const std::map<GLuint, const char*> program_names{{app.init_state_program_, "init_state"}, {app.spawn_full_program_, "spawn_full"}, {app.spawn_gas_program_, "spawn_gas"}, {app.sand_particle_spawn_program_, "sand_particle_spawn"}, {app.sand_particle_compact_program_, "sand_particle_compact"}, {app.sand_particle_clear_program_, "sand_particle_clear"}, {app.sand_particle_p2g_program_, "sand_particle_p2g"}, {app.sand_grid_update_program_, "sand_grid_update"}, {app.sand_particle_step_program_, "sand_particle_step"}, {app.sand_rasterize_program_, "sand_rasterize"}, {app.sand_sleep_program_, "sand_sleep"}, {app.sand_pack_program_, "sand_pack"}, {app.water_sleep_program_, "water_sleep"}, {app.water_pack_program_, "water_pack"}, {app.boundary_build_program_, "boundary_build"}, {app.boundary_downsample_program_, "boundary_downsample"}, {app.boundary_seed_program_, "boundary_seed"}, {app.boundary_jumpflood_program_, "boundary_jumpflood"}, {app.boundary_distance_program_, "boundary_distance"}, {app.water_particle_p2g_program_, "water_particle_p2g"}, {app.water_particle_spawn_program_, "water_particle_spawn"}, {app.water_particle_compact_program_, "water_particle_compact"}, {app.water_particle_clear_program_, "water_particle_clear"}, {app.water_particle_step_program_, "water_particle_step"}, {app.water_particle_finalize_program_, "water_particle_finalize"}, {app.water_mac_build_program_, "water_mac_build"}, {app.water_mac_finalize_program_, "water_mac_finalize"}, {app.water_divergence_program_, "water_divergence"}, {app.pressure_cg_program_, "pressure_cg"}, {app.pressure_pockets_program_, "pressure_pockets"}, {app.pressure_cg_reduce_program_, "pressure_cg_reduce"}, {app.pressure_mg_program_, "pressure_mg"}, {app.water_project_program_, "water_project"}, {app.smoke_advect_program_, "smoke_advect"}, {app.smoke_correct_program_, "smoke_correct"}, {app.gas_velocity_advect_program_, "gas_velocity_advect"}, {app.gas_velocity_correct_program_, "gas_velocity_correct"}, {app.gas_face_to_center_program_, "gas_face_to_center"}, {app.smoke_divergence_program_, "smoke_divergence"}, {app.gas_pressure_kind_program_, "gas_pressure_kind"}, {app.gas_cg_program_, "gas_cg"}, {app.wood_burn_program_, "wood_burn"}, {app.phase_particles_program_, "phase_particles"}, {app.oil_field_program_, "oil_field"}, {app.steam_update_program_, "steam_update"}, {app.gas_pressure_restrict_program_, "gas_pressure_restrict"}, {app.gas_pressure_relax_program_, "gas_pressure_relax"}, {app.smoke_project_program_, "smoke_project"}, {app.pressure_residual_program_, "pressure_residual"}, {app.fire_rd_program_, "fire_rd"}, {app.coupling_fire_program_, "coupling_fire"}, {app.coupling_heat_program_, "coupling_heat"}, {app.render_extract_program_, "render_extract"}, {app.light_build_program_, "light_build"}, {app.render_program_, "render"}, {app.hud_program_, "hud"}};
+        std::ostringstream failures;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glfwSetWindowSize(app.window_, 1766, 1210);
+        glfwShowWindow(app.window_);
+        glfwPollEvents();
+        glfwSwapInterval(0);
+        if (app.fullscreen_vao_ == 0) glGenVertexArrays(1, &app.fullscreen_vao_);
+        int fb_width = 0, fb_height = 0;
+        glfwGetFramebufferSize(app.window_, &fb_width, &fb_height);
+        std::cout << "profile renderer=" << glGetString(GL_RENDERER) << " framebuffer=" << fb_width << 'x' << fb_height
+                  << " frames=" << measured << '\n';
+        std::array<GLuint, 4> stamps{};
+        glGenQueries(4, stamps.data());
+        const float dt = app.config_.fixed_dt;
+        const auto stamp = [&](PowderApp::BrushMode mode, int x, int y, int radius) {
+            app.brush_mode_ = mode;
+            app.brush_x_ = x;
+            app.brush_y_ = y;
+            app.brush_radius_ = radius;
+            app.StampBrush(app.BuildBrushConfig());
+        };
+        const auto line = [&](PowderApp::BrushMode mode, int x0, int y0, int x1, int y1, int radius) {
+            const int steps = std::max(1, static_cast<int>(std::hypot(x1 - x0, y1 - y0) / std::max(1, radius / 2)));
+            for (int i = 0; i <= steps; ++i)
+                stamp(mode, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps, radius);
+        };
+        const auto bowl = [&](int cx, int cy, int r) {
+            for (int a = 0; a <= 36; ++a) {
+                const double t = 3.14159265358979 * (1.0 + a / 36.0);
+                stamp(PowderApp::BrushMode::Wood, cx + static_cast<int>(r * std::cos(t)), cy + static_cast<int>(r * std::sin(t)), 5);
+            }
+        };
+        for (const std::string scene : {"sweep", "pour", "combined", "user"}) {
+            if (!filter.empty() && filter != scene) continue;
+            app.InitializeState();
+            // Every tick's counters (each RunFrame resets them), so a transient failure cannot hide behind a clean last tick.
+            std::array<std::uint64_t, 5> counter_sum{};
+            std::array<GLuint, 5> counter_max{};
+            int ticks = 0, failing_ticks = 0, first_failing = -1;
+            const auto tally = [&] {
+                const auto c = app.ReadDebugCounters();
+                for (std::size_t i = 0; i < c.size(); ++i) {
+                    counter_sum[i] += c[i];
+                    counter_max[i] = std::max(counter_max[i], c[i]);
+                }
+                if (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0) {
+                    if (failing_ticks++ == 0) first_failing = ticks;
+                }
+                ++ticks;
+            };
+            app.replay_mode_ = false;
+            app.render_mode_ = PowderApp::RenderMode::Composite;
+            app.stroke_ = {};
+            app.cursor_trail_.clear();
+            app.help_visible_ = false;
+            app.help_hide_time_ = -1.0;
+            app.painting_ = app.cursor_in_sim_ = false;
+            if (scene == "combined" || scene == "user") {
+                std::vector<Particle> water, sand;
+                const bool user = scene == "user";
+                for (int y = user ? 90 : 200; y < (user ? 190 : 600); ++y)
+                    for (int x = user ? 20 : 600; x < (user ? 980 : 850); ++x) water.push_back({x + 0.5F, y + 0.5F, 0, 0, 1, 1});
+                // The user bed is two jittered grains per cell, as the brush paints it: a one-grain cell-centred lattice
+                // is a degenerate MPM bed whose grains creep at a few cells/s for ever and never pack (7270 moving at the
+                // end against 488).
+                std::uint32_t state = 7U;
+                const auto jitter = [&]() {
+                    state = state * 1664525U + 1013904223U;
+                    return static_cast<float>(state >> 8) / 16777216.0F;
+                };
+                for (int y = user ? 10 : 200; y < (user ? 90 : 450); ++y)
+                    for (int x = user ? 20 : 100; x < (user ? 980 : 300); ++x)
+                        for (int i = 0; i < (user ? 2 : 1); ++i)
+                            sand.push_back({x + (user ? jitter() : 0.5F), y + (user ? jitter() : 0.5F), 0, 0, 1, 1, 0, 0, 0, 0, 1, 0});
+                WriteParticles(app, app.water_state_.particles, water);
+                WriteParticles(app, app.sand_state_.particles, SandRecords(sand));
+            }
+            if (scene == "user") {
+                line(PowderApp::BrushMode::Solid, 60, 420, 380, 320, 7);
+                line(PowderApp::BrushMode::Solid, 620, 360, 940, 470, 7);
+                line(PowderApp::BrushMode::Solid, 150, 700, 420, 760, 6);
+                bowl(300, 560, 90);
+                bowl(700, 640, 100);
+                // Fill the bowls with oil and light them, simulating as the user would have.
+                for (int tick = 0; tick < 90; ++tick) {
+                    if (tick % 30 == 0) {
+                        stamp(PowderApp::BrushMode::Oil, 300, 520, 25);
+                        stamp(PowderApp::BrushMode::Oil, 700, 600, 25);
+                    }
+                    app.RunFrame(dt, nullptr, true);
+                    tally();
+                }
+                for (int tick = 0; tick < 60; ++tick) {
+                    stamp(PowderApp::BrushMode::Fire, 300, 520, 20);
+                    stamp(PowderApp::BrushMode::Fire, 700, 600, 20);
+                    app.RunFrame(dt, nullptr, true);
+                    tally();
+                }
+            }
+            std::vector<double> frame_ms, tick_ms, render_ms;
+            std::array<double, PowderApp::kReplayQueryCount> pass_ms{};
+            double hud_sum = 0.0, water_substeps = 0.0, sand_substeps = 0.0, water_iterations = 0.0, gas_iterations = 0.0;
+            double dispatch_sum = 0.0, wall_sum = 0.0, blocked_sum = 0.0, blocking_sum = 0.0;
+            std::map<GLuint, std::pair<double, int>> program_ms;
+            std::map<std::pair<GLuint, GLuint>, std::pair<double, int>> group_ms;  // by program and workgroups
+            for (int frame = 0; frame < warmup + measured; ++frame) {
+                const double t = frame * static_cast<double>(dt);
+                PowderApp::BrushConfig source{};
+                const PowderApp::BrushConfig* scripted = nullptr;
+                if (scene == "sweep" || scene == "pour") {
+                    const bool pour = scene == "pour";
+                    const double span = pour ? 900.0 : 600.0, phase = std::fmod(t * (pour ? 800.0 : 400.0), 2.0 * span);
+                    const int x = (pour ? 50 : 200) + static_cast<int>(phase < span ? phase : 2.0 * span - phase);
+                    app.brush_mode_ = PowderApp::BrushMode::Water;
+                    app.brush_radius_ = pour ? 48 : 24;
+                    app.cursor_trail_.push_back({x, pour ? 900 : 850});
+                    app.brush_x_ = x;
+                    app.brush_y_ = pour ? 900 : 850;
+                    app.cursor_in_sim_ = app.painting_ = true;
+                } else if (scene == "combined") {
+                    app.brush_mode_ = frame % 2 == 0 ? PowderApp::BrushMode::Fire : PowderApp::BrushMode::Smoke;
+                    app.brush_x_ = 500;
+                    app.brush_y_ = 120;
+                    app.brush_radius_ = 18;
+                    source = app.BuildBrushConfig();
+                    scripted = &source;
+                }
+                dispatches = 0;
+                blocked_ms = 0.0;
+                blocking_calls = 0;
+                glQueryCounter(stamps[0], GL_TIMESTAMP);
+                const auto tick_begin = std::chrono::steady_clock::now();
+                app.RunFrame(dt, scripted, true);
+                const double tick_wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tick_begin).count();
+                const double tick_blocked = blocked_ms;
+                const int tick_blocking = blocking_calls;
+                glQueryCounter(stamps[1], GL_TIMESTAMP);
+                app.Render(true);
+                glQueryCounter(stamps[2], GL_TIMESTAMP);
+                app.DrawHud(t);
+                glQueryCounter(stamps[3], GL_TIMESTAMP);
+                glfwSwapBuffers(app.window_);
+                glfwPollEvents();
+                std::array<GLuint64, 4> at{};
+                for (int i = 0; i < 4; ++i) glGetQueryObjectui64v(stamps[i], GL_QUERY_RESULT, &at[i]);
+                for (std::size_t p = 0; p < pending.size(); ++p) {
+                    const auto& [timed_program, first] = pending[p];
+                    GLuint64 a = 0, b = 0;
+                    glGetQueryObjectui64v(pool[first], GL_QUERY_RESULT, &a);
+                    glGetQueryObjectui64v(pool[first + 1], GL_QUERY_RESULT, &b);
+                    if (frame < warmup) continue;
+                    program_ms[timed_program].first += static_cast<double>(b - a) / 1e6;
+                    ++program_ms[timed_program].second;
+                    auto& by = group_ms[{timed_program, pending_groups[p]}];
+                    by.first += static_cast<double>(b - a) / 1e6;
+                    ++by.second;
+                }
+                pending.clear();
+                pending_groups.clear();
+                tally();
+                if (frame < warmup) continue;
+                frame_ms.push_back(static_cast<double>(at[3] - at[0]) / 1e6);
+                tick_ms.push_back(static_cast<double>(at[1] - at[0]) / 1e6);
+                render_ms.push_back(static_cast<double>(at[2] - at[1]) / 1e6);
+                hud_sum += static_cast<double>(at[3] - at[2]) / 1e6;
+                for (std::size_t i = 0; i < pass_ms.size(); ++i) {
+                    GLuint64 value = 0;
+                    glGetQueryObjectui64v(app.timing_queries_[i], GL_QUERY_RESULT, &value);
+                    pass_ms[i] += static_cast<double>(value) / 1e6;
+                }
+                water_substeps += app.water_state_.substeps;
+                sand_substeps += app.sand_state_.substeps;
+                water_iterations += app.water_state_.pressure_iterations;
+                gas_iterations += app.gas_state_.pressure_iterations;
+                dispatch_sum += dispatches;
+                wall_sum += tick_wall;
+                blocked_sum += tick_blocked;
+                blocking_sum += tick_blocking;
+            }
+            CheckGl("profile frame");
+            const auto water = app.ReadWaterMetrics();
+            const auto sand = app.ReadParticleMetrics(app.sand_state_.particles, PowderApp::kMaxSandParticles,
+                                                      PowderApp::kSandParticleComponents);
+            const double n = static_cast<double>(frame_ms.size());
+            const auto mean = [](const std::vector<double>& v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
+            const auto p95 = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v[std::min(v.size() - 1, static_cast<std::size_t>(v.size() * 0.95))];
+            };
+            const std::vector<double> tail(frame_ms.end() - std::min<std::size_t>(frame_ms.size(), 120), frame_ms.end());
+            std::cout << std::fixed << std::setprecision(2) << "profile " << scene << " water=" << water.count
+                      << " sand=" << sand.count << " counters sum=" << counter_sum[0] << '/' << counter_sum[1] << '/' << counter_sum[2]
+                      << '/' << counter_sum[3] << '/' << counter_sum[4] << " max=" << counter_max[0] << '/' << counter_max[1] << '/'
+                      << counter_max[2] << '/' << counter_max[3] << '/' << counter_max[4] << " over " << ticks << " ticks, failing ticks "
+                      << failing_ticks << " (first " << first_failing << ")" << std::endl;
+            std::cout << "profile " << scene << " GPU frame ms mean/p95/max/last120=" << mean(frame_ms) << '/' << p95(frame_ms)
+                      << '/' << *std::max_element(frame_ms.begin(), frame_ms.end()) << '/' << mean(tail)
+                      << " tick=" << mean(tick_ms) << " render=" << mean(render_ms) << " hud=" << hud_sum / n << '\n';
+            std::cout << "profile " << scene << " pass ms spawn/boundary/water/gas/sand/coupling/extract=";
+            for (std::size_t i = 0; i < pass_ms.size(); ++i) std::cout << (i ? "/" : "") << pass_ms[i] / n;
+            std::cout << "\nprofile " << scene << " per tick: water substeps=" << water_substeps / n
+                      << " last water CG=" << water_iterations / n << " sand substeps=" << sand_substeps / n
+                      << " last gas CG=" << gas_iterations / n << " dispatches=" << dispatch_sum / n << '\n';
+            std::cout << "profile " << scene << " per tick CPU wall ms=" << wall_sum / n << " blocked ms=" << blocked_sum / n
+                      << " (calls " << blocking_sum / n << ") submitting ms=" << (wall_sum - blocked_sum) / n << '\n';
+            if (per_dispatch) {
+                std::vector<std::pair<double, GLuint>> order;
+                for (const auto& [program, total] : program_ms) order.push_back({total.first, program});
+                std::sort(order.rbegin(), order.rend());
+                std::cout << "profile " << scene << " dispatch ms/frame x dispatches/frame:";
+                for (const auto& [total, program] : order) {
+                    const auto found = program_names.find(program);
+                    std::cout << ' ' << (found != program_names.end() ? found->second : "?") << '=' << total / n << 'x'
+                              << program_ms[program].second / n;
+                }
+                std::cout << '\n';
+                if (by_groups) {
+                    std::cout << "profile " << scene << " us/dispatch x dispatches/frame by program:workgroups:";
+                    for (const auto& [key, total] : group_ms) {
+                        const auto found = program_names.find(key.first);
+                        if (total.first / n < 0.05) continue;
+                        std::cout << ' ' << (found != program_names.end() ? found->second : "?") << ':' << key.second << '='
+                                  << total.first * 1e3 / total.second << 'x' << total.second / n;
+                    }
+                    std::cout << '\n';
+                }
+            }
+            if (counter_sum[0] != 0 || counter_sum[2] != 0) failures << scene << " nonfinite/nonconverged " << counter_sum[0] << '/' << counter_sum[2] << " over " << failing_ticks << " ticks; ";
+        }
+        glDeleteQueries(4, stamps.data());
+        Require(failures.str().empty(), "profile scenes reported failures: " + failures.str());
     }
 
     // Live-window profile: the interactive frame body (clock, ticks, Render(true), DrawHud, swap) in a visible
@@ -3145,9 +3547,9 @@ struct AppLifecycleTests {
         WriteParticles(app, app.sand_state_.particles, SandRecords({Particle{500.5F, 500.5F, 0, 0, 1, 1}}));
         app.RunSandPass(1.0F / 60.0F);
         // Three substep passes each, then compaction, the final P2G and the raster, plus the sleep tally and two pack phases.
-        // Still sand: the stress-wave limit alone, ceil(dt sqrt((lambda + 2 mu) / rho) / CFL) = 23.
-        Require(app.sand_state_.substeps == 23 && dispatches == 3 * 23 + 6,
-                "default sand step must dispatch 23 complete material substeps");
+        // Still sand: the stress-wave limit alone, ceil(dt sqrt((lambda + 2 mu) / rho) / CFL) = 46 (it was 23 at the 196000 moduli).
+        Require(app.sand_state_.substeps == 46 && dispatches == 3 * 46 + 6,
+                "default sand step must dispatch 46 complete material substeps");
         const auto rejected_without_dispatch = [&]() {
             dispatches = 0;
             bool rejected = false;
@@ -3212,10 +3614,10 @@ struct AppLifecycleTests {
         WriteParticles(app, app.sand_state_.particles, SandRecords({Particle{500.5F, 500.5F, 0, 0, 1, 1}}));
         dispatches = 0;
         app.RunSandPass(1.0F / 60.0F);
-        Require(app.sand_state_.substeps == 14 && dispatches == 3 * 14 + 6,  // wave speed sqrt(196000 / 2) = 313 cells/s
+        Require(app.sand_state_.substeps == 27 && dispatches == 3 * 27 + 6,  // wave speed sqrt(784000 / 2) = 626 cells/s
                 "large finite yield ratio must remain accepted");
         int force_failures = 0;
-        for (float gravity : {-1.0e8F, 1.0e8F, -6.0e7F, 6.0e7F}) {
+        for (float gravity : {-2.0e8F, 2.0e8F, -6.0e7F, 6.0e7F}) {  // 2e8 / 60 / 46 substeps passes 65504
             app.config_ = {};
             app.InitializeState();
             app.config_.sand_gravity = gravity;
@@ -3226,7 +3628,7 @@ struct AppLifecycleTests {
             catch (const std::runtime_error& error) {
                 rejected = std::string(error.what()).find("sand_gravity") != std::string::npos;
             }
-            const bool unsafe = std::abs(gravity) == 1.0e8F;
+            const bool unsafe = std::abs(gravity) == 2.0e8F;
             const auto particle = ReadParticles<PowderApp::kSandParticleComponents>(app.sand_state_.particles, 1)[0];
             const auto counters = app.ReadDebugCounters();
             std::cout << "sand gravity=" << gravity << " rejected=" << rejected << " dispatches=" << dispatches
@@ -3248,7 +3650,7 @@ struct AppLifecycleTests {
                 std::cout << "  unchecked sand grid peak=" << peak << " nonfinite=" << nonfinite << '\n';
             }
             const bool valid = unsafe ? rejected && dispatches == 0 && particle[0] == 500.5F && particle[1] == 500.5F :
-                !rejected && dispatches == 3 * 23 + 6 && std::all_of(particle.begin(), particle.end(), [](float x) { return std::isfinite(x); });
+                !rejected && dispatches == 3 * 46 + 6 && std::all_of(particle.begin(), particle.end(), [](float x) { return std::isfinite(x); });
             // state1.x is 1 plus the sleep timer (sand_sleep.comp), so a live still grain reads 2.
             if (!valid || particle[4] < 1.0F || particle[5] != 1.0F || counters != std::array<GLuint, 5>{}) {
                 ++force_failures;
@@ -3257,7 +3659,7 @@ struct AppLifecycleTests {
         }
         int additive_failures = 0;
         for (float sign : {-1.0F, 1.0F}) {
-            constexpr float dt = 0.0005F;
+            constexpr float dt = 0.00025F;  // one wave substep at the default moduli
             app.config_ = {};
             app.InitializeState();
             app.config_.sand_damping = 1.0F;
@@ -3930,6 +4332,17 @@ struct AppLifecycleTests {
         } restore{app, original_radius, app.replay_mode_, app.brush_mode_, app.render_mode_, glfwWindowShouldClose(app.window_),
                   app.help_visible_};
         app.replay_mode_ = false;
+        // Coalesced mouse moves: the history entries between the last one taken and the current event, oldest first.
+        {
+            using Move = PowderApp::MovePoint;
+            const std::vector<Move> history{{50, 9, 105}, {40, 8, 104}, {30, 7, 103}, {20, 6, 102}, {10, 5, 101}};
+            Require(PowderApp::MovesSince(history, {20, 6, 102}) == std::vector<Move>{{30, 7, 103}, {40, 8, 104}},
+                    "mouse history must yield the moves since the last one taken, oldest first");
+            Require(PowderApp::MovesSince(history, {40, 8, 104}).empty() && PowderApp::MovesSince(history, {50, 9, 105}).empty(),
+                    "no move lies between the last one taken and the current event");
+            Require(PowderApp::MovesSince(history, {10, 5, 999}).empty() && PowderApp::MovesSince({}, {10, 5, 101}).empty(),
+                    "a last move missing from the history must add nothing");
+        }
         const auto event = [&](int key, int action) { callback(app.window_, key, 0, action, 0); };
         for (int polls : {60, 144}) {
             for (const auto& [key, change] : {std::pair{GLFW_KEY_LEFT_BRACKET, -1}, std::pair{GLFW_KEY_RIGHT_BRACKET, 1}}) {
@@ -4152,7 +4565,9 @@ struct AppLifecycleTests {
                 "a held water brush must skip dense cells only: dense centre skipped, half-dense and empty cells filled");
 
         // Stamps along a fast stroke overlap about four deep, but a swept cell must still receive exactly the particles
-        // one held tick emits; the stale density gates cannot see the stamps of the same tick.
+        // one held tick emits; the stale density gates cannot see the stamps of the same tick. Water records are born a
+        // random part of a tick early and have already moved (water_particle_spawn.comp), so water is checked as the
+        // total over the cells the stamps cover.
         for (const auto& [mode, per_cell] : {std::pair{Brush::Water, 4}, std::pair{Brush::Sand, 2}}) {
             app.InitializeState();
             app.brush_mode_ = mode;
@@ -4169,6 +4584,18 @@ struct AppLifecycleTests {
             };
             if (mode == Brush::Water) tally(ReadParticles(app.water_state_.particles, PowderApp::kMaxWaterParticles));
             else tally(ReadParticles<PowderApp::kSandParticleComponents>(app.sand_state_.particles, PowderApp::kMaxSandParticles));
+            if (mode == Brush::Water) {
+                std::set<std::pair<int, int>> covered;
+                for (const auto& [cx, cy] : PowderApp::StrokePoints({{100, 100}, {300, 100}}, 8))
+                    for (int y = cy - 8; y <= cy + 8; ++y)
+                        for (int x = cx - 8; x <= cx + 8; ++x)
+                            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= 64) covered.insert({x, y});
+                const long long total = std::accumulate(counts.begin(), counts.end(), 0LL);
+                Require(total == 4LL * static_cast<long long>(covered.size()),
+                        "a fast water stroke must emit one held tick of 4 particles per covered cell: " + std::to_string(total) +
+                            " for " + std::to_string(covered.size()) + " cells");
+                continue;
+            }
             int wrong = 0;
             int deepest = 0;
             for (int y = 94; y <= 106; ++y) {
@@ -4773,11 +5200,14 @@ struct AppLifecycleTests {
         const auto sand = ReadParticles<PowderApp::kSandParticleComponents>(app.sand_state_.particles, PowderApp::kMaxSandParticles);
         const auto settled = Compaction(sand);
         std::vector<std::vector<float>> columns(PowderApp::kGridWidth);
-        double speed_squared = 0.0;
+        double speed_squared = 0.0, hardening = 0.0;
         std::size_t live = 0;
         for (const auto& p : sand) {
             if (p[4] < 0.5F) continue;
             ++live;
+            // Klar hardening: the plastic strain q in state1.x's fraction q / (q + 4) (sand_particle_step.comp).
+            const double fraction = p[4] - std::floor(p[4]);
+            hardening += 4.0 * fraction / (1.0 - fraction);
             speed_squared += p[2] * p[2] + p[3] * p[3];
             columns[static_cast<std::size_t>(std::clamp(static_cast<int>(p[0]), 0, PowderApp::kGridWidth - 1))].push_back(p[1]);
         }
@@ -4806,6 +5236,7 @@ struct AppLifecycleTests {
             return std::atan(std::abs((n * sxy - sx * sy) / (n * sxx - sx * sx))) * 180.0 / 3.14159265358979;
         };
         const double angle = 0.5 * (flank(first, apex) + flank(apex, last));
+        SandFrames(app).Save("repose", 380, 0, 240, 80);
         double area = 0.0;
         for (double h : top) area += std::max(h, 0.0);
         // Grains per cell under the surface over the two of rest density.
@@ -4822,7 +5253,11 @@ struct AppLifecycleTests {
                 "a poured pile must compact as it settles: its remembered dilation falls and its volume ratio rises toward 1");
         Require(packing > 0.6 && packing < 1.3, "a settled pile must pack between loose and dense sand, near rest density");
         Require(std::sqrt(speed_squared / static_cast<double>(live)) < 1.0, "the pile must come to rest before its slope is measured");
-        Require(angle > 25.0 && angle < 40.0, "poured sand must rest at an angle of repose between 25 and 40 degrees");
+        hardening /= static_cast<double>(live);
+        std::cout << "sand-repose mean hardening strain q=" << hardening << '\n';
+        Require(hardening > 1.0 && hardening < 100.0, "poured grains must harden by the plastic strain they flowed through");
+        // Dry sand 30-35 degrees (Al-Hashemi and Al-Amoudi 2018); before the stiffer moduli it sagged to 26.6.
+        Require(angle > 30.0 && angle < 35.0, "poured sand must rest at an angle of repose between 30 and 35 degrees");
         app.replay_mode_ = false;
     }
 
@@ -4902,7 +5337,9 @@ struct AppLifecycleTests {
     static void SandWet(PowderApp& app) {
         struct Outcome {
             std::array<double, 4> cone{};
+            double shed = 0.0;  // share of grains that left the column's footprint
             double moisture_min = 1.0, moisture_mean = 0.0, moisture_max = 0.0, field = 0.0;
+            double packed_share = 0.0;  // grains sleeping in the packed texture at the end
         };
         constexpr int ticks = 240;
         const auto run = [&](const std::string& name, float moisture, int sleep_ticks) {
@@ -4919,11 +5356,15 @@ struct AppLifecycleTests {
             }
             SandFrames(app).Save(name + "_" + std::to_string(ticks), 400, 0, 200, 100);
             Outcome outcome;
+            const SandCount count = CountSand(app);
+            outcome.packed_share =
+                static_cast<double>(count.packed) / static_cast<double>(std::max<std::uint64_t>(count.Total(), 1));
             const auto sand = ReadParticles<PowderApp::kSandParticleComponents>(app.sand_state_.particles, PowderApp::kMaxSandParticles);
             outcome.cone = SandCone(sand, 380, 619);
             double n = 0.0;
             for (const auto& p : sand) {
                 if (p[4] < 0.5F) continue;
+                outcome.shed += p[0] < 478.0F || p[0] >= 522.0F;
                 const double m = p[11] - std::floor(p[11]);
                 outcome.moisture_min = std::min(outcome.moisture_min, m);
                 outcome.moisture_max = std::max(outcome.moisture_max, m);
@@ -4931,6 +5372,7 @@ struct AppLifecycleTests {
                 ++n;
             }
             outcome.moisture_mean /= std::max(n, 1.0);
+            outcome.shed /= std::max(n, 1.0);
             std::vector<std::uint8_t> field(static_cast<std::size_t>(PowderApp::kGridWidth * PowderApp::kGridHeight));
             glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
             glBindTexture(GL_TEXTURE_2D, app.sand_state_.moisture);
@@ -4947,18 +5389,62 @@ struct AppLifecycleTests {
             0.5 * std::exp(-static_cast<double>(powder_config::SimulationConfig{}.sand_drying_rate) * ticks / 60.0);
         for (const auto& [name, o] : {std::pair{"dry", dry}, std::pair{"wet", wet}, std::pair{"wet packed", packed}}) {
             std::cout << "sand-wet " << name << " left/right deg=" << o.cone[0] << '/' << o.cone[1] << " peak=" << o.cone[3]
-                      << " moisture min/mean/max=" << o.moisture_min << '/' << o.moisture_mean << '/' << o.moisture_max
-                      << " field at the base=" << o.field << '\n';
+                      << " shed=" << o.shed << " moisture min/mean/max=" << o.moisture_min << '/' << o.moisture_mean << '/' << o.moisture_max
+                      << " field at the base=" << o.field << " packed share=" << o.packed_share << '\n';
         }
         std::cout << "sand-wet expected moisture after drying=" << expected << '\n';
         Require(wet.cone[3] > 1.15 * dry.cone[3], "a damp column must slump less than a dry one");
+        // Damp sand fails locally: a steep core stands while cracked-off crumbs shed around it (before: the column stood
+        // intact, 0.3 cohesion without softening, or toppled over as one block).
+        Require(wet.cone[3] > 0.75 * 80.0 && wet.shed > 0.05, "a damp column must keep a steep core and shed crumbs");
+        Require(packed.cone[3] > 0.85 * wet.cone[3], "sleep-packing must not collapse a damp column");
+        // Intact damp grains pack too (before, bonded grains stayed moving and a damp clump cost as much as a moving one).
+        Require(packed.packed_share > 0.5, "a settled damp column must be mostly packed");
         Require(0.5 * (wet.cone[0] + wet.cone[1]) > 0.5 * (dry.cone[0] + dry.cone[1]) + 5.0, "damp sand must hold steeper sides");
         Require(dry.moisture_max == 0.0 && dry.field == 0.0, "dry sand must stay dry");
         Require(wet.moisture_min >= 0.0 && wet.moisture_max < 1.0 && std::abs(wet.moisture_mean - expected) < 0.01,
                 "moisture must only dry, at the drying rate, and stay in [0, 1)");
         Require(std::abs(wet.field - expected) < 0.02, "the moisture field must carry the grains' moisture");
-        // Packed cells keep the moisture they packed with (between the poured 0.5 and the dried value).
-        Require(packed.field > expected - 0.02 && packed.field < 0.52, "packed sand must keep its moisture");
+        // Bonded damp grains do not pack, so dry the packed moisture directly (after the sleep, the rest of the 240 ticks drying).
+        Require(std::abs(packed.field - expected) < 0.02, "packed sand must dry at the drying rate");
+    }
+
+    // The domain edge is a wall like painted rock: grains rest on its outer face (before: clamped half a cell inside it,
+    // and the grid separated them a node early, while painted walls stop grains at their face).
+    static void SandDomainEdge(PowderApp& app) {
+        app.config_ = {};
+        app.config_.sand_sleep_ticks = 0;
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintRock(app, 0, 100, 1000, 4);    // a painted floor, its face at y = 104
+        PaintRock(app, 900, 104, 4, 100);   // a painted wall, its face at x = 900
+        auto sand = SandBlock(0, 0, 20, 20, 0.0F);  // in the domain's bottom-left corner
+        const auto walled = SandBlock(880, 104, 900, 124, 0.0F);
+        sand.insert(sand.end(), walled.begin(), walled.end());
+        WriteParticles(app, app.sand_state_.particles, sand);
+        for (int t = 0; t < 120; ++t) {
+            app.RunBoundaryPass();
+            app.RunSandPass(app.config_.fixed_dt);
+            Require(CleanCounters(app.ReadDebugCounters()), "the edge scene must report no failures");
+        }
+        // Gaps between the grains and the face they rest on: domain floor and left edge, painted floor and wall.
+        std::array<double, 4> gap{1e9, 1e9, 1e9, 1e9};
+        for (const auto& p : ReadParticles<PowderApp::kSandParticleComponents>(app.sand_state_.particles, PowderApp::kMaxSandParticles)) {
+            if (p[4] < 0.5F) continue;
+            if (p[0] < 500.0F) {
+                gap[0] = std::min(gap[0], static_cast<double>(p[1]));
+                gap[1] = std::min(gap[1], static_cast<double>(p[0]));
+            } else {
+                gap[2] = std::min(gap[2], p[1] - 104.0);
+                gap[3] = std::min(gap[3], 900.0 - p[0]);
+            }
+        }
+        std::cout << "sand-domain-edge gaps domain floor/left=" << gap[0] << '/' << gap[1] << " painted floor/wall=" << gap[2]
+                  << '/' << gap[3] << '\n';
+        for (double g : gap) Require(g >= 0.0 && g < 0.25, "grains must rest against the face of the wall that holds them");
+        Require(std::abs(gap[0] - gap[2]) < 0.1 && std::abs(gap[1] - gap[3]) < 0.1,
+                "the domain edge must hold grains like a painted wall");
+        app.replay_mode_ = false;
     }
 
     // Painted rock is material 2; the next boundary pass turns it into the full and static masks.
@@ -5849,32 +6335,53 @@ struct AppLifecycleTests {
         std::cout << label << " L/R asymmetry=" << shape.asymmetry << " centroid offset=" << shape.centroid_offset
                   << " mirror RMS=" << shape.mirror_rms << " peak=" << shape.peak << " occupancy mass=" << shape.mass << '\n';
     }
-    // The moving grains are not exactly symmetric themselves (random spawn positions and friction traits), so packing
-    // is held to the same pour without it (one seed each, so chaos sets the slack): at most 2% more L/R mass
-    // imbalance, 0.5 cells more centroid offset and
-    // 1.5 cells more mirror RMS.
-    static void RequireUnbiased(const PileShape& packed, const PileShape& moving, const std::string& label) {
-        double squared = 0.0;
-        int columns = 0;
+    // Mean flank slope (degrees) of a drawn pile: least squares on each side between 20% and 80% of the peak height.
+    static double PileAngle(const PileShape& shape) {
+        int first = -1, last = -1, apex = 0;
         for (int x = 0; x < PowderApp::kGridWidth; ++x) {
-            const double a = packed.height[static_cast<std::size_t>(x)], b = moving.height[static_cast<std::size_t>(x)];
-            if (a == 0.0 && b == 0.0) continue;
-            squared += (a - b) * (a - b);
-            ++columns;
+            const double h = shape.height[static_cast<std::size_t>(x)];
+            if (h <= 0.0) continue;
+            if (first < 0) first = x;
+            last = x;
+            if (h >= shape.height[static_cast<std::size_t>(apex)]) apex = x;
         }
-        const double surface_rms = std::sqrt(squared / std::max(1, columns));
-        std::cout << label << " heights moving|packed every 8 columns:";
-        for (int x = 380; x <= 620; x += 8)
-            std::cout << ' ' << moving.height[static_cast<std::size_t>(x)] << '|' << packed.height[static_cast<std::size_t>(x)];
-        std::cout << std::endl;
-        PrintShape(moving, label + " moving");
-        PrintShape(packed, label + " packed");
-        std::cout << label << " packed vs moving surface RMS=" << surface_rms << '\n';
-        // Gated on symmetry only: the packed pile's shape differs from the moving one (a lower, flatter top, see
-        // VALIDATION), but neither side may gain.
-        Require(packed.asymmetry < moving.asymmetry + 0.02 &&
-                std::abs(packed.centroid_offset) < std::abs(moving.centroid_offset) + 0.5 &&
-                packed.mirror_rms < moving.mirror_rms + 1.5,
+        const auto flank = [&](int from, int to) {
+            double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int x = from; x <= to; ++x) {
+                const double h = shape.height[static_cast<std::size_t>(x)];
+                if (h < 0.2 * shape.peak || h > 0.8 * shape.peak) continue;
+                ++n; sx += x; sy += h; sxx += static_cast<double>(x) * x; sxy += x * h;
+            }
+            Require(n >= 3, "a pile flank needs at least three measurable columns");
+            return std::atan(std::abs((n * sxy - sx * sy) / (n * sxx - sx * sx))) * 180.0 / 3.14159265358979;
+        };
+        Require(first >= 0, "the pile must hold sand");
+        return 0.5 * (flank(first, apex) + flank(apex, last));
+    }
+    // The moving grains are not exactly symmetric themselves (random spawn positions and friction traits), so packing
+    // is held to the same pours without it, averaged over seeds (one pour is chaotic: single seeds strayed 1.2 cells): at
+    // most 2% more L/R mass imbalance, 0.5 cells more centroid offset and 1.5 cells more mirror RMS.
+    static void RequireUnbiased(const std::vector<PileShape>& packed, const std::vector<PileShape>& moving,
+                                const std::string& label) {
+        std::array<std::array<double, 3>, 2> mean{};
+        for (std::size_t s = 0; s < packed.size(); ++s) {
+            std::cout << label << " seed " << s << " heights moving|packed every 8 columns:";
+            for (int x = 380; x <= 620; x += 8)
+                std::cout << ' ' << moving[s].height[static_cast<std::size_t>(x)] << '|' << packed[s].height[static_cast<std::size_t>(x)];
+            std::cout << std::endl;
+            PrintShape(moving[s], label + " moving");
+            PrintShape(packed[s], label + " packed");
+            for (const bool p : {false, true}) {
+                const PileShape& shape = p ? packed[s] : moving[s];
+                mean[p][0] += shape.asymmetry / static_cast<double>(packed.size());
+                mean[p][1] += std::abs(shape.centroid_offset) / static_cast<double>(packed.size());
+                mean[p][2] += shape.mirror_rms / static_cast<double>(packed.size());
+            }
+        }
+        std::cout << label << " mean moving/packed L/R asymmetry=" << mean[0][0] << '/' << mean[1][0] << " |centroid offset|="
+                  << mean[0][1] << '/' << mean[1][1] << " mirror RMS=" << mean[0][2] << '/' << mean[1][2] << '\n';
+        // Neither side may gain (sand-sleep-bias also gates the centre pile's height and slope).
+        Require(mean[1][0] < mean[0][0] + 0.02 && mean[1][1] < mean[0][1] + 0.5 && mean[1][2] < mean[0][2] + 1.5,
                 label + ": packing must not bias the pile sideways beyond the same pour without it");
     }
     // A centre pour from (500, 300), then settling.
@@ -5969,25 +6476,50 @@ struct AppLifecycleTests {
 
     // Packing must not bias the pile: a centre pour is as symmetric packed as moving, and so is the collapse into a
     // central hole erased under it. Also logs the settling speed spread that sets sand_sleep_speed.
+    // Eight seeds (the spawn and wake hashes follow frame_index_): one pour's flank varies by +-3 degrees.
     static void SandSleepBias(PowderApp& app) {
-        std::array<PileShape, 2> pile, collapse;
-        std::array<SandCount, 2> counts;
-        for (const bool sleeping : {false, true}) {
-            app.config_ = {};
-            if (!sleeping) app.config_.sand_sleep_ticks = 0;
-            app.replay_mode_ = true;
-            app.InitializeState();
-            PourCentrePile(app, 600, 360, !sleeping);
-            pile[sleeping] = MeasurePile(app);
-            counts[sleeping] = CountSand(app);
-            EraseAt(app, 500, 0, 15);
-            for (int i = 0; i < 360; ++i) SandTick(app, nullptr);
-            collapse[sleeping] = MeasurePile(app);
+        constexpr int kSeeds = 8;
+        std::array<std::vector<PileShape>, 2> pile, collapse;
+        std::array<std::array<double, 3>, 2> mean{};  // peak, flank degrees, collapse peak
+        for (int seed = 0; seed < kSeeds; ++seed) {
+            for (const bool sleeping : {false, true}) {
+                app.config_ = {};
+                if (!sleeping) app.config_.sand_sleep_ticks = 0;
+                app.replay_mode_ = true;
+                app.InitializeState();
+                app.frame_index_ = static_cast<GLuint>(seed) * 100003U;
+                PourCentrePile(app, 600, 360, !sleeping && seed == 0);
+                pile[sleeping].push_back(MeasurePile(app));
+                if (seed == 0) SandFrames(app).Save(sleeping ? "bias_packed" : "bias_moving", 400, 0, 200, 70);
+                const SandCount count = CountSand(app);
+                if (sleeping) {
+                    std::cout << "sand-sleep-bias seed " << seed << " moving/packed=" << count.active << '/' << count.packed << '\n';
+                    Require(count.packed > count.Total() / 2, "the settled centre pile must be mostly packed");
+                }
+                EraseAt(app, 500, 0, 15);
+                for (int i = 0; i < 360; ++i) SandTick(app, nullptr);
+                collapse[sleeping].push_back(MeasurePile(app));
+                const double angle = PileAngle(pile[sleeping].back());
+                std::cout << "sand-sleep-bias seed " << seed << (sleeping ? " packed" : " moving") << " peak="
+                          << pile[sleeping].back().peak << " flank deg=" << angle << " collapse peak=" << collapse[sleeping].back().peak
+                          << '\n';
+                mean[sleeping][0] += pile[sleeping].back().peak / kSeeds;
+                mean[sleeping][1] += angle / kSeeds;
+                mean[sleeping][2] += collapse[sleeping].back().peak / kSeeds;
+            }
         }
-        std::cout << "sand-sleep-bias moving/packed with packing=" << counts[1].active << '/' << counts[1].packed
-                  << " grains without=" << counts[0].Total() << '\n';
-        Require(counts[1].packed > counts[1].Total() / 2, "the settled centre pile must be mostly packed");
+        std::cout << "sand-sleep-bias mean moving/packed peak=" << mean[0][0] << '/' << mean[1][0] << " flank deg=" << mean[0][1]
+                  << '/' << mean[1][1] << " collapse peak=" << mean[0][2] << '/' << mean[1][2] << '\n';
         RequireUnbiased(pile[1], pile[0], "sand-sleep-bias centre pile");
+        // Packed cells push on the grains above them like the frozen grains they hold (sand_grid_update.comp): before, the
+        // first moving layer on a packed surface bore its load alone, compacted, and the packed pile came out 20% denser
+        // and flatter (38 cells tall against 48). Grains pack after 1 s still (sand_sleep_ticks):
+        // at 0.2 s a relaxing pile packed mid-motion and packed flanks stood 5 degrees steeper (37.4 against 32.5).
+        Require(std::abs(mean[1][0] - mean[0][0]) <= 0.05 * mean[0][0] && std::abs(mean[1][1] - mean[0][1]) <= 2.0 &&
+                    mean[1][1] >= 30.0 && mean[1][1] <= 35.0,
+                "a packed pile must stand as tall and as steep (within 2 degrees, 30-35) as the same pour without packing");
+        // The packed collapse still bridges a little more (about 2 cells; 6 before the longer sleep).
+        Require(mean[1][2] - mean[0][2] <= 3.5, "a packed pile must collapse into a hole about like a moving one");
         RequireUnbiased(collapse[1], collapse[0], "sand-sleep-bias central-hole collapse");
         app.replay_mode_ = false;
     }
@@ -5997,7 +6529,8 @@ struct AppLifecycleTests {
         app.config_ = {};
         app.replay_mode_ = true;
         app.InitializeState();
-        PourCentrePile(app, 600, 360, false);
+        // 420 settle ticks: grains pack after 60 still ticks (sand_sleep_ticks), 48 more than when this scene was set up.
+        PourCentrePile(app, 600, 420, false);
         const SandCount settled = CountSand(app);
         std::uint64_t most_active = 0;
         for (int i = 0; i < 300; ++i) {
@@ -6053,6 +6586,43 @@ struct AppLifecycleTests {
         const auto [fill_packed, fill_woken] = run(false);
         Require(jet_woken > jet_packed / 50, "a water jet must wake and erode the packed pile");
         Require(fill_woken * 100 <= fill_packed, "slowly arriving water must leave the packed pile asleep");
+        app.replay_mode_ = false;
+    }
+
+    // A calm submerged bed packs and stays packed: a basin 300 cells wide holding a 60-cell sand bed (two grains per cell)
+    // under a 150-cell water pool, both placed at rest, run with the full coupled frame.
+    static void SandSleepSubmerged(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintRock(app, 340, 0, 10, 260);
+        PaintRock(app, 650, 0, 10, 260);
+        std::vector<Particle> sand;
+        std::uint32_t state = 11U;
+        const auto uniform = [&]() {
+            state = state * 1664525U + 1013904223U;
+            return static_cast<float>(state >> 8) / 16777216.0F;
+        };
+        for (int y = 0; y < 60; ++y)
+            for (int x = 350; x < 650; ++x)
+                for (int i = 0; i < 2; ++i) sand.push_back({x + uniform(), y + uniform(), 0, 0, 1, 1});
+        WriteParticles(app, app.sand_state_.particles, SandRecords(sand));
+        WriteParticles(app, app.water_state_.particles, RandomWater(350, 60, 650, 210, 5U));
+        SandCount count;
+        std::uint64_t settled_moving = 0, most_moving = 0;
+        for (int i = 0; i < 900; ++i) {
+            app.RunFrame(app.config_.fixed_dt, nullptr, true);
+            Require(CleanCounters(app.ReadDebugCounters()), "a submerged bed must report no failures");
+            if (i % 60 == 59) {
+                count = CountSand(app);
+                Require(count.Total() == sand.size(), "a submerged bed must keep every grain");
+                std::cout << "sand-sleep-submerged tick " << i + 1 << " moving/packed=" << count.active << '/' << count.packed << '\n';
+                if (i + 1 == 600) settled_moving = count.active;
+                if (i + 1 > 600) most_moving = std::max(most_moving, count.active);
+            }
+        }
+        Require(settled_moving * 100 <= sand.size(), "a calm submerged bed must leave at most 1% of its grains moving");
+        Require(most_moving <= settled_moving + sand.size() / 1000, "a calm submerged bed must not wake by itself");
         app.replay_mode_ = false;
     }
 
@@ -6610,6 +7180,136 @@ struct AppLifecycleTests {
         Require(out.good(), "could not write the showcase frame");
     }
 
+    // Manual: the kind of scene people paint by hand, for look review. Thin brushed rock strokes hanging in open space
+    // (an arc, a hook and a bowl), water poured over them, an oil slick on a floor pool and in the bowl, both lit. With
+    // POWDER_FRAME_DIR set it saves lit 1000x1000 frames (look_<tick>.ppm) and a letterboxed look_interactive.ppm.
+    static void LookScene(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        const char* frame_dir = std::getenv("POWDER_FRAME_DIR");
+        const std::filesystem::path frames = frame_dir != nullptr ? std::filesystem::path(frame_dir) : std::filesystem::path();
+        FrameTarget target;
+        if (!frames.empty()) {
+            std::filesystem::create_directories(frames);
+            OpenFrameTarget(app, target);
+        }
+        std::array<GLuint, 5> totals{};
+        int t = 0;
+        const auto stamp = [&](PowderApp::BrushMode mode, int x, int y, int radius) { PhaseStamp(app, mode, x, y, radius); };
+        const auto tick = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                PhaseTick(app, totals, 1);
+                ++t;
+                if (!frames.empty() && t % 60 == 0)
+                    SaveFrame(app, target, frames / ("look_" + std::to_string(t) + ".ppm"), 0, 0, PowderApp::kGridWidth, PowderApp::kGridHeight);
+            }
+        };
+        const auto stroke = [&](const auto& point, int steps, int radius) {
+            for (int i = 0; i <= steps; ++i) {
+                const auto [x, y] = point(static_cast<double>(i) / steps);
+                stamp(PowderApp::BrushMode::Solid, static_cast<int>(x), static_cast<int>(y), radius);
+            }
+        };
+        constexpr double kPi = 3.14159265358979;
+        stroke([](double s) { return std::pair{150.0 + 700.0 * s, 650.0 + 90.0 * std::sin(s * kPi * 1.5)}; }, 300, 5);  // wavy arc
+        stroke([&](double s) { return std::pair{300.0 + 90.0 * std::cos(s * 1.6 * kPi), 450.0 + 90.0 * std::sin(s * 1.6 * kPi)}; }, 200, 4);  // hook
+        stroke([&](double s) { return std::pair{600.0 + 110.0 * std::cos(kPi + s * kPi), 380.0 + 70.0 * std::sin(kPi + s * kPi)}; }, 200, 6);  // bowl
+        for (int i = 0; i < 160; ++i) {
+            if (i < 120) stamp(PowderApp::BrushMode::Sand, 200 + (i * 53) % 600, 200, 12);
+            stamp(PowderApp::BrushMode::Water, 150 + (i * 41) % 700, 900, 10);
+            if (i < 90) stamp(PowderApp::BrushMode::Water, 600, 420, 12);
+            stamp(PowderApp::BrushMode::Water, 930, 850, 2);  // a held tiny brush
+            stamp(PowderApp::BrushMode::Water, i % 2 == 0 ? 880 : 895, 850, 3);  // a brush revisiting two columns
+            tick(1);
+        }
+        tick(120);
+        for (int i = 0; i < 30; ++i) {
+            stamp(PowderApp::BrushMode::Oil, 600, 420, 8);
+            stamp(PowderApp::BrushMode::Oil, 250 + (i * 61) % 500, 300, 8);
+            tick(1);
+        }
+        tick(120);
+        for (int i = 0; i < 20; ++i) {
+            stamp(PowderApp::BrushMode::Fire, 600, 400, 10);
+            tick(1);
+        }
+        tick(160);
+        std::cout << "look scene: " << t << " ticks, water=" << app.ReadWaterLiveParticles() << " sand=" << app.ReadSandLiveParticles()
+                  << " counters=" << totals[0] << '/' << totals[1] << '/' << totals[2] << '/' << totals[3] << '\n';
+        {
+            // Face precision: divergence of the projected gas faces in open cells as stored (combustion expansion is a real
+            // source), and the error rounding every face to half precision (the R16F storage they had before) would add.
+            constexpr int gw = PowderApp::kGasWidth, gh = PowderApp::kGasHeight;
+            std::vector<float> u(static_cast<std::size_t>((gw + 1) * gh)), v(static_cast<std::size_t>(gw * (gh + 1)));
+            std::vector<GLubyte> mask(static_cast<std::size_t>(gw * gh));
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glBindTexture(GL_TEXTURE_2D, app.CurrentGasU());
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, u.data());
+            glBindTexture(GL_TEXTURE_2D, app.CurrentGasV());
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, v.data());
+            glBindTexture(GL_TEXTURE_2D, app.boundary_state_.mask_gas);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+            const auto half = [](float x) {
+                if (x == 0.0F) return x;
+                int exponent = 0;
+                std::frexp(x, &exponent);
+                const float quantum = std::ldexp(1.0F, std::max(exponent, -13) - 11);
+                return std::nearbyint(x / quantum) * quantum;
+            };
+            double max_stored = 0.0, max_half = 0.0, sum_stored = 0.0, sum_half = 0.0, max_speed = 0.0;
+            int cells = 0;
+            for (int y = 1; y < gh - 1; ++y)
+                for (int x = 1; x < gw - 1; ++x) {
+                    bool open = true;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) open = open && mask[static_cast<std::size_t>((y + dy) * gw + x + dx)] == 0;
+                    if (!open) continue;
+                    const float ul = u[static_cast<std::size_t>(y * (gw + 1) + x)], ur = u[static_cast<std::size_t>(y * (gw + 1) + x + 1)];
+                    const float vb = v[static_cast<std::size_t>(y * gw + x)], vt = v[static_cast<std::size_t>((y + 1) * gw + x)];
+                    const double stored = std::abs(static_cast<double>(ur) - ul + vt - vb);
+                    // The divergence error half storage of these four faces would add.
+                    const double halved = std::abs(static_cast<double>(half(ur)) - half(ul) + half(vt) - half(vb) - (static_cast<double>(ur) - ul + vt - vb));
+                    max_stored = std::max(max_stored, stored);
+                    max_half = std::max(max_half, halved);
+                    sum_stored += stored * stored;
+                    sum_half += halved * halved;
+                    max_speed = std::max({max_speed, static_cast<double>(std::abs(ur)), static_cast<double>(std::abs(vt))});
+                    ++cells;
+                }
+            std::cout << "gas faces: open cells " << cells << ", max |face| " << max_speed << " cells/s, divergence max/RMS stored "
+                      << max_stored << '/' << std::sqrt(sum_stored / std::max(cells, 1)) << ", error of half storage " << max_half << '/'
+                      << std::sqrt(sum_half / std::max(cells, 1)) << " (gate " << app.config_.gas_pressure_residual_threshold << ")\n";
+        }
+        if (!frames.empty()) {
+            glfwSetWindowSize(app.window_, 1280, 900);
+            glfwPollEvents();
+            int width = 0, height = 0;
+            glfwGetFramebufferSize(app.window_, &width, &height);
+            GLuint color = 0, framebuffer = 0;
+            glGenTextures(1, &color);
+            glBindTexture(GL_TEXTURE_2D, color);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
+            glGenFramebuffers(1, &framebuffer);
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+            app.Render(true);
+            std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 4);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+            std::ofstream out(frames / "look_interactive.ppm", std::ios::binary);
+            out << "P6\n" << width << ' ' << height << "\n255\n";
+            for (int row = height - 1; row >= 0; --row)
+                for (int col = 0; col < width; ++col)
+                    out.write(reinterpret_cast<const char*>(&pixels[static_cast<std::size_t>(row * width + col) * 4]), 3);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &framebuffer);
+            glDeleteTextures(1, &color);
+        }
+        app.replay_mode_ = false;
+        Require(CleanCounters(totals), "the look scene must keep clean counters");
+    }
+
     // Live liquid records split by the oil tag (state2.z): water and oil counts and their mean rows.
     struct LiquidCensus {
         GLuint water = 0, oil = 0;
@@ -6650,6 +7350,73 @@ struct AppLifecycleTests {
     }
 
     // Scripted single stamps and fixed ticks with the debug counters summed; walls of a tank over x in [400, 600).
+    // Water closes the gas grid like dense sand: gas cells under a settled pool are marked porous (3) while the cells over
+    // its surface stay open, smoke stamped into the pool does not stay there, and smoke driven down onto
+    // the pool spreads over it instead of passing into it.
+    static void GasWater(PowderApp& app) {
+        PhaseScene scene(app);
+        for (int i = 0; i < 4; ++i) {
+            scene.Stamp(PowderApp::BrushMode::Water, 500, 40 + 30 * i, 35);
+            scene.Tick(30);
+        }
+        scene.Tick(120);
+        const auto read = [](GLuint texture, int width, int height) {
+            std::vector<float> values(static_cast<std::size_t>(width * height));
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, values.data());
+            return values;
+        };
+        std::vector<GLubyte> mask(static_cast<std::size_t>(PowderApp::kGasWidth * PowderApp::kGasHeight));
+        const auto read_mask = [&] {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glBindTexture(GL_TEXTURE_2D, app.boundary_state_.mask_gas);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
+        };
+        // The pool's surface: the highest full-resolution row in the tank's middle column with water in it.
+        const auto liquid = read(app.water_state_.liquid_volume, PowderApp::kGridWidth, PowderApp::kGridHeight);
+        int surface = 0;
+        for (int y = 0; y < 400; ++y)
+            if (liquid[static_cast<std::size_t>(y * PowderApp::kGridWidth + 500)] > 0.0F) surface = y;
+        Require(surface > 40, "the gas-water tank needs a pool at least 40 cells deep: " + std::to_string(surface));
+        read_mask();
+        const auto gas_mask = [&](int x, int y) { return mask[static_cast<std::size_t>(y * PowderApp::kGasWidth + x)]; };
+        int closed = 0, open_above = 0;
+        for (int gx = 205; gx < 295; ++gx) {
+            closed += gas_mask(gx, (surface - 16) / 2) == 3;
+            open_above += gas_mask(gx, (surface + 12) / 2) == 0;
+        }
+        Require(closed >= 85 && open_above == 90, "gas cells under the pool must be closed and those above open: " +
+                                                       std::to_string(closed) + " closed, " + std::to_string(open_above) + " open");
+        // Smoke stamped into the pool is not there a tick later (the brush skips closed cells, advection clears them); smoke blown down at the pool stays above its surface.
+        const auto smoke_below = [&](int full_row) {
+            const auto smoke = read(app.CurrentSmokeDen(), PowderApp::kGasWidth, PowderApp::kGasHeight);
+            double sum = 0.0, total = 0.0;
+            for (int gy = 0; gy < PowderApp::kGasHeight; ++gy)
+                for (int gx = 200; gx < 300; ++gx) {
+                    const double value = smoke[static_cast<std::size_t>(gy * PowderApp::kGasWidth + gx)];
+                    total += value;
+                    if (2 * gy + 1 < full_row) sum += value;
+                }
+            return std::pair{sum, total};
+        };
+        scene.Stamp(PowderApp::BrushMode::Smoke, 500, surface / 2, 12);
+        scene.Tick();
+        Require(smoke_below(surface - 8).first == 0.0, "smoke inside the pool must be washed out");
+        PowderApp::BrushConfig down = app.BuildBrushConfig();
+        down.smoke_velocity = {0.0F, -150.0F};
+        app.brush_y_ = surface + 30;
+        for (int t = 0; t < 40; ++t) {
+            app.StampBrush(down);
+            scene.Tick();
+        }
+        const auto [under, total] = smoke_below(surface - 8);
+        // Only open cells along the tank walls (where the pool meets the rock) can hold a trace.
+        Require(total > 20.0 && under < 1e-4 * total, "smoke blown at the pool must stay above it: " + std::to_string(under) + " of " + std::to_string(total));
+        Require(CleanCounters(scene.totals), "the gas-water scene must keep clean counters");
+        std::cout << "gas-water: surface row " << surface << ", closed " << closed << "/90, smoke above " << total << '\n';
+    }
+
     struct PhaseScene {
         PowderApp& app;
         std::array<GLuint, 5> totals{};
@@ -6720,6 +7487,280 @@ struct AppLifecycleTests {
         Require(CleanCounters(scene.totals), "oil and water must keep clean counters");
     }
 
+    // Oil in open air falls like any liquid: a blob released in the open and one released against the underside of a
+    // rock ceiling both reach the floor, and none stays on the ceiling. Oil once rose through air and piled upside down
+    // against ceilings because its buoyancy acted wherever oil was the local liquid.
+    static void OilAir(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintRock(app, 300, 700, 400, 20);
+        auto oil = RandomWater(450, 660, 550, 700, 7U);
+        const auto open = RandomWater(100, 600, 150, 640, 8U);
+        oil.insert(oil.end(), open.begin(), open.end());
+        for (auto& p : oil) p[10] = 1.0F;
+        WriteParticles(app, app.water_state_.particles, oil);
+        app.oil_present_ = true;
+        std::array<GLuint, 5> totals{};
+        const auto mean_y = [&](bool open_blob) {
+            double sum = 0.0;
+            int n = 0;
+            for (const auto& p : ReadParticles(app.water_state_.particles, oil.size()))
+                if (p[4] >= 0.5F && (p[0] < 250.0F) == open_blob) {
+                    sum += p[1];
+                    ++n;
+                }
+            return n > 0 ? sum / n : 0.0;
+        };
+        const double open_start = mean_y(true);
+        PhaseTick(app, totals, 15);  // 0.25 s: a free fall drops 0.5 g t^2 = 61 cells
+        const double open_drop = open_start - mean_y(true);
+        PhaseTick(app, totals, 60 * 3 - 15);
+        int on_ceiling = 0;
+        for (const auto& p : ReadParticles(app.water_state_.particles, oil.size()))
+            // Under the slab and slow: splashes may land on top of it or still be in flight.
+            if (p[4] >= 0.5F && p[1] > 400.0F && p[1] < 700.0F && std::hypot(p[2], p[3]) < 200.0F) {
+                ++on_ceiling;
+                std::cout << "  stuck oil at " << p[0] << ',' << p[1] << " v " << p[2] << ',' << p[3] << '\n';
+            }
+        std::cout << "oil in air: open blob dropped " << open_drop << " cells in 0.25 s (free fall 61), records still above row 400 after 3 s "
+                  << on_ceiling << '\n';
+        app.replay_mode_ = false;
+        Require(open_drop > 0.9 * 61.0, "oil in open air must fall at about g");
+        Require(on_ceiling == 0, "oil must not stay against a ceiling");
+        Require(CleanCounters(totals), "falling oil must keep clean counters");
+    }
+
+    // Droplets touching the domain's side walls and a painted wall, blobs thrown at them and a stream poured down the
+    // left edge into a pool all run off the walls: nothing stays above the pool.
+    static void WaterWall(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintRock(app, 600, 300, 40, 700);  // up to the domain top, so no splash rests on it
+        std::vector<Particle> drops;
+        for (int k = 0; k < 6; ++k) {  // single-cell droplets stacked up each wall, a few cells apart
+            for (const int x : {0, PowderApp::kGridWidth - 1, 599, 640}) {
+                const auto d = RandomWater(x, 500 + 30 * k, x + 1, 501 + 30 * k, 11U + k);
+                drops.insert(drops.end(), d.begin(), d.end());
+            }
+        }
+        const auto film = RandomWater(0, 400, 2, 480, 5U);  // a thin film down the left edge
+        drops.insert(drops.end(), film.begin(), film.end());
+        // Blobs thrown at the walls: a splash against a wall must run down it.
+        for (const auto& blob : {RandomWater(20, 600, 50, 620, 9U, -800.0F, 200.0F), RandomWater(970, 600, 990, 640, 10U, 900.0F, 0.0F),
+                                  RandomWater(540, 600, 570, 620, 12U, 700.0F, 100.0F), RandomWater(660, 650, 690, 660, 13U, -700.0F, 0.0F)})
+            drops.insert(drops.end(), blob.begin(), blob.end());
+        WriteParticles(app, app.water_state_.particles, drops);
+        std::array<GLuint, 5> totals{};
+        const auto stuck = [&](const char* scene, float above) {
+            int count = 0;
+            for (const auto& p : ReadParticles(app.water_state_.particles, app.water_state_.record_bound))
+                // A clinging record hangs on a wall, slowly or not at all; splashes still in flight are fast.
+                if (p[4] >= 0.5F && p[1] > above && std::hypot(p[2], p[3]) < 200.0F) {
+                    if (count++ < 5) std::cout << "  " << scene << ": record at " << p[0] << ',' << p[1] << " v " << p[2] << ',' << p[3] << '\n';
+                }
+            std::cout << "water on walls (" << scene << "): " << count << " records above row " << above << '\n';
+            return count;
+        };
+        PhaseTick(app, totals, 240);
+        const int thrown = stuck("drops and splashes after 4 s", 200.0F);
+        // Like sand, water reaches the domain's faces: it rests on the floor's face and is no longer clamped half a cell
+        // inside the side faces (a pool's flow keeps it a little off them, as it does off a painted wall).
+        std::array<float, 3> reach{1e9F, 1e9F, -1e9F};  // min x, min y, max x
+        for (const auto& p : ReadParticles(app.water_state_.particles, app.water_state_.record_bound))
+            if (p[4] >= 0.5F) reach = {std::min(reach[0], p[0]), std::min(reach[1], p[1]), std::max(reach[2], p[0])};
+        std::cout << "water reach: min x " << reach[0] << ", min y " << reach[1] << ", max x " << reach[2] << '\n';
+        Require(reach[0] < 0.5F && reach[1] < 0.25F, "water must reach the domain faces");
+        // A stream poured down the left edge into a pool, then 3 s to drain.
+        app.InitializeState();
+        WriteParticles(app, app.water_state_.particles, RandomWater(0, 0, PowderApp::kGridWidth, 60, 21U));
+        for (int t = 0; t < 120; ++t) {
+            PhaseStamp(app, PowderApp::BrushMode::Water, 12, 700, 10);
+            PhaseTick(app, totals, 1);
+        }
+        PhaseTick(app, totals, 180);
+        const int poured = stuck("stream down the wall after 3 s", 300.0F);
+        app.replay_mode_ = false;
+        Require(thrown == 0 && poured == 0, "water must not cling to walls");
+        Require(CleanCounters(totals), "wall droplets must keep clean counters");
+    }
+
+    // A pool poured into a 300-cell tank splashes and sloshes for a few seconds, then calms: level surface, slow bulk,
+    // and calm water packs.
+    static void WaterCalm(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintRock(app, 349, 0, 1, 400);
+        PaintRock(app, 650, 0, 1, 400);
+        std::array<GLuint, 5> totals{};
+        for (int t = 0; t < 60; ++t) {
+            PhaseStamp(app, PowderApp::BrushMode::Water, 500, 250, 12);
+            PhaseTick(app, totals, 1);
+        }
+        std::array<double, 3> surface{};
+        double p50 = 0.0, packed_share = 0.0, early_p50 = 0.0;
+        for (int second = 1; second <= 10; ++second) {
+            PhaseTick(app, totals, 60);
+            surface = WaterSurface(app, 355, 644);
+            std::vector<float> speeds;
+            for (const auto& p : ReadParticles(app.water_state_.particles, app.water_state_.record_bound))
+                if (p[4] >= 0.5F) speeds.push_back(std::hypot(p[2], p[3]));
+            std::sort(speeds.begin(), speeds.end());
+            p50 = speeds.empty() ? 0.0 : speeds[speeds.size() / 2];
+            if (second == 2) early_p50 = p50;
+            const WaterCount count = CountWater(app);
+            packed_share = static_cast<double>(count.packed) / static_cast<double>(std::max<std::uint64_t>(1, count.Total()));
+            std::cout << "water calm t=" << second << " s: level " << surface[0] << " std " << surface[1] << " max-min " << surface[2]
+                      << ", moving p50 speed " << p50 << ", packed " << packed_share << '\n';
+        }
+        app.replay_mode_ = false;
+        Require(early_p50 > 20.0, "a poured pool must still be moving 2 s after the pour");
+        Require(surface[1] < 1.0 && surface[2] <= 4.0, "a calm pool must have a level surface after 10 s");
+        Require(p50 < 1.0, "a poured pool must calm within 10 s");
+        Require(packed_share > 0.6, "calm water must pack");
+        Require(CleanCounters(totals), "the calming pool must keep clean counters");
+    }
+
+    // The profile's user-scene bowl (wood arc of radius-5 stamps) has one-cell pinholes in its wall whose four neighbours
+    // are wood; a radius-35 oil stamp makes one of them (765,569) liquid through the particles at its open diagonal.
+    // Its density correction was a right-hand side for a cell without a pressure equation (diagonal 0), so CG never
+    // converged, diverged and overflowed the projected faces (here 1100167/0/633187 failure counts over 60 ticks).
+    static void WaterSealedCell(PowderApp& app) {
+        app.config_ = {};
+        app.InitializeState();
+        std::vector<Particle> water, sand;
+        for (int y = 90; y < 190; ++y)
+            for (int x = 20; x < 980; ++x) water.push_back({x + 0.5F, y + 0.5F, 0, 0, 1, 1});
+        for (int y = 10; y < 90; ++y)
+            for (int x = 20; x < 980; ++x) sand.push_back({x + 0.5F, y + 0.5F, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0});
+        WriteParticles(app, app.water_state_.particles, water);
+        WriteParticles(app, app.sand_state_.particles, SandRecords(sand));
+        for (const auto [cx, cy, r] : {std::array<int, 3>{300, 560, 90}, std::array<int, 3>{700, 640, 100}})
+            for (int a = 0; a <= 36; ++a) {
+                const double t = 3.14159265358979 * (1.0 + a / 36.0);
+                PhaseStamp(app, PowderApp::BrushMode::Wood, cx + static_cast<int>(r * std::cos(t)),
+                           cy + static_cast<int>(r * std::sin(t)), 5);
+            }
+        std::array<GLuint, 5> totals{};
+        PhaseStamp(app, PowderApp::BrushMode::Oil, 300, 520, 35);
+        PhaseStamp(app, PowderApp::BrushMode::Oil, 700, 600, 35);
+        PhaseTick(app, totals, 60);
+        std::cout << "sealed cell counters " << totals[0] << '/' << totals[1] << '/' << totals[2] << '/' << totals[3] << '\n';
+        Require(CleanCounters(totals), "oil against a pinholed wood bowl must keep clean counters");
+    }
+
+    // A small water brush held in the air pours an even stream. Spawning every record at the tick's start emitted one
+    // slab per tick, v dt apart (2 cells at the brush, 18 a metre lower): the stream fell as a string of beads. Each
+    // record's time since birth tau follows from its height and velocity (y = y0 + v tau - g tau^2 / 2); the mean
+    // resultant length R of the birth phases 2 pi tau / dt is large when records are born with the tick and about
+    // 1 / sqrt(N) when they are born at random times within it (water_particle_spawn.comp).
+    static void WaterStream(PowderApp& app) {
+        PhaseScene scene(app);
+        for (int t = 0; t < 40; ++t) {
+            scene.Stamp(PowderApp::BrushMode::Water, 500, 800, 2);
+            scene.Tick();
+        }
+        const double g = app.config_.water_gravity, dt = app.config_.fixed_dt;
+        double re = 0.0, im = 0.0, n = 0.0;
+        float front = 1e9F;
+        for (const auto& p : ReadParticles(app.water_state_.particles, app.water_state_.record_bound)) {
+            if (p[4] < 0.5F || p[1] >= 790.0F) continue;  // records that have left the brush
+            const double v = p[3], tau = (v + std::sqrt(std::max(0.0, v * v - 2.0 * g * (p[1] - 800.5)))) / g;
+            re += std::cos(6.283185307179586 * tau / dt);
+            im += std::sin(6.283185307179586 * tau / dt);
+            n += 1.0;
+            front = std::min(front, p[1]);
+        }
+        const double r = std::hypot(re, im) / std::max(n, 1.0);
+        std::cout << "water stream: " << n << " records below the brush, front row " << front << ", birth-phase R " << r
+                  << " (random phases about " << 1.0 / std::sqrt(std::max(n, 1.0)) << ")" << '\n';
+        Require(n > 1000.0 && front < 600.0F, "the held brush must pour a stream");
+        Require(r < 0.06, "a held brush must emit continuously, not one slab per tick");
+        Require(CleanCounters(scene.totals), "the stream must keep clean counters");
+    }
+
+    // A rock frame around [x, x + w) x [y, y + h), walls `wall` cells thick.
+    static void PaintFrame(PowderApp& app, int x, int y, int w, int h, int wall) {
+        PaintRock(app, x - wall, y - wall, wall, h + 2 * wall);
+        PaintRock(app, x + w, y - wall, wall, h + 2 * wall);
+        PaintRock(app, x, y - wall, w, wall);
+        PaintRock(app, x, y + h, w, wall);
+    }
+
+    // Liquid sealed in painted rock with no air cell is a singular Neumann system: its pressure is fixed only up to a
+    // constant, and an overfilled pocket's density correction does not sum to zero, a right-hand side with no
+    // solution, on which CG stalled. A pinhole (one cell walled in on all four sides), pockets of 2 to 5 cells and an
+    // overfilled oil-and-water tank, all sealed, must keep clean counters and every record.
+    static void WaterSealedPocket(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        std::vector<Particle> liquid;
+        std::uint32_t state = 7U;
+        const auto fill = [&](int x0, int y0, int x1, int y1, int per_cell, float oil) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x)
+                    for (int i = 0; i < per_cell; ++i) {
+                        state = state * 1664525U + 1013904223U;
+                        const float fx = static_cast<float>(state >> 8) / 16777216.0F;
+                        state = state * 1664525U + 1013904223U;
+                        const float fy = static_cast<float>(state >> 8) / 16777216.0F;
+                        liquid.push_back({x + fx, y + fy, 0, 0, 1, 1, 0, 0, 0, 0, oil, 0});
+                    }
+        };
+        const std::array<std::array<int, 2>, 6> pockets{{{1, 1}, {2, 1}, {3, 1}, {2, 2}, {5, 1}, {1, 2}}};
+        for (std::size_t k = 0; k < pockets.size(); ++k) {
+            const int x = 100 + 40 * static_cast<int>(k), y = 500;
+            PaintFrame(app, x, y, pockets[k][0], pockets[k][1], 4);
+            fill(x, y, x + pockets[k][0], y + pockets[k][1], 6, 0.0F);
+        }
+        // The tank: water at rest density plus an oil record per cell, 25% over rest everywhere.
+        PaintFrame(app, 400, 600, 200, 80, 6);
+        fill(400, 600, 600, 680, 4, 0.0F);
+        fill(400, 600, 600, 680, 1, 1.0F);
+        WriteParticles(app, app.water_state_.particles, liquid);
+        std::array<GLuint, 5> totals{};
+        PhaseTick(app, totals, 120);
+        const LiquidCensus census = Liquids(app);
+        std::cout << "sealed pockets: counters " << totals[0] << '/' << totals[1] << '/' << totals[2] << '/' << totals[3]
+                  << ", records " << census.water + census.oil << " of " << liquid.size() << ", oil mean row " << census.oil_y
+                  << '\n';
+        app.replay_mode_ = false;
+        Require(census.water + census.oil + app.ReadWaterPackedSum() == liquid.size(), "sealed pockets must keep every record");
+        Require(CleanCounters(totals), "liquid sealed in rock must keep clean counters");
+    }
+
+    // Gas sealed in a painted rock box (no open top, no porous sand) is singular the same way: a fire burning in it asks
+    // the closed box to expand, which no pressure can do.
+    static void GasSealedPocket(PowderApp& app) {
+        app.config_ = {};
+        app.replay_mode_ = true;
+        app.InitializeState();
+        PaintFrame(app, 400, 300, 120, 80, 8);
+        // A gas cell is closed when its footprint plus a one-cell halo holds rock: these leave a single gas cell (351, 151)
+        // and a two-by-two pocket (361-362, 151-152).
+        PaintFrame(app, 701, 301, 4, 4, 8);
+        PaintFrame(app, 721, 301, 6, 6, 8);
+        std::array<GLuint, 5> totals{};
+        double burning = 0.0;
+        for (int t = 0; t < 90; ++t) {
+            if (t < 60) {
+                PhaseStamp(app, PowderApp::BrushMode::Fire, 460, 330, 20);
+                PhaseStamp(app, PowderApp::BrushMode::Fire, 702, 302, 3);
+                PhaseStamp(app, PowderApp::BrushMode::Fire, 724, 304, 3);
+            }
+            PhaseTick(app, totals, 1);
+            if (t == 59) burning = FireStats(app)[0];
+        }
+        std::cout << "sealed gas: counters " << totals[0] << '/' << totals[1] << '/' << totals[2] << '/' << totals[3]
+                  << ", gas CG iterations " << app.gas_state_.pressure_iterations << ", reaction while fed " << burning << '\n';
+        app.replay_mode_ = false;
+        Require(burning > 10.0, "the sealed fires must burn");
+        Require(CleanCounters(totals), "fire sealed in rock must keep clean counters");
+    }
+
     // A slick on a pool, lit from above, keeps burning after the brush stops and is consumed; every burned record is
     // counted, and the water under it only loses what the flame evaporated.
     static void OilBurn(PowderApp& app) {
@@ -6734,17 +7775,22 @@ struct AppLifecycleTests {
             // The level of the settled liquid, twice its mean row; the flame sits on it.
             const int surface = static_cast<int>(2.0 * (before.water_y * before.water + before.oil_y * before.oil) / (before.water + before.oil));
             for (int t = 0; t < 30; ++t) {
-                scene.Stamp(PowderApp::BrushMode::Fire, 500, surface + 8, 10);
+                // Lit across the slick: how far a flame spreads along it by itself is chaotic (one spot burned 21-98%
+                // of the oil as the liquid details changed).
+                scene.Stamp(PowderApp::BrushMode::Fire, 430 + 70 * (t % 3), surface + 8, 10);
                 scene.Tick();
             }
             if (oil) PhaseFrame(app, "2-oil-burn-0.0s", 200);
             scene.Tick(60);  // a second after the brush: an unfed fire is out by now (fire-dynamics)
             if (oil) PhaseFrame(app, "2-oil-burn-1.0s", 200);
             late_reaction[oil ? 1 : 0] = FireStats(app)[0];
-            scene.Tick(60 * 5);
+            scene.Tick(60 * 2);
+            if (oil) PhaseFrame(app, "2-oil-burn-3.0s", 200);
+            scene.Tick(60 * 3);
+            if (oil) PhaseFrame(app, "2-oil-burn-6.0s", 200);
             const LiquidCensus after = Liquids(app);
             const auto sinks = app.ReadPhaseSinks();
-            std::cout << "oil burn (" << (oil ? "slick" : "water only") << "): oil " << before.oil << " -> " << after.oil
+            std::cout << "oil burn (" << (oil ? "slick" : "water only") << "): oil " << before.oil << " (mean rows oil " << before.oil_y << ", water " << before.water_y << ")" << " -> " << after.oil
                       << " burned=" << sinks[1] << ", water " << before.water << " -> " << after.water
                       << " evaporated=" << sinks[0] << ", reaction 1 s after the brush=" << late_reaction[oil ? 1 : 0] << '\n';
             Require(after.oil + sinks[1] == before.oil && after.water + app.ReadWaterPackedSum() + sinks[0] == before.water + packed_before,
@@ -6752,8 +7798,141 @@ struct AppLifecycleTests {
             if (oil) Require(sinks[1] > before.oil / 2, "a lit slick must burn most of its oil within 6 s");
             Require(CleanCounters(scene.totals), "burning oil must keep clean counters");
         }
-        Require(late_reaction[0] < 2.5 && late_reaction[1] > 10.0 && late_reaction[1] > 5.0 * late_reaction[0],
+        // Three brush spots: 7.5 is three times the 2.5 a single spot was held to.
+        Require(late_reaction[0] < 7.5 && late_reaction[1] > 10.0 && late_reaction[1] > 5.0 * late_reaction[0],
                 "burning oil must keep the flame going after the brush stops; a fire over plain water goes out");
+    }
+
+    // The gas projection leaves the divergence its solve was asked for, up to the residual gate: per fluid cell,
+    // div(projected faces) minus the burning source, recomputed in double from the solve's input and output faces.
+    // With the right-hand side stored as half floats (the faces are R32F) its rounding alone reached 0.5 /s, twice the
+    // 0.25 gate, in the combined benchmark's fire and smoke (RMS 0.025, against 0.0023 now).
+    static void GasRhsPrecision(PowderApp& app) {
+        static PowderApp* target = nullptr;
+        static PFNGLDISPATCHCOMPUTEPROC native = nullptr;
+        static std::vector<double> stats;  // max |e|, sum e^2, cells, max |b16 - b|, sum (b16-b)^2
+        target = &app;
+        native = glad_glDispatchCompute;
+        struct Restore { ~Restore() { glad_glDispatchCompute = native; } } restore;
+        glad_glDispatchCompute = [](GLuint x, GLuint y, GLuint z) {
+            GLint program = 0;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            if (static_cast<GLuint>(program) != target->smoke_project_program_) return native(x, y, z);
+            constexpr int w = PowderApp::kGasWidth, h = PowderApp::kGasHeight;
+            const auto read = [](GLuint tex, std::size_t n, GLenum f = GL_RED) {
+                std::vector<float> v(n);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glGetTexImage(GL_TEXTURE_2D, 0, f, GL_FLOAT, v.data());
+                return v;
+            };
+            const auto u0 = read(target->CurrentGasU(), (w + 1) * h), v0 = read(target->CurrentGasV(), w * (h + 1));
+            const auto b = read(target->gas_state_.divergence, w * h), reaction = read(target->CurrentReactionRate(), w * h * 2, GL_RG);
+            std::vector<GLubyte> kind(w * h);
+            glBindTexture(GL_TEXTURE_2D, target->gas_state_.level_kind[0]);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, kind.data());
+            native(x, y, z);
+            const auto u1 = read(target->NextGasU(), (w + 1) * h), v1 = read(target->NextGasV(), w * (h + 1));
+            for (int j = 0; j < h; ++j) for (int i = 0; i < w; ++i) {
+                const std::size_t c = static_cast<std::size_t>(j * w + i);
+                if (kind[c] != 0) continue;
+                const double source = target->config_.gas_expansion * std::max(0.0F, reaction[c * 2]);
+                const double exact = (double(u0[j * (w + 1) + i + 1]) - u0[j * (w + 1) + i]) + (double(v0[(j + 1) * w + i]) - v0[j * w + i]) - source;
+                const double e = (double(u1[j * (w + 1) + i + 1]) - u1[j * (w + 1) + i]) + (double(v1[(j + 1) * w + i]) - v1[j * w + i]) - source;
+                stats[0] = std::max(stats[0], std::abs(e));
+                stats[1] += e * e;
+                stats[2] += 1;
+                stats[3] = std::max(stats[3], std::abs(double(b[c]) - exact));
+                stats[4] += (double(b[c]) - exact) * (double(b[c]) - exact);
+            }
+        };
+        // The second pass drops sand through the flame: dense sand faces conduct at kSandLeak in the operator, so the
+        // projection must correct them by the same weight.
+        for (const bool sand : {false, true}) {
+            stats.assign(5, 0.0);
+            app.config_ = {};
+            app.replay_mode_ = true;
+            app.InitializeState();
+            std::array<GLuint, 5> totals{};
+            double iterations = 0;
+            for (int t = 0; t < 240; ++t) {
+                if (sand && t < 60) PhaseStamp(app, PowderApp::BrushMode::Sand, 500, 220, 16);
+                app.brush_mode_ = t % 2 == 0 ? PowderApp::BrushMode::Fire : PowderApp::BrushMode::Smoke;
+                app.brush_x_ = 500;
+                app.brush_y_ = 120;
+                app.brush_radius_ = 18;
+                const auto source = app.BuildBrushConfig();
+                app.RunFrame(app.config_.fixed_dt, &source, true);
+                const auto c = app.ReadDebugCounters();
+                for (std::size_t i = 0; i < c.size(); ++i) totals[i] += c[i];
+                iterations += app.gas_state_.pressure_iterations;
+            }
+            std::cout << "gas projection" << (sand ? " with sand" : "") << ": divergence error max " << stats[0]
+                      << " RMS " << std::sqrt(stats[1] / stats[2]) << ", rhs rounding max " << stats[3] << " RMS "
+                      << std::sqrt(stats[4] / stats[2]) << ", gas CG iterations mean " << iterations / 240.0
+                      << ", counters " << totals[0] << '/' << totals[2] << '\n';
+            app.replay_mode_ = false;
+            Require(stats[2] > 0.0 && stats[0] <= app.config_.gas_pressure_residual_threshold,
+                    "the gas projection must leave the divergence its solve was asked for");
+            Require(CleanCounters(totals), "the gas precision scene must keep clean counters");
+        }
+    }
+
+    // Water poured over a burning slick flashes to steam where it meets the lit oil and quenches the flame there, so a
+    // slick doused all along goes out; before, the water sank through the oil and the slick burned on (flame half a
+    // second after the dousing about that of the slick left alone). Every evaporated and burned record is counted:
+    // moving plus packed water plus the evaporation sink equals the water there was plus what the brush spawned.
+    static void OilQuench(PowderApp& app) {
+        std::array<double, 2> flame{}, burned{}, flashed{};
+        for (const bool douse : {false, true}) {
+            PhaseScene scene(app);
+            scene.Stamp(PowderApp::BrushMode::Water, 500, 40, 30);
+            scene.Stamp(PowderApp::BrushMode::Oil, 500, 110, 14);
+            scene.Tick(90);
+            const LiquidCensus settled = Liquids(app);
+            const int surface = static_cast<int>(2.0 * (settled.water_y * settled.water + settled.oil_y * settled.oil) / (settled.water + settled.oil));
+            for (int t = 0; t < 30; ++t) {
+                scene.Stamp(PowderApp::BrushMode::Fire, 430 + 70 * (t % 3), surface + 8, 10);
+                scene.Tick();
+            }
+            const LiquidCensus before = Liquids(app);
+            const std::uint64_t packed_before = app.ReadWaterPackedSum();
+            const auto sinks_before = app.ReadPhaseSinks();
+            const auto cursor = [&] {
+                GLuint value = 0;
+                glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, app.water_state_.spawn_cursor);
+                glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(value), &value);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                return value;
+            };
+            std::uint64_t spawned = 0;
+            for (int t = 0; t < 30; ++t) {
+                if (douse) {
+                    const GLuint start = cursor();
+                    scene.Stamp(PowderApp::BrushMode::Water, 420 + 40 * (t % 5), surface + 30, 12);
+                    spawned += cursor() - start;
+                }
+                scene.Tick();
+            }
+            scene.Tick(30);
+            flame[douse ? 1 : 0] = FireStats(app)[0];  // half a second after the last water
+            scene.Tick(60);
+            const LiquidCensus after = Liquids(app);
+            const auto sinks = app.ReadPhaseSinks();
+            burned[douse ? 1 : 0] = sinks[1] - sinks_before[1];
+            flashed[douse ? 1 : 0] = sinks[0] - sinks_before[0];
+            std::cout << "oil quench (" << (douse ? "doused" : "left burning") << "): water spawned " << spawned << ", evaporated "
+                      << flashed[douse ? 1 : 0] << ", oil burned " << burned[douse ? 1 : 0] << " of " << before.oil
+                      << ", flame 0.5 s after the dousing " << flame[douse ? 1 : 0] << '\n';
+            Require(after.oil + sinks[1] == before.oil + sinks_before[1], "burned oil must be counted");
+            Require(after.water + app.ReadWaterPackedSum() + sinks[0] == before.water + packed_before + sinks_before[0] + spawned,
+                    "flashed water must be counted as evaporated");
+            Require(CleanCounters(scene.totals), "dousing burning oil must keep clean counters");
+        }
+        Require(flame[0] > 10.0, "the undoused slick must still burn");
+        Require(flame[1] < 0.3 * flame[0], "a slick doused all along must go out");
+        Require(flashed[1] > 0.2 * (flashed[0] + 1.0) + 100.0, "water meeting burning oil must flash to steam");
     }
 
     // Water poured onto a fire that is still fed boils off into steam that rises; the fire is still quenched
@@ -6825,19 +8004,19 @@ struct AppLifecycleTests {
     }
 
     static int Run(const std::string& selected) {
-        const std::array<std::pair<const char*, void (*)(PowderApp&)>, 55> tests{{
+        const std::array<std::pair<const char*, void (*)(PowderApp&)>, 70> tests{{
             {"fire-dynamics", FireDynamics}, {"wood-fire", WoodFire},
-            {"oil-float", OilFloat}, {"oil-burn", OilBurn}, {"steam", SteamPlume}, {"sand-smother", SandSmother},
+            {"oil-float", OilFloat}, {"oil-air", OilAir}, {"water-wall", WaterWall}, {"water-calm", WaterCalm}, {"water-sealed-cell", WaterSealedCell}, {"water-sealed-pocket", WaterSealedPocket}, {"water-stream", WaterStream}, {"gas-sealed-pocket", GasSealedPocket}, {"oil-burn", OilBurn}, {"oil-quench", OilQuench}, {"gas-rhs-precision", GasRhsPrecision}, {"steam", SteamPlume}, {"sand-smother", SandSmother}, {"gas-water", GasWater},
             {"brush-input", BrushInput}, {"hud", HudRender}, {"uniform-cache", UniformCache},
             {"upload-alignment", UploadAlignment}, {"reset", Reset}, {"erase", Erase}, {"water-force", WaterForce},
             {"water-force-range", WaterForceRange},
-            {"water-surface", WaterSurface}, {"water-mass", WaterMass}, {"water-density", WaterDensity}, {"water-free-slip", WaterFreeSlip}, {"water-free-fall", WaterFreeFall}, {"gas-projection", GasProjection},
+            {"water-surface", WaterSurface}, {"water-mass", WaterMass}, {"water-pool-full", WaterPoolFull}, {"water-density", WaterDensity}, {"water-free-slip", WaterFreeSlip}, {"water-free-fall", WaterFreeFall}, {"gas-projection", GasProjection},
             {"readback-invalid", ValidateReadbacks}, {"render-modes", RenderModes}, {"lighting", Lighting}, {"water-pressure", WaterPressure},
             {"water-multigrid", WaterMultigrid},
             {"replay-metrics", ValidateReplayMetrics}, {"boundary", BoundaryLifecycle},
-            {"sand-substeps", SandSubsteps}, {"sand-water", SandWater}, {"sand-repose", SandRepose}, {"sand-silo", SandSilo}, {"sand-wet", SandWet}, {"sand-sleep-conservation", SandSleepConservation}, {"sand-sleep-bias", SandSleepBias}, {"sand-sleep-no-flicker", SandSleepNoFlicker}, {"sand-sleep-water", SandSleepWater}, {"benchmark-fill", BenchmarkFill}, {"water-pack-conservation", WaterPackConservation}, {"water-pack-no-flicker", WaterPackNoFlicker}, {"water-pack-wave", WaterPackWave}, {"benchmark-water-fill", BenchmarkWaterFill}, {"gas-diffusion-substeps", GasDiffusionSubsteps}, {"coupling-lifecycle", CouplingLifecycle},
+            {"sand-substeps", SandSubsteps}, {"sand-water", SandWater}, {"sand-repose", SandRepose}, {"sand-silo", SandSilo}, {"sand-wet", SandWet}, {"sand-domain-edge", SandDomainEdge}, {"sand-sleep-conservation", SandSleepConservation}, {"sand-sleep-bias", SandSleepBias}, {"sand-sleep-no-flicker", SandSleepNoFlicker}, {"sand-sleep-water", SandSleepWater}, {"sand-sleep-submerged", SandSleepSubmerged}, {"benchmark-fill", BenchmarkFill}, {"water-pack-conservation", WaterPackConservation}, {"water-pack-no-flicker", WaterPackNoFlicker}, {"water-pack-wave", WaterPackWave}, {"benchmark-water-fill", BenchmarkWaterFill}, {"gas-diffusion-substeps", GasDiffusionSubsteps}, {"coupling-lifecycle", CouplingLifecycle},
             {"benchmark-pressure", BenchmarkPressure}, {"benchmark-coupling", BenchmarkCoupling}, {"benchmark-gas", BenchmarkGas},
-            {"benchmark-water-scenes", WaterScenes}, {"benchmark-feel", FeelScenes}, {"showcase", Showcase},
+            {"benchmark-water-scenes", WaterScenes}, {"benchmark-feel", FeelScenes}, {"showcase", Showcase}, {"look-scene", LookScene},
             {"benchmark-gas-pressure", [](PowderApp& app) { BenchmarkGasPressure(app, false); }},
             {"benchmark-gas-slow", [](PowderApp& app) { BenchmarkGasPressure(app, true); }},
             {"gas-quenching", [](PowderApp& app) {
@@ -6846,7 +8025,7 @@ struct AppLifecycleTests {
             }},
             {"benchmark", [](PowderApp& app) { Benchmark(app, 1); }},
             {"benchmark-realtime", [](PowderApp& app) { Benchmark(app, 2); }},
-            {"benchmark-interactive", BenchmarkInteractive}}};
+            {"benchmark-interactive", BenchmarkInteractive}, {"benchmark-profile", BenchmarkProfile}}};
         Require(selected == "all" || std::any_of(tests.begin(), tests.end(), [&](const auto& test) {
                     return selected == test.first;
                 }), "unknown app lifecycle test: " + selected);
@@ -6900,7 +8079,7 @@ struct AppLifecycleTests {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc <= 2, "Usage: powder_app_lifecycle_tests [all|brush-input|hud|uniform-cache|upload-alignment|reset|erase|water-force|water-force-range|water-surface|water-mass|water-density|water-free-slip|water-free-fall|gas-projection|gas-quenching|readback-invalid|render-modes|lighting|water-pressure|water-multigrid|replay-metrics|boundary|sand-substeps|sand-water|sand-repose|sand-silo|sand-wet|sand-sleep-conservation|sand-sleep-bias|sand-sleep-no-flicker|sand-sleep-water|benchmark-fill|water-pack-conservation|water-pack-no-flicker|water-pack-wave|benchmark-water-fill|gas-diffusion-substeps|coupling-lifecycle|fire-dynamics|wood-fire|oil-float|oil-burn|steam|sand-smother|benchmark-pressure|benchmark-coupling|benchmark-gas|benchmark-water-scenes|benchmark-feel|showcase|benchmark-gas-pressure|benchmark-gas-slow|benchmark|benchmark-realtime|benchmark-interactive]");
+        Require(argc <= 2, "Usage: powder_app_lifecycle_tests [all|brush-input|hud|uniform-cache|upload-alignment|reset|erase|water-force|water-force-range|water-surface|water-mass|water-pool-full|water-density|water-free-slip|water-free-fall|gas-projection|gas-quenching|readback-invalid|render-modes|lighting|water-pressure|water-multigrid|replay-metrics|boundary|sand-substeps|sand-water|sand-repose|sand-silo|sand-wet|sand-domain-edge|sand-sleep-conservation|sand-sleep-bias|sand-sleep-no-flicker|sand-sleep-water|sand-sleep-submerged|benchmark-fill|water-pack-conservation|water-pack-no-flicker|water-pack-wave|benchmark-water-fill|gas-diffusion-substeps|coupling-lifecycle|fire-dynamics|wood-fire|oil-float|oil-air|water-wall|water-calm|water-sealed-cell|water-sealed-pocket|gas-sealed-pocket|water-stream|oil-burn|oil-quench|gas-rhs-precision|steam|sand-smother|gas-water|benchmark-pressure|benchmark-coupling|benchmark-gas|benchmark-water-scenes|benchmark-feel|showcase|look-scene|benchmark-gas-pressure|benchmark-gas-slow|benchmark|benchmark-realtime|benchmark-interactive|benchmark-profile]");
         return AppLifecycleTests::Run(argc == 2 ? argv[1] : "all");
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

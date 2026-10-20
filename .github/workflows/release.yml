@@ -34,14 +34,7 @@ jobs:
           $exe = Get-ChildItem build -Recurse -Filter "powder_game.exe" | Select-Object -First 1
           if (-not $exe) { throw "powder_game.exe not found" }
 
-          $shaderDir = Join-Path $exe.Directory.FullName "shaders"
-          if (-not (Test-Path $shaderDir)) { throw "shaders directory not found next to executable" }
-
           Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
-          Get-Content (Join-Path $exe.Directory.FullName "runtime-dlls.txt") | Where-Object { $_ } | ForEach-Object {
-            Copy-Item -LiteralPath $_ -Destination $outDir -Force
-          }
-          Copy-Item $shaderDir (Join-Path $outDir "shaders") -Recurse -Force
           Copy-Item LICENSE $outDir
           $licenseDir = Join-Path $outDir "licenses"
           New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
@@ -65,7 +58,7 @@ jobs:
             "- Esc: quit",
             "",
             "Notes:",
-            "- Keep the shaders/ folder and DLLs next to powder_game.exe.",
+            "- powder_game.exe is self-contained (shaders built in, static runtime); run it from any folder.",
             "- Requires OpenGL 4.3 and the resource limits listed in the source README.",
             "- See the release notes and source VALIDATION.md for measured limitations."
           )
@@ -75,6 +68,7 @@ jobs:
           $binaryZip = "dist/win11/PowderGame-$env:GITHUB_REF_NAME-win11-x64.zip"
           $sourceZip = "dist/win11/PowderGame-$env:GITHUB_REF_NAME-source.zip"
           Compress-Archive -Path "$outDir/*" -DestinationPath $binaryZip -Force
+          ./.github/check-package.ps1 -Zip $binaryZip -Exe $exe.FullName -Expected "LICENSE", "README.txt", "licenses/GLAD-LICENSE", "licenses/GLFW-LICENSE.md", "licenses/khrplatform.h", "powder_game.exe"
           git archive --format=zip --output=$sourceZip HEAD
           if ($LASTEXITCODE -ne 0) { throw "Source archive failed with exit $LASTEXITCODE" }
           @($binaryZip, $sourceZip) | ForEach-Object {

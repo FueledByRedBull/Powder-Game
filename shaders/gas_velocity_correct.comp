@@ -2,16 +2,16 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D gasUSrc;
-layout(r16f, binding = 1) uniform readonly image2D gasVSrc;
+layout(r32f, binding = 0) uniform readonly image2D gasUSrc;
+layout(r32f, binding = 1) uniform readonly image2D gasVSrc;
 layout(rg16f, binding = 2) uniform readonly image2D gasCenterVelocitySrc;
-layout(r16f, binding = 3) uniform readonly image2D gasUFwd;
-layout(r16f, binding = 4) uniform readonly image2D gasVFwd;
+layout(r32f, binding = 3) uniform readonly image2D gasUFwd;
+layout(r32f, binding = 4) uniform readonly image2D gasVFwd;
 layout(rg16f, binding = 5) uniform readonly image2D gasCenterVelocityFwd;
 layout(r16f, binding = 6) uniform readonly image2D smokeDensityTex;
 layout(r16f, binding = 7) uniform readonly image2D temperatureTex;
-layout(r16f, binding = 8) uniform writeonly image2D gasUDst;
-layout(r16f, binding = 9) uniform writeonly image2D gasVDst;
+layout(r32f, binding = 8) uniform writeonly image2D gasUDst;
+layout(r32f, binding = 9) uniform writeonly image2D gasVDst;
 layout(r8ui, binding = 10) uniform readonly uimage2D boundaryTex;
 
 layout(std430, binding = 7) buffer DebugCounters {

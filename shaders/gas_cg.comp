@@ -8,7 +8,7 @@
 // s -= alpha q, partial s.z_old, z = 0; 4 partial s.z; 5 beta (one workgroup); 6 d = z + beta d.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(r32f, binding = 0) uniform readonly image2D rhsTex;
 layout(r32f, binding = 1) uniform image2D xTex;
 layout(r32f, binding = 2) uniform image2D sTex;
 layout(r32f, binding = 3) uniform image2D zTex;

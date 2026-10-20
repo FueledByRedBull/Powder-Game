@@ -28,28 +28,99 @@ layout(std430, binding = 3) readonly buffer WaterCellTally {
     uint tally[];
 };
 
+// Kept records per bin (phase 0), then each bin's next destination slot (phases 1 and 2). Cleared by the host.
+layout(std430, binding = 4) buffer WaterBins {
+    uint bins[];
+};
+
 uniform int maxParticles;
 uniform ivec2 gridSize;
 uniform int dropPacked;
+// Records are compacted in bin order, a bin being binSize x binSize cells in row-major order, so the particle passes
+// read and deposit to nearby cells together. Order within a bin is arbitrary (atomic), as the whole order was before;
+// every particle pass is order-independent (fixed-point sums, per-record state).
+uniform int binSize;
+uniform int binCount;
+// 0: count kept records per bin; 1: exclusive scan of the counts (one workgroup), total into spawnCursor;
+// 2: copy each kept record to its bin's next slot.
+uniform int phase;
+
+const uint kNoBin = 0xffffffffu;
+shared uint sharedBin[256];
+shared uint sharedBase[256];
+shared uint sharedSums[256];  // scan scratch
+
+// The record's bin, or kNoBin when compaction drops it (inactive, or packed into a cell this tick).
+uint keptBin(WaterParticle particle) {
+    if (particle.state1.x < 0.5) return kNoBin;
+    vec2 position = particle.state0.xy;
+    bool valid = !any(isnan(position)) && !any(isinf(position)) && all(greaterThanEqual(position, vec2(0.0))) &&
+                 all(lessThan(position, vec2(gridSize)));
+    if (!valid) return 0u;  // invalid records are still copied; the particle passes count them
+    ivec2 cell = ivec2(floor(position));
+    // The same particles water_sleep.comp tallied.
+    if (dropPacked == 1 && particle.state1.x >= 0.5 && (tally[cell.y * gridSize.x + cell.x] & (1u << 31)) != 0u) return kNoBin;
+    int binsPerRow = (gridSize.x + binSize - 1) / binSize;
+    return uint((cell.y / binSize) * binsPerRow + cell.x / binSize);
+}
+
+void scan() {
+    uint local = gl_LocalInvocationID.x;
+    uint chunk = (uint(binCount) + 255u) / 256u;
+    uint first = min(local * chunk, uint(binCount));
+    uint last = min(first + chunk, uint(binCount));
+    uint sum = 0u;
+    for (uint b = first; b < last; ++b) sum += bins[b];
+    sharedSums[local] = sum;
+    barrier();
+    // Hillis-Steele inclusive scan of the 256 chunk sums.
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint add = local >= offset ? sharedSums[local - offset] : 0u;
+        barrier();
+        sharedSums[local] += add;
+        barrier();
+    }
+    uint running = sharedSums[local] - sum;
+    for (uint b = first; b < last; ++b) {
+        uint count = bins[b];
+        bins[b] = running;
+        running += count;
+    }
+    if (local == 255u) spawnCursor = sharedSums[255];
+}
 
 void main() {
+    if (phase == 1) {
+        scan();
+        return;
+    }
     uint index = gl_GlobalInvocationID.x;
-    if (index >= uint(maxParticles)) {
-        return;
+    uint local = gl_LocalInvocationID.x;
+    WaterParticle particle;
+    uint bin = kNoBin;
+    if (index < uint(maxParticles)) {
+        particle = srcParticles[index];
+        bin = keptBin(particle);
+        if (phase == 2 && !(particle.state1.x < 0.5)) srcParticles[index].state1.x = 0.0;
     }
-
-    WaterParticle particle = srcParticles[index];
-    if (particle.state1.x < 0.5) {
-        return;
+    // Records arrive mostly sorted, so neighbours share a bin: one atomic per run of equal bins, not per record. A max
+    // scan of the run starts gives each invocation its run's first invocation; the run's last one reserves the slots.
+    sharedBin[local] = bin;
+    barrier();
+    sharedSums[local] = local > 0u && sharedBin[local - 1u] == bin ? 0u : local;
+    barrier();
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint other = local >= offset ? sharedSums[local - offset] : 0u;
+        barrier();
+        sharedSums[local] = max(sharedSums[local], other);
+        barrier();
     }
-    srcParticles[index].state1.x = 0.0;
-    // The same particles water_sleep.comp tallied.
-    vec2 position = particle.state0.xy;
-    if (dropPacked == 1 && particle.state1.x >= 0.5 && !any(isnan(position)) && !any(isinf(position)) &&
-        all(greaterThanEqual(position, vec2(0.0))) && all(lessThan(position, vec2(gridSize)))) {
-        ivec2 cell = ivec2(floor(position));
-        if ((tally[cell.y * gridSize.x + cell.x] & (1u << 31)) != 0u) return;
+    uint head = sharedSums[local];
+    if (bin != kNoBin && (local == 255u || sharedBin[local + 1u] != bin)) {
+        sharedBase[head] = atomicAdd(bins[bin], local + 1u - head);
     }
+    barrier();
+    if (phase == 0 || bin == kNoBin) return;
 
     float speed = length(particle.state0.zw);
     // The plain read skips most atomics: a stale value only costs a redundant one.
@@ -57,7 +128,7 @@ void main() {
         atomicMax(fastestSpeedBits, floatBitsToUint(speed));
     }
 
-    uint dst_index = atomicAdd(spawnCursor, 1u);
+    uint dst_index = sharedBase[head] + (local - head);
     if (dst_index >= uint(maxParticles)) {
         return;
     }

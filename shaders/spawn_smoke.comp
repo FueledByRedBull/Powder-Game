@@ -2,8 +2,8 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform image2D gasUTex;
-layout(r16f, binding = 1) uniform image2D gasVTex;
+layout(r32f, binding = 0) uniform image2D gasUTex;
+layout(r32f, binding = 1) uniform image2D gasVTex;
 layout(rg16f, binding = 2) uniform image2D gasCenterVelocityTex;
 layout(r16f, binding = 3) uniform image2D smokeDenTex;
 layout(r16f, binding = 4) uniform image2D temperatureTex;

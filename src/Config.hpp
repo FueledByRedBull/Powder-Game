@@ -68,9 +68,9 @@ struct SimulationConfig {
     // Rate (1/s) of turbulent and boundary-layer losses in pressure-supported water (water_particle_step.comp); free
     // fall is exempt. Real viscosity is negligible here, but a poured pool's turbulence dies within seconds, which an
     // inviscid 5 mm grid does not resolve: without it a poured half-screen pool sloshed at p50 92 cells/s after 40 s.
-    float water_bulk_damping = 0.4F;
+    float water_bulk_damping = 1.0F;
     // 12 m/s, above the 9.9 m/s of a free fall across the whole 5 m domain (1981 cells/s), so falling water is never
-    // cut: five to six substeps at the CFL limit. Faster splash particles are clamped and counted (water_velocity_clamped).
+    // cut: three substeps per 1/60 s tick at the CFL limit. Faster splash particles are clamped and counted (water_velocity_clamped).
     float water_max_velocity = 2400.0F;
     float water_flip_blend = 0.97F;
     float water_particle_mass = 1.0F;
@@ -83,8 +83,8 @@ struct SimulationConfig {
     int water_pressure_iterations = 1024;
     float water_pressure_residual_threshold = 0.12F;
     // Gas rates are per second and gas cells (1 cm, two simulation cells); see PLAN "Scale and constants".
-    // Semi-Lagrangian traces stop at walls, so a trace may cross several cells: one substep per tick at the
-    // speed cap (about 7 cells).
+    // Semi-Lagrangian traces stop at walls, so a trace may cross several cells: two transport substeps per 1/30 s
+    // gas step at the speed cap (sqrt(2) x 300 gas cells/s, about 14 cells per step).
     float gas_cfl_limit = 8.0F;
     int gas_min_substeps = 1;
     int gas_max_substeps = 2;
@@ -112,11 +112,13 @@ struct SimulationConfig {
     float gas_temperature_cooling = 2.5F;
     float gas_smoke_dissipation = 0.08F;
     float gas_water_cooling = 2.4F;
-    // V-cycle cap. Most solves stop after four; dense sand walls with fire took up to 48 in the combined replay.
+    // Preconditioned CG iteration cap (a multigrid V-cycle preconditions each iteration).
+    // Most solves stop after four; dense sand walls with fire took up to 48 in the combined replay.
     int gas_pressure_iterations = 48;
     // Zero pressure above the top edge: hot gas and smoke leave through the cave roof.
     bool gas_open_top = true;
-    // About one half-float step of a face at the speed cap: R16F faces cannot hold a finer divergence.
+    // About one half-float step of a face at the speed cap (8e-4 of the cap). The faces and right-hand side are R32F now;
+    // the gate stays tied to the speed cap (AGENTS, Physics and evidence contracts).
     float gas_pressure_residual_threshold = 0.25F;
     float sand_gravity = 1962.0F;
     // Retained per 1/60 s: none; dissipation comes from plasticity, wall friction and the grid transfer.
@@ -132,9 +134,11 @@ struct SimulationConfig {
     float sand_spawn_occupancy_limit = 0.225F;
     float sand_friction_coefficient = 0.62F;
     float sand_reference_density = 2.0F;
-    // Scaled with gravity from 24000 at 240 cells/s^2 (x 1962/240), so a 100-cell column still compresses to J ~0.68.
-    float sand_shear_modulus = 196000.0F;
-    float sand_lame_lambda = 196000.0F;
+    // Four times 196000 (24000 scaled with gravity x 1962/240): at the softer moduli a pile stored elastic shear strain of
+    // about 2 alpha p / (lambda + mu), ~0.6 at a 50-cell pile's base, and sagged elastically to 27 degrees whatever alpha
+    // was (sand-repose). Now ~0.15 and 33 degrees; a 100-cell column compresses to J ~0.9. Costs twice the wave substeps.
+    float sand_shear_modulus = 784000.0F;
+    float sand_lame_lambda = 784000.0F;
     // Kelvin-Voigt viscosity (mass / (cell s)): grain contacts are inelastic, so elastic vibration of a resting bed dies
     // out (a deep fill otherwise rings for seconds above the sleep speed). Explicit: it adds diffusion substeps.
     float sand_viscosity = 200.0F;
@@ -142,8 +146,9 @@ struct SimulationConfig {
     // weight keeps its grains in enduring contact, which dissipates the bed's bulk elastic vibration (period ~2 s at
     // these moduli, beyond reach of the explicit viscosity). Free, loose and surface sand (J ~1) is untouched.
     float sand_contact_damping = 6.0F;
-    // sin(phi) = sqrt(2) alpha in 2D: 0.5 is 45 degrees nominal, but poured piles measure ~30 (0.385 gives ~24).
-    float sand_friction_alpha = 0.6F;
+    // sin(phi) = sqrt(2) alpha in 2D: the large-strain value of the Klar hardening curve (settled piles average ~1.2x it).
+    // 0.5 measures 31.5 degrees (sand-repose); above an effective ~0.6 piles pack looser and spread wider, not steeper.
+    float sand_friction_alpha = 0.5F;
     // Per-grain friction spread (+-), as natural sand mixes grain shapes: each pile comes out irregular.
     float sand_friction_variation = 0.2F;
     // mu(I) rate-dependent friction (Jop et al. 2006): alpha scales by 1 + gain I / (I0 + I), I the inertial number of a
@@ -152,11 +157,15 @@ struct SimulationConfig {
     float sand_inertial_i0 = 0.279F;
     float sand_grain_diameter = 0.08F;
     // Wet-sand cohesion: the compression (log volume strain) the yield cone widens by at full capillary strength
-    // (sand_particle_step.comp's capillary). At these soft moduli the shear strength c (lambda + mu) needs large elastic
-    // strains: 0.3 keeps a damp 80-cell column 64 cells tall where dry sand slumps to 33 (sand-wet); 0.06-0.15 measured
-    // no steeper than dry. Moisture rises toward the surrounding water fill at sand_wetting_rate and dries at
+    // (sand_particle_step.comp's capillary): a Mohr-Coulomb cohesion of about tan(phi) (lambda + mu) c, ~3.6 kPa at
+    // 1 cell = 5 mm (damp sand: a few kPa of suction stress, Lu and Likos 2004). A damp 40x80-cell column keeps a steep
+    // core ~70 cells tall and sheds crumbs where dry sand slumps to 30 (sand-wet); 0.3 stood as a rigid block, 0.075
+    // barely beat dry. Moisture rises toward the surrounding water fill at sand_wetting_rate and dries at
     // sand_drying_rate (1/s).
-    float sand_cohesion = 0.3F;
+    float sand_cohesion = 0.15F;
+    // Plastic strain over which a grain's capillary cohesion decays by e (liquid bridges rupture as grains shear or pull
+    // apart): damp sand fails along cracks into clumps instead of toppling as one block.
+    float sand_cohesion_softening = 0.5F;
     // Volume correction (Klar et al. 2016) remembers at most this dilation (log volume): dense over loose random packing,
     // ln(0.64 / 0.555).
     float sand_max_dilation = 0.14F;
@@ -170,10 +179,14 @@ struct SimulationConfig {
     // Sleep-packing: a grain slower than sand_sleep_speed (cells/s) for sand_sleep_ticks ticks is ready; a supported cell
     // whose grains are all ready becomes an integer count in the packed texture (0 ticks disables packing). A packed cell
     // wakes when it loses support, a side opens steeper than 45 degrees, sand nearby moves faster than
-    // sand_wake_impact_speed, or full water nearby flows faster than sand_wake_water_speed (cells/s).
+    // sand_wake_impact_speed, moving sand presses into it faster than sand_wake_press_speed, or full water nearby flows
+    // faster than sand_wake_water_speed (cells/s). Moving sand falling faster than sand_sleep_speed beside a cell counts as
+    // an open side. 60 ticks (1 s) spans a period of the pile's slowest (bulk) mode: at 12 (0.2 s) a pile still relaxing
+    // packed at a turning point and packed piles stood 5 degrees steeper (PLAN, Sleeping sand).
     float sand_sleep_speed = 4.0F;
-    int sand_sleep_ticks = 12;
+    int sand_sleep_ticks = 60;
     float sand_wake_impact_speed = 60.0F;
+    float sand_wake_press_speed = 20.0F;
     float sand_wake_water_speed = 40.0F;
     // Calm-water packing: a particle slower than water_sleep_speed (cells/s) for water_sleep_ticks ticks is ready; a cell
     // holding exactly the rest count of ready particles deep inside liquid becomes an integer count (0 ticks disables
@@ -228,12 +241,14 @@ inline SimulationConfig LoadConfigFromEnvironment() {
     EnvToFloat("POWDER_SAND_FRICTION_ALPHA", config.sand_friction_alpha);
     EnvToFloat("POWDER_SAND_FRICTION_RATE_GAIN", config.sand_friction_rate_gain);
     EnvToFloat("POWDER_SAND_COHESION", config.sand_cohesion);
+    EnvToFloat("POWDER_SAND_COHESION_SOFTENING", config.sand_cohesion_softening);
     EnvToFloat("POWDER_SAND_MAX_DILATION", config.sand_max_dilation);
     EnvToFloat("POWDER_SAND_CFL", config.sand_cfl_limit);
     EnvToInt("POWDER_SAND_MAX_SUBSTEPS", config.sand_max_substeps);
     EnvToFloat("POWDER_SAND_SLEEP_SPEED", config.sand_sleep_speed);
     EnvToInt("POWDER_SAND_SLEEP_TICKS", config.sand_sleep_ticks);
     EnvToFloat("POWDER_SAND_WAKE_IMPACT_SPEED", config.sand_wake_impact_speed);
+    EnvToFloat("POWDER_SAND_WAKE_PRESS_SPEED", config.sand_wake_press_speed);
     EnvToFloat("POWDER_SAND_WAKE_WATER_SPEED", config.sand_wake_water_speed);
     EnvToFloat("POWDER_WATER_SLEEP_SPEED", config.water_sleep_speed);
     EnvToInt("POWDER_WATER_SLEEP_TICKS", config.water_sleep_ticks);
@@ -287,6 +302,7 @@ inline SimulationConfig LoadConfigFromEnvironment() {
     require(config.sand_friction_alpha >= 0.0F, "POWDER_SAND_FRICTION_ALPHA");
     require(config.sand_friction_rate_gain >= 0.0F, "POWDER_SAND_FRICTION_RATE_GAIN");
     require(config.sand_cohesion >= 0.0F, "POWDER_SAND_COHESION");
+    require(config.sand_cohesion_softening > 0.0F, "POWDER_SAND_COHESION_SOFTENING");
     require(config.sand_max_dilation >= 0.0F, "POWDER_SAND_MAX_DILATION");
     require(config.sand_cfl_limit > 0.0F, "POWDER_SAND_CFL");
     require(config.sand_max_substeps >= 1, "POWDER_SAND_MAX_SUBSTEPS");
@@ -294,6 +310,7 @@ inline SimulationConfig LoadConfigFromEnvironment() {
     // The grain's still-tick timer saturates at 255 (sand_sleep.comp).
     require(config.sand_sleep_ticks >= 0 && config.sand_sleep_ticks <= 255, "POWDER_SAND_SLEEP_TICKS");
     require(config.sand_wake_impact_speed > 0.0F, "POWDER_SAND_WAKE_IMPACT_SPEED");
+    require(config.sand_wake_press_speed > 0.0F, "POWDER_SAND_WAKE_PRESS_SPEED");
     require(config.sand_wake_water_speed > 0.0F, "POWDER_SAND_WAKE_WATER_SPEED");
     require(config.water_sleep_speed >= 0.0F, "POWDER_WATER_SLEEP_SPEED");
     // The particle still-tick timer saturates at 255 (water_sleep.comp).

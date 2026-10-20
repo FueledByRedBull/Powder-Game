@@ -2,11 +2,11 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D gasUSrc;
-layout(r16f, binding = 1) uniform readonly image2D gasVSrc;
+layout(r32f, binding = 0) uniform readonly image2D gasUSrc;
+layout(r32f, binding = 1) uniform readonly image2D gasVSrc;
 layout(r32f, binding = 2) uniform readonly image2D pressureTex;
-layout(r16f, binding = 3) uniform writeonly image2D gasUDst;
-layout(r16f, binding = 4) uniform writeonly image2D gasVDst;
+layout(r32f, binding = 3) uniform writeonly image2D gasUDst;
+layout(r32f, binding = 4) uniform writeonly image2D gasVDst;
 layout(r8ui, binding = 5) uniform readonly uimage2D boundaryTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
@@ -18,6 +18,7 @@ layout(std430, binding = 7) buffer DebugCounters {
 
 uniform ivec2 gasSize;
 uniform int openTop;
+uniform float sandLeak;
 
 float pressureAt(ivec2 coord) {
     coord = clamp(coord, ivec2(0), gasSize - ivec2(1));
@@ -29,6 +30,15 @@ float pressureAt(ivec2 coord) {
 
 bool blockedCell(ivec2 coord) {
     return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || imageLoad(boundaryTex, coord).r != 0u;
+}
+
+// A face between open gas and dense sand (mask 3) conducts at sandLeak in the pressure operator (gas_cg.comp,
+// pressure_residual.comp), so its correction carries the same weight; the sand side's pressure is zero. Both cells are
+// inside the grid (interior faces only).
+bool sandFace(ivec2 a, ivec2 b) {
+    uint maskA = imageLoad(boundaryTex, a).r;
+    uint maskB = imageLoad(boundaryTex, b).r;
+    return min(maskA, maskB) == 0u && max(maskA, maskB) == 3u;
 }
 
 bool invalid(float value) {
@@ -47,6 +57,12 @@ void main() {
                 atomicAdd(nanInfDetected, 1u);
                 value = 0.0;
             }
+        } else if (coord.x > 0 && coord.x < gasSize.x && sandFace(ivec2(coord.x - 1, coord.y), coord)) {
+            value = imageLoad(gasUSrc, coord).x - sandLeak * (pressureAt(coord) - pressureAt(ivec2(coord.x - 1, coord.y)));
+            if (invalid(value)) {
+                atomicAdd(nanInfDetected, 1u);
+                value = 0.0;
+            }
         }
         imageStore(gasUDst, coord, vec4(value, 0.0, 0.0, 0.0));
     }
@@ -56,6 +72,12 @@ void main() {
         if (coord.y > 0 && coord.y < gasSize.y && !blockedCell(ivec2(coord.x, coord.y - 1)) &&
             !blockedCell(ivec2(coord.x, coord.y))) {
             value = imageLoad(gasVSrc, coord).x - (pressureAt(ivec2(coord.x, coord.y)) - pressureAt(ivec2(coord.x, coord.y - 1)));
+            if (invalid(value)) {
+                atomicAdd(nanInfDetected, 1u);
+                value = 0.0;
+            }
+        } else if (coord.y > 0 && coord.y < gasSize.y && sandFace(ivec2(coord.x, coord.y - 1), coord)) {
+            value = imageLoad(gasVSrc, coord).x - sandLeak * (pressureAt(coord) - pressureAt(ivec2(coord.x, coord.y - 1)));
             if (invalid(value)) {
                 atomicAdd(nanInfDetected, 1u);
                 value = 0.0;

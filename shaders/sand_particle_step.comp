@@ -26,6 +26,12 @@ layout(std430, binding = 0) buffer SandParticles {
     SandParticle particles[];
 };
 
+// The grid update has read this substep's node mass: each grain zeroes its stencil's nodes (every deposit came from
+// the same stencil), so the next transfer starts from zero without a per-substep clear.
+layout(std430, binding = 1) writeonly buffer SandGridMass {
+    uint gridMass[];
+};
+
 uniform ivec2 gridSize;
 uniform float dt;
 uniform float restitution;
@@ -46,6 +52,9 @@ uniform float grainDiameter;
 uniform float referenceDensity;
 // Wet-sand cohesion: the log volume strain of compression the cone widens by at full capillary strength.
 uniform float cohesion;
+// Plastic strain (the hardening state q) over which the capillary cohesion of a grain decays by e: liquid bridges break as
+// the grains shear or pull apart, so damp sand fails along cracks and shear bands into clumps.
+uniform float cohesionSoftening;
 // Largest remembered dilation (log volume): dense over loose random packing.
 uniform float maxDilation;
 // Moisture relaxes up toward the water fill around the grain at wettingRate and dries at dryingRate (1/s). moistureDt is
@@ -67,7 +76,8 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 
         if (displacement[axis] == 0.0) {
             continue;
         }
-        float edge = displacement[axis] > 0.0 ? float(gridSize[axis]) - 0.5 : 0.5;
+        // The domain edge is the outer face of the edge cells, like a painted wall's face.
+        float edge = displacement[axis] > 0.0 ? float(gridSize[axis]) : 0.0;
         float time = (edge - position[axis]) / displacement[axis];
         if (time <= hitTime) {
             if (time < hitTime) {
@@ -127,7 +137,7 @@ float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 
 
 void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 affine,
                         vec2 displacement, float bounce) {
-    position = clamp(position, vec2(0.5), vec2(gridSize) - vec2(0.5));
+    position = clamp(position, vec2(0.0), vec2(gridSize) - vec2(1.0 / 256.0));
     // A particle already inside painted geometry waits for the brush's explicit clearing.
     if (blockedCell(ivec2(floor(position)))) {
         velocity = vec2(0.0);
@@ -195,6 +205,7 @@ mat2 gatherGridVelocity(vec2 position, out vec2 velocity, out mat2 velocityGradi
             }
             float weight = wx[i] * wy[j];
             vec2 value = imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+            gridMass[(cell.y + 1) * (gridSize.x + 2) + cell.x + 1] = 0u;
             vec2 delta = vec2(cell) + vec2(0.5) - position;
             velocity += weight * value;
             affine += 4.0 * weight * outerProduct(value, delta);
@@ -246,8 +257,11 @@ mat2 matrixExp(mat2 a) {
 // compression: Mohr-Coulomb shear strength at zero pressure with a tension cut-off, a simplified Tampubolon et al. 2017
 // (2 grains per cell cannot carry the tensile stress of a shifted apex: it fractured and flattened damp columns).
 // 0 is cohesion-free dry sand. alpha rises with the inertial number (mu(I), Jop et al. 2006).
+// plasticStrain receives the increment of the hardening state q: the plastic strain the projection removed (Klar et al.
+// 2016: ||strain|| at the tip, the deviatoric cut delta on the cone).
 bool projectDeformation(mat2 deformation, float alpha, float shearRate, float cohesion, inout float volumeCorrection,
-                        out mat2 projected) {
+                        out mat2 projected, out float plasticStrain) {
+    plasticStrain = 0.0;
     float volume = determinant(deformation);
     vec2 rotation = vec2(deformation[0][0] + deformation[1][1], deformation[0][1] - deformation[1][0]);
     float rotationLength = length(rotation);
@@ -273,6 +287,7 @@ bool projectDeformation(mat2 deformation, float alpha, float shearRate, float co
         // limit. Past loose packing the grains are apart, and a deeper memory let MPM's volume drift overpack poured
         // piles fourfold.
         volumeCorrection = min(trace, maxDilation);
+        plasticStrain = length(strain);
         projected = polar;
         return true;
     }
@@ -290,6 +305,7 @@ bool projectDeformation(mat2 deformation, float alpha, float shearRate, float co
         projected = deformation;
         return true;
     }
+    plasticStrain = min(max(delta, 0.0), norm);
     vec2 projectedStretch = exp(0.5 * trace + (norm == 0.0 ? vec2(0.0) : deviator * (1.0 - max(delta, 0.0) / norm)));
     projected = polar * right * mat2(projectedStretch.x, 0.0, 0.0, projectedStretch.y) * transpose(right);
     return !invalid(projected[0][0]) && !invalid(projected[0][1]) &&
@@ -301,6 +317,17 @@ bool projectDeformation(mat2 deformation, float alpha, float shearRate, float co
 float capillary(float moisture) {
     return clamp(10.0 * moisture, 0.0, 1.0) * clamp(10.0 * (1.0 - moisture), 0.0, 1.0);
 }
+
+// Klar et al. 2016 friction hardening: phi_F = h0 + (h1 q - h3) exp(-h2 q) with h0 35, h1 9, h2 0.2, h3 10 degrees:
+// fresh sand starts 10 degrees weaker, peaks near q 6 (48 degrees) and settles back to h0. In 2D sin(phi) = sqrt(2) alpha,
+// so alpha scales by sin(phi_F) / sin(h0) and frictionAlpha stays the calibrated large-strain value.
+float hardening(float q) {
+    const float kDegrees = 0.0174532925;
+    return sin(kDegrees * (35.0 + (9.0 * q - 10.0) * exp(-0.2 * q))) / sin(kDegrees * 35.0);
+}
+
+// state1.x is 1 + the still-tick timer (an integer, sand_sleep.comp) plus q / (q + kHardeningScale) in the fraction.
+const float kHardeningScale = 4.0;
 
 void main() {
     uint index = gl_GlobalInvocationID.x;
@@ -316,6 +343,9 @@ void main() {
     vec2 position = particle.state0.xy;
     vec2 velocity = particle.state0.zw;
     float volumeCorrection = particle.state2.z;
+    float timer = floor(particle.state1.x);
+    float hardened = particle.state1.x - timer;
+    float q = kHardeningScale * hardened / (1.0 - hardened);
 
     vec2 gridVelocity;
     mat2 velocityGradient;
@@ -366,13 +396,20 @@ void main() {
     float shearRate = sqrt(2.0) * length(vec4(shear[0], shear[1]));  // gamma-dot: the rate of simple shear
     mat2 deformation;
     mat2 trial = matrixExp(dt * velocityGradient) * mat2(particle.state3.xy, particle.state3.zw);
-    float alpha = frictionAlpha * (1.0 + frictionVariation * clamp(trait / 31.0, -1.0, 1.0));
-    if (!projectDeformation(trial, alpha, shearRate, cohesion * capillary(moisture), volumeCorrection, deformation)) {
+    float alpha = frictionAlpha * (1.0 + frictionVariation * clamp(trait / 31.0, -1.0, 1.0)) * hardening(q);
+    float bond = cohesion * capillary(moisture) * exp(-q / cohesionSoftening);
+    float plasticStrain;
+    if (!projectDeformation(trial, alpha, shearRate, bond, volumeCorrection, deformation, plasticStrain)) {
         // Non-finite (the exponential cannot invert): count it, reset the elastic state to its rotation and keep moving.
         atomicAdd(nanInfDetected, 1u);
         deformation = rotationOf(trial);
         volumeCorrection = 0.0;
+        plasticStrain = 0.0;
     }
+    q += plasticStrain;
+    // shortcut: increments below half the fraction's step (1.5e-5 of q / (q + 4)) round away, so very slow creep does not
+    // harden; store q in its own component if the record ever frees one.
+    particle.state1.x = timer + min(q / (q + kHardeningScale), 0.9999);
     moveWithCollisions(position, velocity, affine, displacement, restitution);
 
     particle.state0 = vec4(position, velocity);

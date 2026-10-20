@@ -1,9 +1,38 @@
 # Powder Game Completion Roadmap
 
-## Current handoff - v0.5.0, 2026-10-20
+## Current handoff - v0.6.0, 2026-10-21
 
 This section is the current handoff. Everything below it is history, kept as written;
 where an older section says "current", read it as the state on the date in its title.
+
+State: `main` at `c4efd24` (v0.5.0) plus the working tree that is to be committed and
+tagged `v0.6.0`. Measured results, hashes and exit codes are in VALIDATION, "Current
+status"; raw logs in the ignored `build/goal-baseline/2026-10-20-release-candidate/`.
+The algorithms are documented pass by pass in `docs/ALGORITHMS.md`.
+
+What changed since v0.5.0 (design in PLAN): a single self-contained `powder_game.exe`
+(embedded shaders, static runtime, `POWDER_SHADER_DIR` override); sealed-pocket mean
+removal for water and gas (`pressure_pockets.comp`); a 30 Hz gas step with an R32F
+right-hand side and a gas projection consistent with the porous-sand operator; water
+to the domain face, binned compaction and shared-memory P2G; sand sleep readiness,
+submerged beds and pool-full brush limits; centripetal Catmull-Rom stroke smoothing.
+
+Verified on 2026-10-21 (Windows 11, RX 7800 XT, Unity editor open): Release build exit
+0, CTest 93/93, `POWDER_REPLAY=all` exit 0, `benchmark-realtime` exit 0 twice (combined
+about 55 FPS, p95 about 28 ms), four `benchmark-profile` scenes exit 0, the exe alone in
+a fresh folder, and `check-package.ps1` on a locally built release-shaped zip.
+
+Open items:
+
+1. The preferred 60 FPS combined target (about 55 FPS here) is unmet.
+2. Native interactive checks: live mouse painting and fast strokes, the H key and help
+   timeout, HiDPI and DPI transitions, temporal flicker, the 30 Hz gas look.
+3. Not run here: Linux and MinGW builds, other GPUs, a machine without the VC++
+   redistributable, the hosted CI and release workflows. Verify the draft release's
+   ZIPs and `SHA256SUMS.txt` before publishing it.
+4. Sand feel: a packed pile has a lower, flatter top than a moving one (not gated).
+
+## Handoff - v0.5.0, 2026-10-20 (historical)
 
 State: `main` at `3f7055d` plus the working tree that is to be committed and tagged
 `v0.5.0` (the tag workflow then builds a draft release). Measured results, hashes and

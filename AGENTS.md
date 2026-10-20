@@ -25,7 +25,9 @@ handoff and historical evidence. Historical checkpoints are not current passes.
   `Render(true)` (letterboxed square viewport) followed by `DrawHud()`. Keep the HUD out
   of replays and other pixel tests. `composite.frag` paints the whole framebuffer: the
   simulation inside `simRect` and the letterbox margin with the same dark cave-wall
-  albedo; it has no time dependence. The scene is albedo times light (moonlit ambient,
+  albedo; its only time input is `fxTime`, simulation time from the tick count, which moves
+  the lit-only flame tongues, sparks and heat shimmer, so a frame stays a function of the
+  simulation state. The scene is albedo times light (moonlit ambient,
   the fire's glow from `light_build.comp` and its mip chain, and a cursor lantern that
   only letterboxed frames with the cursor over the simulation get) plus emissive fire.
   `PowderApp::lighting_enabled_` (uniform `lighting`) switches the light and the lantern
@@ -36,8 +38,8 @@ handoff and historical evidence. Historical checkpoints are not current passes.
   and overlays the corner otherwise. HUD motion is eased host state (`HudMotion`,
   advanced by `DrawHud(now)`), so tests pass explicit times; the help panel hides itself
   after `hud::kHelpSeconds` only when `help_hide_time_` is armed.
-- `CMakeLists.txt`, `cmake/CopyRuntimeLibraries.cmake`, `build-win11.sh` and
-  `.github/workflows/` define builds and packaging. `build/`, `build-msvc/`,
+- `CMakeLists.txt`, `cmake/EmbedShaders.cmake`, `build-win11.sh`, `.github/workflows/`
+  and `.github/check-package.ps1` define builds and packaging. `build/`, `build-msvc/`,
   `build-win/` and `dist/` are generated output locations; existing evidence and
   older packages there do not describe the current source automatically.
 - CMake 3.24+, C++20, GLFW and GLAD; OpenGL 4.3 core with at least 18 image units,
@@ -81,7 +83,7 @@ Replay selectors are `water`, `gas`, `sand`, `boundary`, `leakage`, `combined` a
 acceptance command, excluded from CTest; the single-tick `benchmark` diagnostic
 does not establish the two-tick real-time gate. Run GPU checks serially and keep
 other simulations/benchmarks idle. Do not build while another worker uses the
-shared build tree or its copied runtime shaders.
+shared build tree.
 
 ## Physics and evidence contracts
 
@@ -93,14 +95,15 @@ shared build tree or its copied runtime shaders.
   surfaces. Preserve finite-storage diagnostics, elapsed-time dissipation and
   CFL/material-wave/diffusion rejection before unsafe dispatch. Do not hide
   failures by clipping required substeps or weakening residual gates.
-  The gas residual threshold is 0.25 /s (was 0.015 when the gas speed cap was 10 cells/s): about one
-  half-float step of a face at the 300 cells/s cap, 8e-4 of the cap and so stricter relative to speed than
-  before. Keep it tied to the speed cap; a deliberately broken solve (CG update disabled) still reports
+  The gas residual threshold is 0.25 /s (was 0.015 when the gas speed cap was 10 cells/s): 8e-4 of the
+  300 cells/s cap and so stricter relative to speed than before. It was sized as one half-float step of a face at
+  the cap; the gas faces are R32F now, so it sits well above their rounding rather than at it. Keep it tied to
+  the speed cap; a deliberately broken solve (CG update disabled) still reports
   millions of residual failures in the fire scenes (VALIDATION).
 - Physical scale (PLAN, Scale and constants): one cell is 5 mm, g = 1962 cells/s^2 for water and
   sand, no uniform velocity damping (only `water_bulk_damping` on pressure-supported water; free fall is
   exempt), speed caps 2400 cells/s (12 m/s, above a full-domain free
-  fall). Water substeps follow the fastest particle at pressure CFL 8 (at most 6 solves per tick) with
+  fall). Water substeps follow the fastest particle at pressure CFL 16 (3 solves per tick at the cap, at most 6) with
   swept advection sub-moves of at most 2 cells; sand substeps are the larger of the stress-wave limit
   (CFL 0.4) and the advective limit (1 cell per substep), not their sum. The budgets at the caps are
   checked before any dispatch.
@@ -121,11 +124,17 @@ shared build tree or its copied runtime shaders.
 
 ## Runtime packaging
 
-The app loads `shaders/` beside its executable, independent of working directory;
-direct GPU fixtures load source shaders. Build the appropriate target after shader
-edits so application checks use the updated copy. Stage DLLs from the generated
-`runtime-dlls.txt` manifest as well as shaders. The `app-shader-package` CTest
-checks ASCII/Unicode relocation and shader selection. Follow VALIDATION for
+The release is `powder_game.exe` alone. `cmake/EmbedShaders.cmake` compiles every
+`shaders/*.comp|frag|vert` into the executable (and `powder_app_lifecycle_tests`) by
+file name; a shader edit regenerates it on the next build, a new shader file needs a
+reconfigure. Setting `POWDER_SHADER_DIR` loads every shader from that directory instead
+(a missing file fails by name, never falling back); a `shaders/` folder beside the
+executable is ignored. Direct GPU fixtures load source shaders by path. The MSVC
+runtime is static (`/MT`, GLFW and GLAD included) and MinGW links `-static`, so there
+are no DLLs to stage. The `app-shader-package` CTest runs the executable copied alone
+into ASCII and Unicode folders, then checks `POWDER_SHADER_DIR` selection and a missing
+override file. The workflows run `.github/check-package.ps1` (exact zip contents, only
+system DLL imports). Follow VALIDATION for
 package verification; do not treat an old `dist/win11` bundle as current evidence.
 The tag workflow creates a draft release containing versioned binary/source ZIPs
 and `SHA256SUMS.txt`. Verify the downloaded binary, source and checksums before

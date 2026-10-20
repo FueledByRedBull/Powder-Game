@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Static CRT (/MT, /MTd), so the executable needs no VC++ redistributable; fetched GLFW and GLAD follow it.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(USE_MSVC_RUNTIME_LIBRARY_DLL OFF CACHE BOOL "" FORCE)
+
 find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG QUIET)
 find_package(glad CONFIG QUIET)
@@ -69,40 +73,37 @@ if(GLAD_TARGET STREQUAL "")
     message(FATAL_ERROR "Could not determine GLAD target name.")
 endif()
 
+# Every shader is compiled into the executable; editing one regenerates the source (adding one needs a reconfigure).
+file(GLOB powder_shader_files CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.vert")
+set(powder_embedded_shaders "${CMAKE_CURRENT_BINARY_DIR}/generated/EmbeddedShaders.cpp")
+add_custom_command(
+    OUTPUT "${powder_embedded_shaders}"
+    COMMAND ${CMAKE_COMMAND}
+        "-DSHADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+        "-DOUTPUT=${powder_embedded_shaders}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake"
+    DEPENDS ${powder_shader_files} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake"
+    COMMENT "Embedding shaders"
+    VERBATIM
+)
+
+add_library(powder_gl STATIC src/GLUtil.cpp "${powder_embedded_shaders}")
+target_include_directories(powder_gl PUBLIC src)
+target_link_libraries(powder_gl PUBLIC OpenGL::GL ${GLFW_TARGET} ${GLAD_TARGET})
+
 add_executable(powder_game
     src/main.cpp
     src/PowderApp.cpp
-    src/GLUtil.cpp
 )
-
-target_include_directories(powder_game PRIVATE src)
-target_link_libraries(powder_game PRIVATE OpenGL::GL ${GLFW_TARGET} ${GLAD_TARGET})
+target_link_libraries(powder_game PRIVATE powder_gl)
 
 if(MINGW)
-    # Keep MinGW runtime linked statically to avoid extra DLL dependencies.
-    target_link_options(powder_game PRIVATE -static-libgcc -static-libstdc++)
+    # Link libgcc, libstdc++ and winpthread statically so the executable needs no MinGW DLLs.
+    target_link_options(powder_game PRIVATE -static)
 endif()
-
-if(MSVC)
-    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
-    include(InstallRequiredSystemLibraries)
-endif()
-set(powder_runtime_libraries "$<TARGET_RUNTIME_DLLS:powder_game>;${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}")
-
-add_custom_target(powder_shaders
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:powder_game>/shaders"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders" "$<TARGET_FILE_DIR:powder_game>/shaders"
-    COMMAND ${CMAKE_COMMAND}
-        "-DRUNTIME_DLLS=${powder_runtime_libraries}"
-        "-DDESTINATION=$<TARGET_FILE_DIR:powder_game>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyRuntimeLibraries.cmake"
-    DEPENDS ${GLFW_TARGET} ${GLAD_TARGET}
-    COMMENT "Copying runtime shaders and libraries"
-    VERBATIM
-)
-add_dependencies(powder_game powder_shaders)
-file(GENERATE OUTPUT "$<TARGET_FILE_DIR:powder_game>/runtime-dlls.txt"
-    CONTENT "$<JOIN:${powder_runtime_libraries},\n>\n")
 
 include(CTest)
 if(BUILD_TESTING)
@@ -111,21 +112,17 @@ if(BUILD_TESTING)
     add_test(NAME config-parsing COMMAND powder_config_tests)
     set_tests_properties(config-parsing PROPERTIES TIMEOUT 30)
 
-    add_executable(powder_gpu_tests tests/GpuTests.cpp src/GLUtil.cpp)
-    target_include_directories(powder_gpu_tests PRIVATE src)
+    add_executable(powder_gpu_tests tests/GpuTests.cpp)
     target_compile_definitions(powder_gpu_tests PRIVATE POWDER_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-    target_link_libraries(powder_gpu_tests PRIVATE OpenGL::GL ${GLFW_TARGET} ${GLAD_TARGET})
-    add_dependencies(powder_gpu_tests powder_shaders)
+    target_link_libraries(powder_gpu_tests PRIVATE powder_gl)
     foreach(test_case compile water-transfer water-p2g water-affine water-integration water-sand water-wall-density water-sparse-face water-density-term particle-capacity boundary-mask water-wall-pressure gas-pressure smoke-dissipation gas-velocity-dissipation gas-wall-transport coupling-time gas-brush-blocking fire-reaction pressure-invalid half-storage)
         add_test(NAME gpu-${test_case} COMMAND powder_gpu_tests ${test_case})
         set_tests_properties(gpu-${test_case} PROPERTIES TIMEOUT 30)
     endforeach()
 
-    add_executable(powder_sand_tests tests/SandTests.cpp src/GLUtil.cpp)
-    target_include_directories(powder_sand_tests PRIVATE src)
+    add_executable(powder_sand_tests tests/SandTests.cpp)
     target_compile_definitions(powder_sand_tests PRIVATE POWDER_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-    target_link_libraries(powder_sand_tests PRIVATE OpenGL::GL ${GLFW_TARGET} ${GLAD_TARGET})
-    add_dependencies(powder_sand_tests powder_shaders)
+    target_link_libraries(powder_sand_tests PRIVATE powder_gl)
     foreach(test_case transfer integration support collisions material pile coupling thin-wall occupancy repair impact rheology wall-rounding)
         add_test(NAME sand-${test_case} COMMAND powder_sand_tests ${test_case})
         set_tests_properties(sand-${test_case} PROPERTIES TIMEOUT 30)
@@ -133,24 +130,21 @@ if(BUILD_TESTING)
 
     set_tests_properties(sand-pile PROPERTIES TIMEOUT 60)
 
-    add_executable(powder_app_lifecycle_tests tests/AppLifecycleTests.cpp src/PowderApp.cpp src/GLUtil.cpp)
-    target_include_directories(powder_app_lifecycle_tests PRIVATE src)
-    target_link_libraries(powder_app_lifecycle_tests PRIVATE OpenGL::GL ${GLFW_TARGET} ${GLAD_TARGET})
-    add_dependencies(powder_app_lifecycle_tests powder_shaders)
-    foreach(test_case brush-input hud uniform-cache upload-alignment reset erase water-force water-surface water-mass gas-projection gas-quenching readback-invalid render-modes lighting water-pressure water-multigrid replay-metrics boundary sand-substeps sand-water sand-repose sand-silo sand-wet sand-sleep-conservation sand-sleep-bias sand-sleep-no-flicker sand-sleep-water water-pack-conservation water-pack-no-flicker water-pack-wave gas-diffusion-substeps coupling-lifecycle fire-dynamics wood-fire oil-float oil-burn steam sand-smother water-force-range water-density water-free-slip water-free-fall)
+    add_executable(powder_app_lifecycle_tests tests/AppLifecycleTests.cpp src/PowderApp.cpp)
+    target_link_libraries(powder_app_lifecycle_tests PRIVATE powder_gl)
+    foreach(test_case brush-input hud uniform-cache upload-alignment reset erase water-force water-surface water-mass water-pool-full gas-projection gas-quenching readback-invalid render-modes lighting water-pressure water-multigrid replay-metrics boundary sand-substeps sand-water sand-repose sand-silo sand-wet sand-domain-edge sand-sleep-conservation sand-sleep-bias sand-sleep-no-flicker sand-sleep-water sand-sleep-submerged water-pack-conservation water-pack-no-flicker water-pack-wave gas-diffusion-substeps coupling-lifecycle fire-dynamics wood-fire oil-float oil-air water-wall water-calm water-sealed-cell water-sealed-pocket gas-sealed-pocket water-stream oil-burn oil-quench gas-rhs-precision steam sand-smother gas-water water-force-range water-density water-free-slip water-free-fall)
         add_test(NAME app-${test_case} COMMAND powder_app_lifecycle_tests ${test_case})
         set_tests_properties(app-${test_case} PROPERTIES TIMEOUT 30)
     endforeach()
-    set_tests_properties(app-sand-silo app-sand-wet app-sand-sleep-conservation app-sand-sleep-bias app-sand-sleep-no-flicker app-sand-sleep-water
+    set_tests_properties(app-sand-silo app-sand-wet app-sand-sleep-conservation app-sand-sleep-bias app-sand-sleep-no-flicker app-sand-sleep-water app-sand-sleep-submerged
         app-water-pack-conservation app-water-pack-no-flicker app-water-pack-wave
         PROPERTIES TIMEOUT 180)
     add_test(NAME app-shader-package COMMAND ${CMAKE_COMMAND}
         "-DEXECUTABLE=$<TARGET_FILE:powder_game>"
-        "-DSHADER_SOURCE=$<TARGET_FILE_DIR:powder_game>/shaders"
-        "-DRUNTIME_DLL_MANIFEST=$<TARGET_FILE_DIR:powder_game>/runtime-dlls.txt"
+        "-DSHADER_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/shaders"
         "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/shader-package-test"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ShaderPackageTest.cmake")
-    set_tests_properties(app-shader-package PROPERTIES TIMEOUT 40)
+    set_tests_properties(app-shader-package PROPERTIES TIMEOUT 120)
     # Painted-wall containment: no water particle may end inside a wall or past the barrier.
     foreach(scene boundary leakage)
         add_test(NAME app-replay-${scene} COMMAND ${CMAKE_COMMAND} -E env POWDER_REPLAY=${scene} $<TARGET_FILE:powder_game>)

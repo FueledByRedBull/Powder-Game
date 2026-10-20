@@ -6,9 +6,9 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r8ui, binding = 0) uniform uimage2D packedTex;
-// Mean left stretch of a cell's sleeping grains (column-major), their deformation gradient when they wake. The stretch is
-// symmetric, so .z holds the grains' mean moisture instead of the duplicate [1][0].
-layout(rgba16f, binding = 1) uniform image2D packedFTex;
+// Mean volume ratio J (.x), hardening fraction (.y) and moisture (.z) of a cell's sleeping grains, restored when they wake.
+// 32-bit: a tick's drying is below the half-float step of the moisture.
+layout(rgba32f, binding = 1) uniform image2D packedFTex;
 layout(r16f, binding = 2) uniform readonly image2D boundarySdfTex;
 layout(r16f, binding = 3) uniform readonly image2D waterAmountTex;
 layout(rg16f, binding = 4) uniform readonly image2D waterVelocityTex;
@@ -29,12 +29,19 @@ layout(std430, binding = 1) buffer SandCellTally {
     uint tally[];
 };
 
-layout(std430, binding = 2) readonly buffer SandCellFSum {
+// Writable: the apply phase zeroes the tally and sums it consumed (nothing clears them per tick).
+layout(std430, binding = 2) buffer SandCellFSum {
     int fsum[];
 };
 
+// sand_particle_compact.comp's cursor: woken grains are appended after compaction and join its fastest speed and box.
 layout(std430, binding = 3) buffer SandSpawnCursor {
     uint spawnCursor;
+    uint fastestSpeedBits;
+    uint boxMinX;
+    uint boxMinY;
+    uint boxMaxX;
+    uint boxMaxY;
 };
 
 layout(std430, binding = 7) buffer DebugCounters {
@@ -48,9 +55,14 @@ uniform ivec2 gridSize;
 uniform int phase;
 uniform int maxPacked;
 uniform float impactSpeed;
+// sand_sleep_speed: moving sand falling beside a cell faster than this leaves that side open (yielding()).
+uniform float sleepSpeed;
+// sand_wake_press_speed: moving sand driven into a cell faster than this disturbs it.
+uniform float pressSpeed;
 uniform float waterSpeed;
 uniform float waterFullVolume;
 uniform float wettingRate;
+uniform float dryingRate;
 uniform float dt;
 uniform int maxParticles;
 uniform uint seed;
@@ -66,10 +78,9 @@ int cellIndex(ivec2 c) {
     return c.y * gridSize.x + c.x;
 }
 
-// The outermost cells count as solid: the grid separates grains there, so sand rests a cell inside the domain.
+// Outside the domain is solid, like a painted wall (the grid separates grains at the halo nodes).
 bool solidAt(ivec2 c) {
-    return any(lessThan(c, ivec2(1))) || any(greaterThanEqual(c, gridSize - ivec2(1))) ||
-           imageLoad(boundarySdfTex, c).x <= 0.0;
+    return !inside(c) || imageLoad(boundarySdfTex, c).x <= 0.0;
 }
 
 bool packedAt(ivec2 c) {
@@ -91,17 +102,35 @@ bool open(ivec2 c) {
     return !solidAt(c) && !packedAt(c) && grainsAt(c) == 0u;
 }
 
-// A grain on this cell could slide off a side steeper than 45 degrees: the side and the cell below it are both open.
+vec2 nodeVelocity(ivec2 c) {
+    // Sand grid nodes sit at cell centres with a one-node halo.
+    return imageLoad(sandVelocityTex, clamp(c, ivec2(-1), gridSize) + ivec2(1)).xy;
+}
+
+// Gives way under a packed neighbour: open, or moving sand falling faster than sleepSpeed (a shaft's collapsing column
+// held its packed walls up by friction, so they stood vertical where moving sand slumps).
+bool yielding(ivec2 c) {
+    return open(c) || (!solidAt(c) && !packedAt(c) && nodeVelocity(c).y < -sleepSpeed);
+}
+
+// A grain on this cell could slide off a side steeper than 45 degrees: the side and the cells below and above it give
+// way. The cell above tells an outer face from a closed void inside the pile, which packed cells now arch over: grains
+// beside such voids stayed moving.
 bool sideOpen(ivec2 c) {
-    return (open(c + ivec2(-1, 0)) && open(c + ivec2(-1, -1))) || (open(c + ivec2(1, 0)) && open(c + ivec2(1, -1)));
+    return (yielding(c + ivec2(-1, 0)) && yielding(c + ivec2(-1, -1)) && yielding(c + ivec2(-1, 1))) ||
+           (yielding(c + ivec2(1, 0)) && yielding(c + ivec2(1, -1)) && yielding(c + ivec2(1, 1)));
 }
 
 bool disturbed(ivec2 c) {
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             ivec2 n = c + ivec2(i, j);
-            // Sand grid nodes sit at cell centres with a one-node halo.
-            if (length(imageLoad(sandVelocityTex, clamp(n, ivec2(-1), gridSize) + ivec2(1)).xy) > impactSpeed) return true;
+            vec2 v = nodeVelocity(n);
+            if (length(v) > impactSpeed) return true;
+            // Moving sand driven into the cell faster than pressSpeed loads it past what its grains held when they packed
+            // (sand_grid_update.comp's packed reaction cancels only up to their stored stress). Below it, grains rolling
+            // down a settled slope (up to ~10 cells/s) set off wake cascades.
+            if ((i != 0 || j != 0) && !packedAt(n) && !solidAt(n) && dot(v, normalize(vec2(-i, -j))) > pressSpeed) return true;
             if (inside(n) && imageLoad(waterAmountTex, n).x >= 0.5 * waterFullVolume &&
                 length(imageLoad(waterVelocityTex, n).xy) > waterSpeed) return true;
         }
@@ -124,16 +153,21 @@ void decide(ivec2 c) {
     uint t = tally[cellIndex(c)];
     uint total = t & 4095u;
     uint packed = imageLoad(packedTex, c).r;
+    if (packed == 0u && total == 0u) return;  // nothing to pack or wake
     ivec2 below = c + ivec2(0, -1);
     bool calm = !sideOpen(c) && !disturbed(c);
+    // Packed or solid cells on both lower diagonals arch over an empty cell below (packed cells push on the grains
+    // above them, sand_grid_update.comp): a grain held there stayed moving and blocked the cells above it from packing.
+    bool arched = (solidAt(below + ivec2(-1, 0)) || packedAt(below + ivec2(-1, 0))) &&
+                  (solidAt(below + ivec2(1, 0)) || packedAt(below + ivec2(1, 0)));
     uint flags = 0u;
     if (packed > 0u) {
         // Grains still moving below hold the cell up until they leave (or move fast enough to disturb it).
-        bool supported = solidAt(below) || packedAt(below) || grainsAt(below) > 0u;
+        bool supported = solidAt(below) || packedAt(below) || grainsAt(below) > 0u || arched;
         if (!supported || !calm) flags = kWake;
         else if (allReady(c) && packed + total <= uint(maxPacked)) flags = kPack;
     } else if (allReady(c) && total <= uint(maxPacked) && calm &&
-               (solidAt(below) || packedAt(below) || allReady(below))) {
+               (solidAt(below) || packedAt(below) || allReady(below) || arched)) {
         flags = kPack;
     }
     if (flags != 0u) atomicOr(tally[cellIndex(c)], flags);
@@ -141,12 +175,18 @@ void decide(ivec2 c) {
 
 void apply(ivec2 c) {
     uint t = tally[cellIndex(c)];
+    // The last reader of this tick's tally (compaction took the pack bits), so it leaves the next tick a zero tally.
+    if (t != 0u) tally[cellIndex(c)] = 0u;
+    vec4 sum = vec4(0.0);
+    if (((t >> 12) & 4095u) != 0u) {
+        int i = 4 * cellIndex(c);
+        sum = vec4(fsum[i], fsum[i + 1], fsum[i + 2], fsum[i + 3]) / 4096.0;
+        for (int k = 0; k < 4; ++k) fsum[i + k] = 0;
+    }
     uint packed = imageLoad(packedTex, c).r;
     vec4 meanF = imageLoad(packedFTex, c);
     if ((t & kPack) != 0u) {
         uint total = t & 4095u;
-        int i = 4 * cellIndex(c);
-        vec4 sum = vec4(fsum[i], fsum[i + 1], fsum[i + 2], fsum[i + 3]) / 4096.0;
         imageStore(packedTex, c, uvec4(packed + total));
         imageStore(packedFTex, c, (meanF * float(packed) + sum) / float(packed + total));
     } else if ((t & kWake) != 0u) {
@@ -162,9 +202,15 @@ void apply(ivec2 c) {
             return;
         }
         vec2 velocity = imageLoad(sandVelocityTex, c + ivec2(1)).xy;
+        if (!any(isnan(velocity)) && !any(isinf(velocity))) atomicMax(fastestSpeedBits, floatBitsToUint(length(velocity)));
+        atomicMax(boxMinX, 0xffffffffu - uint(c.x));
+        atomicMax(boxMinY, 0xffffffffu - uint(c.y));
+        atomicMax(boxMaxX, uint(c.x) + 1u);
+        atomicMax(boxMaxY, uint(c.y) + 1u);
         // Woken grains restart isotropic at the cell's mean volume ratio J (design; restoring the mean stretch itself
-        // measured no better in sand-sleep-bias). The mean stretch is symmetric; .z holds the mean moisture instead.
-        float volume = meanF.x * meanF.w - meanF.y * meanF.y;
+        // measured no better in sand-sleep-bias) with the cell's mean hardening and moisture.
+        float volume = meanF.x;
+        float hardened = clamp(meanF.y, 0.0, 0.9999);
         float moisture = clamp(meanF.z, 0.0, 0.999);
         float stretch = sqrt(clamp(volume, 0.05, 4.0));
         vec4 deformation = vec4(stretch, 0.0, 0.0, stretch);
@@ -172,7 +218,7 @@ void apply(ivec2 c) {
             uvec3 key = uvec3(uvec2(c), 3u * i);
             uint index = slot + i;
             particles[index].state0 = vec4(vec2(c) + uniform2(key), velocity);
-            particles[index].state1 = vec4(1.0, 1.0, 0.0, 0.0);
+            particles[index].state1 = vec4(1.0 + hardened, 1.0, 0.0, 0.0);
             // sand_particle_spawn.comp's trait and moisture packing; no volume correction.
             float trait = floor(uniform2(key + uvec3(0u, 0u, 1u)).x * 63.0) - 31.0;
             particles[index].state2 = vec4(0.0, 0.0, 0.0, trait + moisture);
@@ -181,8 +227,7 @@ void apply(ivec2 c) {
         imageStore(packedTex, c, uvec4(0u));
         imageStore(packedFTex, c, vec4(0.0));
     } else if (packed > 0u) {
-        // Sleeping sand keeps its moisture and soaks up water around it (sand_particle_step.comp's wetting). It dries
-        // only once awake: a tick's drying is below the half-float step of the stored mean.
+        // Sleeping sand soaks up water around it and dries like moving grains (sand_particle_step.comp's moisture).
         float fill = 0.0;
         for (int j = -1; j <= 1; ++j) {
             for (int i = -1; i <= 1; ++i) {
@@ -190,10 +235,8 @@ void apply(ivec2 c) {
             }
         }
         float saturation = clamp(fill / waterFullVolume, 0.0, 1.0);
-        if (saturation > meanF.z) {
-            meanF.z = mix(saturation, meanF.z, exp(-wettingRate * dt));
-            imageStore(packedFTex, c, meanF);
-        }
+        meanF.z = mix(saturation, meanF.z, exp(-(saturation > meanF.z ? wettingRate : dryingRate) * dt));
+        imageStore(packedFTex, c, meanF);
     }
 }
 

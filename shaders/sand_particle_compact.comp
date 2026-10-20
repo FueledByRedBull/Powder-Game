@@ -9,7 +9,8 @@ struct SandParticle {
     vec4 state3;
 };
 
-layout(std430, binding = 0) readonly buffer SandParticlesSrc {
+// Writable: every record read is deactivated, so the source becomes an all-inactive scratch pool for the next tick.
+layout(std430, binding = 0) buffer SandParticlesSrc {
     SandParticle srcParticles[];
 };
 
@@ -55,6 +56,7 @@ void main() {
         particle = srcParticles[index];
         // NaN flags stay live, as before, so P2G reports them.
         live = !(particle.state1.x < 0.5);
+        if (live) srcParticles[index].state1.x = 0.0;
     }
     if (live) {
         vec2 position = particle.state0.xy;

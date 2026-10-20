@@ -39,6 +39,7 @@ private:
         int substeps = 2;
         GLuint particles = 0;
         GLuint scratch_particles = 0;
+        GLuint bins = 0;  // per-bin counts, then slots, of the sorted compaction (water_particle_compact.comp)
         GLuint spawn_cursor = 0;
         GLuint live_count = 0;    // live particles after the last compaction
         // Host upper bound on the slots that may hold a live record (live count plus every spawn since); compaction
@@ -61,6 +62,7 @@ private:
         GLuint pressure_sums = 0;   // three vec4 sums per listed tile
         GLuint pressure_levels = 0;  // multigrid indirect arguments, level boxes, then the coarse level cells
         GLuint pressure_state = 0;   // a copy of the solver's running flag, breakdown flag and iteration count
+        GLuint pockets = 0;          // uvec4 per cell: sealed-pocket labels and sums (pressure_pockets.comp), water and gas
         int pressure_iterations = 0;  // GPU iterations of the last solve, which sizes the next blind batch
         int pressure_dispatched = 0;  // iterations the host dispatched for the last solve
         GLuint divergence = 0;
@@ -101,6 +103,8 @@ private:
         std::array<GLuint, kGasLevels - 1> level_rhs{};
         // Fine residual of each level that restricts, gathered with the transposed prolongation weights.
         std::array<GLuint, kGasLevels - 1> level_residual{};
+        // Pre-smoothed pressure of each level that restricts: fused smoothing never smooths in place.
+        std::array<GLuint, kGasLevels - 1> level_smoothed{};
         // Preconditioned CG vectors (R32F, gas size): residual s, preconditioned z, direction d, q = L d,
         // per-workgroup partial sums and the shared scalars (gas_cg.comp).
         GLuint cg_s = 0;
@@ -136,14 +140,18 @@ private:
         GLuint grid_momentum_x = 0;
         GLuint grid_momentum_y = 0;
         GLuint grid_moisture = 0;  // moisture-weighted node mass of the occupancy transfer (sand_particle_p2g.comp)
+        GLuint tile_flags = 0;     // per 16x16 node tile: deposited this substep (sand_grid_update.comp skips the rest)
         GLuint grid_velocity = 0;
         GLuint occupancy = 0;
         GLuint moisture = 0;     // R8 mean moisture of a cell's sand (sand_rasterize.comp), drawn by composite.frag
         GLuint packed = 0;       // R8UI sleeping grains per cell (sand_pack.comp)
-        GLuint packed_f = 0;     // RGBA16F mean left stretch of a cell's sleeping grains, mean moisture in .z
+        GLuint packed_f = 0;     // RGBA32F mean volume ratio J, hardening fraction and moisture of a cell's sleeping grains
         GLuint cell_tally = 0;   // per cell: grains, ready grains, wake/pack flags (sand_sleep.comp)
         GLuint cell_fsum = 0;    // per cell: summed F of the ready grains, four ints times 4096
         GLuint live_count = 0;   // live grains after the last compaction
+        // Host upper bound on the slots that may hold a live grain (the live count plus every spawn since), as for water;
+        // the sleep tally, compaction and erase dispatch it. Slots at or past it are inactive.
+        GLuint record_bound = 0;
         // Grid node rows/columns [x0, x1) x [y0, y1) the previous tick's grid passes covered; the next tick also clears
         // them, so nodes the moving sand left hold zero mass and velocity.
         std::array<int, 4> node_box{0, 0, kGridWidth + 2, kGridHeight + 2};
@@ -272,8 +280,11 @@ private:
     static constexpr int kGridWidth = 1000;
     static constexpr int kGridHeight = 1000;
     static constexpr int kWorkgroupSize = 16;
+    // Sand grid node tiles per row (and column): the (grid + 2)-node halo grid in workgroup-sized tiles.
+    static constexpr int kSandTileStride = (kGridWidth + 2 + kWorkgroupSize - 1) / kWorkgroupSize;
     static constexpr int kGasWidth = kGridWidth / 2;
     static constexpr int kGasHeight = kGridHeight / 2;
+    static constexpr std::uint32_t kGasTickStride = 2;  // the gas steps once per this many ticks (RunGasTick)
     static constexpr int kHeatWidth = kGasWidth;
     static constexpr int kHeatHeight = kGasHeight;
     static constexpr int kSmokeWidth = kGasWidth;
@@ -287,6 +298,10 @@ private:
     // Preallocated pools (CreateBuffers checks GL_MAX_SHADER_STORAGE_BLOCK_SIZE): 96 MB of water, 64 MB of sand, each
     // twice for compaction. Sleeping sand lives in the packed texture instead, so the sand pool bounds moving grains.
     static constexpr int kMaxWaterParticles = 1 << 21;
+    // Slots the water brush leaves free for packed water that wakes (RunSpawnWaterParticles).
+    static constexpr int kWaterWakeReserve = kMaxWaterParticles / 16;
+    static constexpr int kWaterBinSize = 8;  // cells per side of a compaction bin
+    static constexpr int kWaterBinCount = ((kGridWidth + kWaterBinSize - 1) / kWaterBinSize) * ((kGridHeight + kWaterBinSize - 1) / kWaterBinSize);
     static constexpr int kWaterParticleComponents = 12;
     static constexpr int kSandParticleComponents = 16;
     static constexpr int kMaxSandParticles = 1 << 20;
@@ -374,6 +389,16 @@ private:
     } stroke_;
     // Cursor cells reported since the last stamp (event rate, not frame rate), oldest first and bounded.
     std::vector<std::array<int, 2>> cursor_trail_;
+    // One entry of the OS mouse-move history (Windows: GetMouseMovePointsEx), in screen pixels and milliseconds.
+    struct MovePoint {
+        int x = 0;
+        int y = 0;
+        std::uint32_t time = 0;
+        bool operator==(const MovePoint&) const = default;
+    };
+    // The newest history entry already in cursor_trail_; invalid after a press, so a stroke never reaches back before it.
+    MovePoint last_move_{};
+    bool last_move_valid_ = false;
     // Cursor velocity in cells/s: the stroke polyline's travel per tick, smoothed (kBrushVelocityTau) and capped.
     std::array<float, 2> brush_velocity_{0.0F, 0.0F};
     static constexpr float kBrushVelocityTau = 0.05F;
@@ -451,6 +476,7 @@ private:
     GLuint water_mac_finalize_program_ = 0;
     GLuint water_divergence_program_ = 0;
     GLuint pressure_cg_program_ = 0;
+    GLuint pressure_pockets_program_ = 0;
     GLuint pressure_cg_reduce_program_ = 0;
     GLuint pressure_mg_program_ = 0;
     GLuint water_project_program_ = 0;
@@ -468,7 +494,6 @@ private:
     GLuint steam_update_program_ = 0;
     GLuint gas_pressure_restrict_program_ = 0;
     GLuint gas_pressure_relax_program_ = 0;
-    GLuint gas_pressure_prolongate_program_ = 0;
     GLuint smoke_project_program_ = 0;
     GLuint pressure_residual_program_ = 0;
     GLuint fire_rd_program_ = 0;
@@ -516,6 +541,7 @@ private:
     static void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
     static void CursorPosCallback(GLFWwindow* window, double x, double y);
     static void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+    static std::vector<MovePoint> MovesSince(const std::vector<MovePoint>& newest_first, const MovePoint& last);
     int RunInteractiveFrame(FixedStepClock& clock, double elapsed);
     void RunFrame(float dt, const BrushConfig* scripted_brush = nullptr, bool reset_counters = true);
     void RunSpawnPass(const BrushConfig* replay_brush);
@@ -536,11 +562,14 @@ private:
     void RunSandPass(float dt);
     void RunWaterPass(float dt);
     void RunWaterProjection();
+    void RemovePocketMeans(bool gas);
     void BindWaterSolver();
     void SetupWaterMultigrid();
     void ApplyWaterMultigrid(int slot, bool initial);
-    void RunGasPass(float dt);
-    void RunSmokePass(float dt);
+    void RunGasTick(float dt);
+    // Without project_each_substep, transport substeps share the last substep's projection.
+    void RunGasPass(float dt, bool project_each_substep = true);
+    void RunSmokePass(float dt, bool project = true);
     void RunGasProjection();
     void RunFireHeatPass(float dt);
     void RunCouplingPass(float dt);

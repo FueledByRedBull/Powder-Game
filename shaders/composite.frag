@@ -24,6 +24,7 @@ uniform ivec4 simRect;  // x, y, width, height of the simulation in the framebuf
 uniform int renderMode;
 uniform int lighting;   // 1: albedo * (ambient + fire glow + lantern); 0: albedo alone, which tests/AppLifecycleTests.cpp mirrors
 uniform vec3 lantern;   // cursor lantern: centre cell x, y and radius in cells; radius <= 0 switches it off
+uniform float fxTime;   // simulation seconds (tick count times the fixed step): flame tongues, sparks, heat shimmer; lit frames only
 uniform int debugReplayOk;
 uniform int debugPassCount;
 uniform float debugPassTimings[7];
@@ -88,13 +89,17 @@ float waterPresence(vec2 coord) {
 // Dark-cave palette. Everything in the scene is an albedo; the light (ambient, the fire's glow and the cursor lantern)
 // multiplies it at the end, and only flames, sparks and the hot-gas halo are emissive. tests/AppLifecycleTests.cpp
 // (render-modes) mirrors the albedo functions below with lighting = 0.
-const vec3 kCave = vec3(0.210, 0.195, 0.225);  // back wall, scaled by stone tone
-const vec3 kRockDark = vec3(0.21, 0.24, 0.32);
-const vec3 kRockMid = vec3(0.38, 0.43, 0.53);
-const vec3 kRockLight = vec3(0.60, 0.66, 0.78);
-const vec3 kRockMoss = vec3(0.34, 0.38, 0.17);
-const vec3 kCrustTop = vec3(0.80, 0.86, 0.94);   // lit rim on exposed top edges
-const vec3 kCrustSide = vec3(0.60, 0.66, 0.76);
+// The back wall is distant: dark, low in contrast and only coarsely textured, so painted rock (bright, fine-grained,
+// rimmed) reads as the solid foreground even as a thin stroke.
+const vec3 kCave = vec3(0.125, 0.118, 0.150);  // back wall, scaled by its coarse tone
+const vec3 kRockDark = vec3(0.30, 0.32, 0.39);
+const vec3 kRockMid = vec3(0.46, 0.49, 0.57);
+const vec3 kRockLight = vec3(0.62, 0.66, 0.75);
+const vec3 kRockMoss = vec3(0.36, 0.40, 0.18);
+const vec3 kCrustTop = vec3(0.88, 0.91, 0.96);   // lit rim on exposed top edges
+const vec3 kCrustSide = vec3(0.66, 0.70, 0.79);
+const float kCaveShadow = 0.60;  // back wall lost under the drop shadow of rock (and wood) up and to the left
+const float kContactShade = 0.30;  // albedo lost by sand, water and back wall touching rock (ambient occlusion)
 const vec3 kSandRelaxed = vec3(0.82, 0.64, 0.38);  // ochre
 const vec3 kSandCompressed = vec3(0.66, 0.48, 0.27);
 const float kSandWetDarkening = 0.45;  // albedo lost by saturated sand
@@ -113,9 +118,81 @@ float stoneTone(ivec2 cell) {
            0.25 * unitFloat(pcg2d(uvec2(cell >> 3) + 101u).x) + 0.20 * unitFloat(pcg2d(uvec2(cell >> 4) + 202u).y);
 }
 
-// The back wall of the cave, also the letterbox margin (which passes framebuffer pixels as cells).
+// The back wall of the cave, also the letterbox margin (which passes framebuffer pixels as cells): 4x4, 8x8 and 16x16
+// blocks only, no per-cell grain.
 vec3 caveAlbedo(ivec2 cell) {
-    return kCave * (0.45 + 1.1 * stoneTone(cell));
+    float tone = 0.40 * unitFloat(pcg2d(uvec2(cell >> 2) + 11u).x) + 0.35 * unitFloat(pcg2d(uvec2(cell >> 3) + 101u).x) +
+                 0.25 * unitFloat(pcg2d(uvec2(cell >> 4) + 202u).y);
+    return kCave * (0.70 + 0.60 * tone);
+}
+
+bool solidAt(ivec2 cell) {
+    return texelFetch(materialTex, clamp(cell, ivec2(0), gridSize - 1), 0).r >= 2u;
+}
+
+// Shading of an open cell by the solids (rock and wood) next to it: x is the drop shadow cast down and to the right
+// (1 under a solid one cell up-left, fading over four), y is 1 when one of the four neighbours is solid.
+vec2 solidShade(ivec2 cell) {
+    float touch = solidAt(cell + ivec2(1, 0)) || solidAt(cell - ivec2(1, 0)) || solidAt(cell + ivec2(0, 1)) ||
+                  solidAt(cell - ivec2(0, 1)) ? 1.0 : 0.0;
+    float shadow = touch;
+    for (int k = 1; k <= 4; ++k) {
+        if (solidAt(cell + ivec2(-k, k))) {
+            shadow = max(shadow, float(5 - k) / 4.0);
+            break;
+        }
+    }
+    return vec2(shadow, touch);
+}
+
+// Smooth value noise on the integer lattice, for flame tongues.
+float valueNoise(vec2 x) {
+    ivec2 i = ivec2(floor(x));
+    vec2 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = unitFloat(pcg2d(uvec2(i) + 41u).x);
+    float b = unitFloat(pcg2d(uvec2(i + ivec2(1, 0)) + 41u).x);
+    float c = unitFloat(pcg2d(uvec2(i + ivec2(0, 1)) + 41u).x);
+    float d = unitFloat(pcg2d(uvec2(i + ivec2(1, 1)) + 41u).x);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Flame particles and embers, drawn procedurally (no particle buffers). Each layer is a lattice of potential sparks
+// born together at one phase of the layer's cycle; a spark exists when the gas at its birth point is burning now and
+// its hash passes the layer's density for this cycle. Flame sparks rise fast and live a third of a second; embers are
+// thrown up and arc down under gravity for over a second. p is in cells, t in seconds. Lit frames only.
+vec3 sparks(vec2 p, float t) {
+    vec3 sum = vec3(0.0);
+    for (int layer = 0; layer < 6; ++layer) {
+        bool ember = layer >= 4;
+        float life = ember ? 1.3 + 0.2 * float(layer - 4) : 0.30 + 0.06 * float(layer);
+        float cycle = t / life + 0.618 * float(layer);
+        float age = fract(cycle) * life;
+        uint epoch = uint(int(floor(cycle))) * 7919u + uint(layer) * 104729u;
+        float size = ember ? 40.0 : 16.0;  // wider than any spark strays from its layer's mean travel
+        // Mean travel of the layer's sparks so far: the lattice cell a pixel's spark was born in is near p - travel.
+        vec2 mean = ember ? vec2(0.0, 70.0 * age - 0.5 * 160.0 * age * age) : vec2(0.0, 110.0 * age);
+        ivec2 base = ivec2(floor((p - mean) / size));
+        for (int j = 0; j < 9; ++j) {
+            ivec2 lattice = base + ivec2(j % 3 - 1, j / 3 - 1);
+            uvec2 h = pcg2d(uvec2(lattice) + uvec2(epoch, epoch * 3u));
+            uvec2 g = pcg2d(h);
+            if (unitFloat(g.y) > (ember ? 0.8 : 0.5)) continue;
+            vec2 birth = (vec2(lattice) + vec2(unitFloat(h.x), unitFloat(h.y))) * size;
+            float heat = textureLod(temperatureTex, birth / vec2(gridSize), 0.0).r;
+            float burn = textureLod(fireEmissiveTex, birth / vec2(gridSize), 0.0).r;
+            if (max(heat, burn) < 0.45) continue;
+            float vx = (unitFloat(g.x) - 0.5) * (ember ? 32.0 : 24.0);
+            float vy = ember ? 70.0 + 32.0 * (unitFloat(g.x >> 4u) - 0.5) : 110.0 + 50.0 * (unitFloat(g.x >> 4u) - 0.5);
+            vec2 at = birth + vec2(vx, vy) * age - vec2(0.0, ember ? 80.0 * age * age : 0.0);
+            vec2 d = abs(p - at);
+            if (max(d.x, d.y) > 1.1) continue;
+            float fade = smoothstep(0.0, 0.06, age) * (1.0 - smoothstep(0.4 * life, life, age));
+            float flicker = 0.55 + 0.45 * sin(t * 37.0 + 6.2832 * unitFloat(h.x >> 3u));
+            sum += (ember ? vec3(1.0, 0.36, 0.06) : vec3(1.0, 0.62, 0.22)) * (fade * flicker * (ember ? 1.6 : 1.2));
+        }
+    }
+    return sum;
 }
 
 // Rim strength along `dir`: 1 for a cell next to open space, falling to 0 over `reach` cells, 0 deeper in the rock.
@@ -140,7 +217,7 @@ vec3 rockAlbedo(ivec2 cell) {
     float rimTop = rimStrength(cell, ivec2(0, 1), 6);
     float rimBottom = rimStrength(cell, ivec2(0, -1), 3);
     float rimSide = max(rimStrength(cell, ivec2(-1, 0), 3), rimStrength(cell, ivec2(1, 0), 3));
-    color *= mix(0.62, 1.0, max(max(rimTop, rimBottom), rimSide));
+    color *= mix(0.80, 1.0, max(max(rimTop, rimBottom), rimSide));
     float jitter = unitFloat(fine.y) * 0.95;
     float crustTop = rimTop > jitter ? 1.0 : 0.0;
     float crustSide = rimSide > jitter ? 1.0 : 0.0;
@@ -192,7 +269,8 @@ float vignette(vec2 p) {
 
 // What reaches a surface, in linear light: the moonlit ambient, the fire's glow (the emitted-light mip chain read at
 // four widths, so one small flame lights the cave a long way off) and the cursor lantern.
-vec3 sceneLight(vec2 uv, vec2 p, out float warmth) {
+// backdrop is the share of the pixel that is bare back wall, which gets half the glow and lantern light.
+vec3 sceneLight(vec2 uv, vec2 p, float backdrop, out float warmth) {
     float dim = vignette(p);
     // Mips 1-4 (8 to 64 cells per texel), weights summing to 2: a flame lights its surroundings, not the whole cave.
     vec3 glow = textureLod(lightTex, uv, 1.0).rgb * 0.4 + textureLod(lightTex, uv, 2.0).rgb * 0.5 +
@@ -202,6 +280,7 @@ vec3 sceneLight(vec2 uv, vec2 p, out float warmth) {
         float f = 1.0 - smoothstep(0.0, 1.0, length(uv * vec2(gridSize) - lantern.xy) / lantern.z);
         glow += kLanternColor * (2.4 * f * f);
     }
+    glow *= 1.0 - 0.5 * backdrop;
     vec3 light = kAmbient * dim + glow;
     // The share of the light that is warm: it washes the blue out of stone, so lit rock reads orange-brown, not olive.
     warmth = dot(glow, vec3(0.30, 0.59, 0.11)) / max(dot(light, vec3(0.30, 0.59, 0.11)), 1e-4);
@@ -221,6 +300,19 @@ void main() {
         return;
     }
     vec2 texel = 1.0 / vec2(gridSize);
+    // Heat shimmer: above and inside hot gas the whole scene is looked up through a wavering offset, as if refracted
+    // by the hot air. Lit frames only (lighting is 0 in every pixel test but the lighting case), and time enters only
+    // through fxTime, so a frame is still a function of the simulation state.
+    if (lighting != 0) {
+        float hot = max(textureLod(temperatureTex, uv, 0.0).r, textureLod(temperatureTex, uv - vec2(0.0, 10.0) * texel, 0.0).r);
+        float shimmer = smoothstep(0.12, 0.55, hot);
+        if (shimmer > 0.0) {
+            vec2 cellPos = uv * vec2(gridSize);
+            uv += texel * shimmer * 1.6 * vec2(sin(cellPos.y * 0.31 - fxTime * 11.0 + sin(cellPos.x * 0.07)),
+                                                0.5 * sin(cellPos.x * 0.23 + fxTime * 7.0));
+            uv = clamp(uv, vec2(0.0), vec2(1.0) - 0.5 * texel);
+        }
+    }
     uint material = texture(materialTex, uv).r;
     float stress = material == 2u ? 1.0 : 0.0;
     Taps waterTaps = tapScalar(waterAmountTex, uv, texel, 0.0);
@@ -298,6 +390,8 @@ void main() {
     // Presentation only: nothing below feeds back into the simulation, and nothing depends on time.
     ivec2 cell = ivec2(uv * vec2(gridSize));
     vec3 color = caveAlbedo(cell);
+    vec2 shade = material < 2u ? solidShade(cell) : vec2(0.0);
+    color *= 1.0 - kCaveShadow * shade.x;
 
     if (material == 2u) {
         color = rockAlbedo(cell);
@@ -335,39 +429,61 @@ void main() {
     // shimmer of lighter cells near the surface, and foam only for genuinely fast flow. Coverage saturates quickly so
     // sparse (1-2 particle) water still reads.
     float water_cover = 1.0 - exp(-water * 26.0);
-    float oilShare = 0.0;  // oil_field share, eased; oil tints the liquid amber
+    // A gap of a few cells with water on all four sides is a void the particles left in a churning body, not air you
+    // can see through: it reads as water instead of a dark hole (the particle density holes themselves are physics).
+    float enclosed = 0.0;
+    if (material == 0u && water_cover < 0.9) {
+        enclosed = min(min(waterPresence(uv + texel * vec2(3.0, 0.0)), waterPresence(uv - texel * vec2(3.0, 0.0))),
+                       min(waterPresence(uv + texel * vec2(0.0, 3.0)), waterPresence(uv - texel * vec2(0.0, 3.0))));
+        water_cover = max(water_cover, enclosed);
+    }
+    float oilShare = 0.0;  // oil_field share, filtered; oil turns the liquid into a dark amber slick
+    vec3 oilSheen = vec3(0.0);  // thin-film colour of the slick's surface
     float glint = 0.0;  // moonlight caught by the surface and a few ripples; added after the lighting
     if (water_cover > 0.004 && (material == 0u || sandCover > 0.0)) {
-        // Depth: water above (three taps) and to both sides; thin streams, films and the band under the
-        // surface stay shallow. Per-pixel jitter of the reaches turns the three steps into a smooth ramp.
+        // Depth: water above (three heights) and to both sides; thin streams, films and the band under the surface
+        // stay shallow. Each tap is bilinear and half a cell off the column, so it averages a 2x2 block and one missing
+        // cell (a particle gap above) does not draw a light streak down the body. Per-pixel jitter of the heights
+        // turns the three steps into a smooth ramp.
         vec3 reach = 0.7 + 0.6 * vec3(pixelHash.y & 1023u, (pixelHash.y >> 10u) & 1023u, (pixelHash.y >> 20u) & 1023u) / 1023.0;
-        float depth = (waterPresence(uv + texel * vec2(0.0, 5.0 * reach.x)) +
-                       waterPresence(uv + texel * vec2(0.0, 12.0 * reach.y)) +
-                       waterPresence(uv + texel * vec2(0.0, 24.0 * reach.z))) / 3.0 *
-                      waterPresence(uv + texel * vec2(7.0 * reach.y, 0.0)) *
-                      waterPresence(uv - texel * vec2(7.0 * reach.z, 0.0));
+        vec2 half_cell = vec2(0.5, 0.0) * texel;
+        float depth = (waterPresence(uv + half_cell + texel * vec2(0.0, 5.0 * reach.x)) +
+                       waterPresence(uv - half_cell + texel * vec2(0.0, 12.0 * reach.y)) +
+                       waterPresence(uv + half_cell + texel * vec2(0.0, 24.0 * reach.z))) / 3.0 *
+                      waterPresence(uv + texel * vec2(7.0, 0.5)) * waterPresence(uv - texel * vec2(7.0, -0.5));
         float foam = smoothstep(35.0, 70.0, length(water_velocity));
         vec3 water_color = mix(kWaterShallow, kWaterDeep, depth * (1.0 - foam) * 0.85);
         // Saturated coverage one and two cells up, so particle jitter inside the body does not light up the rim.
         float above1 = 1.0 - exp(-waterTaps.above * 26.0);
         float above2 = 1.0 - exp(-textureLod(waterAmountTex, uv + vec2(0.0, 2.0 * texel.y), 0.0).r * 26.0);
-        float surface = max(max(water_cover - above1, 0.0), 0.5 * max(water_cover - above2, 0.0));
+        float surface = max(max(water_cover - above1, 0.0), 0.5 * max(water_cover - above2, 0.0)) * (1.0 - enclosed);
         water_color = mix(water_color, vec3(0.62, 0.88, 0.90), surface * 0.85);
         float shimmer = unitFloat(pcg2d(uvec2(cell) + 505u).x) > 0.9 ? (1.0 - depth) * (1.0 - depth) * water_cover : 0.0;
         water_color = mix(water_color, vec3(0.50, 0.82, 0.86), 0.35 * shimmer);
         glint = (0.55 * surface + 0.30 * shimmer) * (material == 0u ? 1.0 : 0.4);
         water_color = mix(water_color, vec3(0.70, 0.90, 0.92), foam * 0.25);
-        // Oil: dark amber-brown liquid, nearly opaque, with a warm golden sheen along its surface instead of the
-        // pale water line.
-        oilShare = smoothstep(0.0, 0.6, texture(oilTex, uv).r);
+        // Oil: a dark amber slick. The share is filtered over the 3x3 neighbourhood and dilated, so the few oil
+        // records of a thin film join into one continuous band instead of rust-coloured specks. Its surface carries
+        // a thin-film sheen, an amber-biased rainbow along its top cells.
+        Taps oilTaps = tapScalar(oilTex, uv, texel, 0.0);
+        oilShare = smoothstep(0.04, 0.45, max(oilTaps.filtered * 1.2, oilTaps.dilated * 0.75));
         if (oilShare > 0.0) {
-            vec3 oil_color = mix(vec3(0.46, 0.27, 0.08), vec3(0.24, 0.12, 0.03), depth * 0.8);
-            oil_color = mix(oil_color, vec3(0.92, 0.70, 0.34), surface * 0.75 + 0.12 * shimmer);
+            // Amber where the slick is thin or near its top, near-black brown where it is deep.
+            float top = 1.0 - waterPresence(uv + texel * vec2(0.5, 3.5));
+            vec3 oil_color = mix(vec3(0.40, 0.23, 0.08), vec3(0.17, 0.095, 0.04), clamp(max(depth, oilShare) - 0.7 * top, 0.0, 1.0));
+            // The hue drifts smoothly along the slick (low-frequency noise), not cell by cell.
+            float film = float(cell.x) * 0.006 + 0.5 * valueNoise(vec2(cell) * 0.04) + 0.35 * oilTaps.filtered;
+            oilSheen = 0.5 + 0.5 * cos(6.2832 * (film + vec3(0.0, 0.33, 0.67)));
+            oilSheen = mix(vec3(0.95, 0.68, 0.28), oilSheen, 0.55);  // amber-biased rainbow
+            oil_color = mix(oil_color, oilSheen * 0.6, top * 0.55);
             water_color = mix(water_color, oil_color, oilShare);
+            glint = mix(glint, 0.5 * top, oilShare);
         }
-        float water_alpha = water_cover * (material == 0u ? 0.88 : 0.40);
+        float water_alpha = water_cover * (material == 0u ? mix(0.88, 0.97, oilShare) : 0.40);
         color = mix(color, water_color, water_alpha);
     }
+    // Sand, water and the back wall darken where they touch rock: contact occlusion.
+    color *= 1.0 - kContactShade * shade.y;
 
     // Smoke: a grey haze that shows even when thin, slightly warmed where hot. It is albedo, so the fire's glow
     // lights it.
@@ -386,30 +502,44 @@ void main() {
 
     if (lighting != 0) {
         float warmth;
-        vec3 light = sceneLight(uv, gl_FragCoord.xy / vec2(fbSize), warmth);
+        // The back wall is further from the flames and the lantern than the matter in front of it: half their light.
+        float backdrop = material < 2u ? (1.0 - max(water_cover, sandCover)) * (1.0 - smoke_alpha) * (1.0 - steam_alpha) : 0.0;
+        vec3 light = sceneLight(uv, gl_FragCoord.xy / vec2(fbSize), backdrop, warmth);
         color = mix(color, vec3(dot(color, vec3(0.30, 0.59, 0.11))), 0.40 * warmth);
         color *= sqrt(light);
-        color += mix(vec3(0.16, 0.30, 0.32), vec3(0.40, 0.28, 0.10), oilShare) * glint + vec3(0.32, 0.33, 0.35) * steam_alpha;
+        color += mix(vec3(0.16, 0.30, 0.32), oilSheen * 0.35, oilShare) * glint + vec3(0.32, 0.33, 0.35) * steam_alpha;
     }
 
-    // Fire: additive flame, a temperature glow that outlives the flame and a few embers, soft-saturated instead of
-    // hard-clamped. The bloom is four jittered taps of the same temperature field at a wide reach, so flames
-    // leave a warm halo on whatever is around them. Embers are static per-cell sparks in the halo: they come and
-    // go as the hot gas moves through them, with no clock involved.
+    // Fire: additive flame, a temperature glow that outlives the flame, soft-saturated instead of hard-clamped. The
+    // bloom is eight fixed taps of the same temperature field at two reaches, so flames leave a smooth warm halo on
+    // whatever is around them. Lit frames break the flame into rising tongues and add flame sparks and embers
+    // (sparks()); both move with fxTime only.
     float heat = temperature * temperature;
-    vec2 bloomJitter = 0.75 + 0.5 * vec2(pixelHash.y & 1023u, (pixelHash.y >> 10u) & 1023u) / 1023.0;
-    vec2 bloomReach = texel * 13.0 * bloomJitter;
-    float bloom = 0.25 * (texture(temperatureTex, uv + bloomReach).r + texture(temperatureTex, uv - bloomReach).r +
-                          texture(temperatureTex, uv + vec2(bloomReach.x, -bloomReach.y)).r +
-                          texture(temperatureTex, uv + vec2(-bloomReach.x, bloomReach.y)).r);
+    vec2 near = texel * 8.0, far = texel * 14.0;
+    float bloom = 0.0625 * (texture(temperatureTex, uv + near).r + texture(temperatureTex, uv - near).r +
+                            texture(temperatureTex, uv + vec2(near.x, -near.y)).r +
+                            texture(temperatureTex, uv + vec2(-near.x, near.y)).r) +
+                  0.1875 * (texture(temperatureTex, uv + vec2(far.x, 0.0)).r + texture(temperatureTex, uv - vec2(far.x, 0.0)).r +
+                            texture(temperatureTex, uv + vec2(0.0, far.y)).r + texture(temperatureTex, uv - vec2(0.0, far.y)).r);
     bloom = clamp(bloom, 0.0, 1.0);
-    float hot = clamp(temperature * 1.5 + bloom * 1.5, 0.0, 1.0);
-    float ember = unitFloat(pcg2d(uvec2(cell) + 606u).x) > 0.996 ? smoothstep(0.10, 0.45, hot) * (1.0 - smoothstep(0.85, 1.0, hot)) : 0.0;
+    float tongues = 1.0;
+    vec3 spark = vec3(0.0);
+    if (lighting != 0) {
+        vec2 cellPos = uv * vec2(gridSize);
+        if (flame > 0.0 || heat > 0.01) {
+            // Two octaves of noise stretched upward and scrolled up: tongues that lick and flicker. Thin flame
+            // (the tip) is cut harder than the dense base.
+            float n = 0.65 * valueNoise(vec2(cellPos.x * 0.11, cellPos.y * 0.045 - fxTime * 2.6)) +
+                      0.35 * valueNoise(vec2(cellPos.x * 0.27, cellPos.y * 0.11 - fxTime * 5.5));
+            tongues = smoothstep(0.62 - 0.55 * max(flame, heat), 0.95, n + 0.25) * 1.5;
+        }
+        if (dot(textureLod(lightTex, uv, 3.0).rgb, vec3(1.0)) > 0.02) spark = sparks(cellPos, fxTime);
+    }
     // Flame hue follows the gas temperature; its strength follows the burn, plus a dim glow from very hot gas.
-    vec3 fire_add = flameColor(max(temperature, flame * 0.8)) * (flame * 1.6) +
-                    flameColor(temperature * 0.5) * (heat * heat * 1.6) +
-                    vec3(1.0, 0.30, 0.03) * (bloom * 0.2 + bloom * bloom * 0.35) +
-                    vec3(1.0, 0.70, 0.28) * (ember * 1.4) + vec3(1.0, 0.30, 0.04) * (woodEmber * 1.2);
+    vec3 fire_add = flameColor(max(temperature, flame * 0.8)) * (flame * 1.6 * tongues) +
+                    flameColor(temperature * 0.5) * (heat * heat * 1.6 * mix(1.0, tongues, 0.6)) +
+                    vec3(1.0, 0.30, 0.03) * (bloom * 0.2 + bloom * bloom * 0.35) + spark +
+                    vec3(1.0, 0.30, 0.04) * (woodEmber * 1.2);
     color = 1.0 - (1.0 - color) * exp(-fire_add);
 
     // Sub-LSB dither against banding in the dark gradients.

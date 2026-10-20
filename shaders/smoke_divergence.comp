@@ -2,9 +2,11 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D gasUTex;
-layout(r16f, binding = 1) uniform readonly image2D gasVTex;
-layout(r16f, binding = 2) uniform writeonly image2D divergenceTex;
+layout(r32f, binding = 0) uniform readonly image2D gasUTex;
+layout(r32f, binding = 1) uniform readonly image2D gasVTex;
+// R32F like the faces: stored as half floats, the right-hand side of a fire scene was rounded by up to 0.5 /s, twice the
+// residual gate, and the projected field kept that error (app-gas-rhs-precision).
+layout(r32f, binding = 2) uniform writeonly image2D divergenceTex;
 layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
 // x: fuel burned per second (fire_rd.comp).
 layout(rg16f, binding = 4) uniform readonly image2D reactionTex;

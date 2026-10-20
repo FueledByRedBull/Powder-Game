@@ -12,6 +12,10 @@
 #include "HudFont.hpp"
 
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,7 +24,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -30,10 +33,6 @@
 #include <string>
 #include <vector>
 
-#ifndef _WIN32
-#include <unistd.h>
-#endif
-
 namespace {
 
 constexpr GLuint kEmptyMaterial = 0U;
@@ -41,16 +40,21 @@ constexpr GLuint kSolidMaterial = 2U;
 // Intact wood; burning and charred wood use 256 and up (shaders/wood_burn.comp).
 constexpr GLuint kWoodMaterial = 3U;
 // Oil (crude or vegetable oil, 0.85-0.92 g/cm^3) is a liquid record tagged in state2.z. Bodies of it rise through water
-// under a Boussinesq buoyancy of (1 - kOilDensity) g on the local oil share, and within a cell the liquids separate by
-// a drift (water_particle_step.comp).
+// under the variable-density correction (1 / kOilDensity - 1) times the pressure acceleration on the local oil share,
+// which vanishes in open air, and within a cell the liquids separate by a drift (water_particle_step.comp): 20 cells/s
+// (10 cm/s) is the terminal rise of a 5 mm oil droplet in water (Schiller-Naumann drag: 3 cm/s at 1 mm, about
+// 10 cm/s at 5 mm).
 constexpr float kOilDensity = 0.87F;
-constexpr float kOilDrift = 60.0F;
+constexpr float kOilDrift = 20.0F;
 // Surface oil under flame burns at 2/s per record, so a 5-cell slick (20 records per column) is gone in about 3 s;
 // surface water (and the edges of a stream) under full flame boils off at 2/s per record, a thin film each second: the
 // dousing still quenches, with a visible plume.
 constexpr float kOilBurnRate = 2.0F;
 constexpr float kOilIgnitionTemperature = 0.3F;
 constexpr float kWaterEvaporateRate = 2.0F;
+// Water that meets burning oil flashes within a couple of ticks (mean life 1/30 s): a lit slick's surface is far above
+// the boiling point, so water does not survive sinking into it (phase_particles.comp).
+constexpr float kWaterFlashRate = 30.0F;
 // Steam rises at 1 m/s (100 gas cells/s) through the gas and condenses within about 1.5 s.
 constexpr float kSteamRise = 100.0F;
 constexpr float kSteamCondense = 0.8F;
@@ -66,24 +70,6 @@ constexpr std::array<const char*, 5> kDebugCounterNames{
     "water_velocity_clamped",
 };
 constexpr std::size_t kDebugFailureCounters = 4;  // the counters before water_velocity_clamped
-
-std::filesystem::path GetExecutableDirectory() {
-#ifdef _WIN32
-    std::array<wchar_t, 32768> path_buffer{};
-    const DWORD written = GetModuleFileNameW(nullptr, path_buffer.data(), static_cast<DWORD>(path_buffer.size()));
-    if (written > 0 && written < path_buffer.size()) {
-        return std::filesystem::path(std::wstring(path_buffer.data(), written)).parent_path();
-    }
-#else
-    std::array<char, 4096> path_buffer{};
-    const ssize_t written = readlink("/proc/self/exe", path_buffer.data(), path_buffer.size() - 1);
-    if (written > 0 && static_cast<std::size_t>(written) < path_buffer.size() - 1) {
-        path_buffer[static_cast<std::size_t>(written)] = '\0';
-        return std::filesystem::path(path_buffer.data()).parent_path();
-    }
-#endif
-    throw std::runtime_error("Could not determine the executable directory.");
-}
 
 }  // namespace
 
@@ -142,7 +128,10 @@ int PowderApp::Run() {
 // The body of the interactive loop after input, shared with the interactive profiling fixture.
 int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
     const int steps = clock.Advance(elapsed, config_.fixed_dt);
+    // Ticks end in blocking readbacks, so their wall time tracks their GPU cost.
+    const double tick_start = glfwGetTime();
     for (int step = 0; step < steps; ++step) RunFrame(config_.fixed_dt, nullptr, step == 0);
+    clock.MeasureTicks(glfwGetTime() - tick_start, steps);
     Render(true);
     DrawHud();
     glfwSwapBuffers(window_);
@@ -239,7 +228,6 @@ void PowderApp::Shutdown() {
         DeleteProgram(fire_rd_program_);
         DeleteProgram(pressure_residual_program_);
         DeleteProgram(smoke_project_program_);
-        DeleteProgram(gas_pressure_prolongate_program_);
         DeleteProgram(gas_pressure_relax_program_);
         DeleteProgram(gas_pressure_restrict_program_);
         DeleteProgram(gas_pressure_kind_program_);
@@ -260,6 +248,7 @@ void PowderApp::Shutdown() {
         DeleteProgram(water_project_program_);
         DeleteProgram(pressure_cg_reduce_program_);
         DeleteProgram(pressure_cg_program_);
+        DeleteProgram(pressure_pockets_program_);
         DeleteProgram(pressure_mg_program_);
         DeleteProgram(water_divergence_program_);
         DeleteProgram(water_mac_finalize_program_);
@@ -295,6 +284,7 @@ void PowderApp::Shutdown() {
         DeleteProgram(oil_field_program_);
         DeleteProgram(steam_update_program_);
         DeleteBuffer(sand_state_.grid_moisture);
+        DeleteBuffer(sand_state_.tile_flags);
         DeleteBuffer(sand_state_.grid_momentum_y);
         DeleteBuffer(sand_state_.grid_momentum_x);
         DeleteBuffer(sand_state_.grid_mass);
@@ -308,6 +298,7 @@ void PowderApp::Shutdown() {
         DeleteBuffer(water_state_.pressure_sums);
         DeleteBuffer(water_state_.pressure_levels);
         DeleteBuffer(water_state_.pressure_state);
+        DeleteBuffer(water_state_.pockets);
         DeleteBuffer(water_state_.pressure_tiles);
         DeleteBuffer(water_state_.pressure_scalars);
         DeleteBuffer(water_state_.pressure_partials);
@@ -318,6 +309,7 @@ void PowderApp::Shutdown() {
         DeleteBuffer(water_state_.cell_counts);
         DeleteBuffer(water_state_.spawn_cursor);
         DeleteBuffer(water_state_.scratch_particles);
+        DeleteBuffer(water_state_.bins);
         DeleteBuffer(water_state_.particles);
 
         DeleteTexture(gas_state_.reaction_b);
@@ -339,6 +331,7 @@ void PowderApp::Shutdown() {
         for (GLuint& texture : gas_state_.level_pressure) DeleteTexture(texture);
         for (GLuint& texture : gas_state_.level_rhs) DeleteTexture(texture);
         for (GLuint& texture : gas_state_.level_residual) DeleteTexture(texture);
+        for (GLuint& texture : gas_state_.level_smoothed) DeleteTexture(texture);
         for (GLuint* texture : {&gas_state_.cg_s, &gas_state_.cg_z, &gas_state_.cg_d, &gas_state_.cg_q}) DeleteTexture(*texture);
         DeleteBuffer(gas_state_.cg_partials);
         DeleteBuffer(gas_state_.cg_scalars);
@@ -424,22 +417,24 @@ void PowderApp::CreateTextures() {
     water_state_.pressure_a = CreateTexture(kGridWidth, kGridHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
     water_state_.divergence = CreateTexture(kGridWidth, kGridHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
 
-    gas_state_.mac_u_a = CreateTexture(kGasWidth + 1, kGasHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
-    gas_state_.mac_u_b = CreateTexture(kGasWidth + 1, kGasHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
-    gas_state_.mac_u_tmp = CreateTexture(kGasWidth + 1, kGasHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
-    gas_state_.mac_v_a = CreateTexture(kGasWidth, kGasHeight + 1, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
-    gas_state_.mac_v_b = CreateTexture(kGasWidth, kGasHeight + 1, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
-    gas_state_.mac_v_tmp = CreateTexture(kGasWidth, kGasHeight + 1, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
+    gas_state_.mac_u_a = CreateTexture(kGasWidth + 1, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mac_u_b = CreateTexture(kGasWidth + 1, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mac_u_tmp = CreateTexture(kGasWidth + 1, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mac_v_a = CreateTexture(kGasWidth, kGasHeight + 1, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mac_v_b = CreateTexture(kGasWidth, kGasHeight + 1, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mac_v_tmp = CreateTexture(kGasWidth, kGasHeight + 1, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
     gas_state_.velocity_center_a = CreateTexture(kGasWidth, kGasHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
     gas_state_.velocity_center_b = CreateTexture(kGasWidth, kGasHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
     gas_state_.velocity_center_tmp = CreateTexture(kGasWidth, kGasHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
 
     gas_state_.pressure_a = CreateTexture(kGasWidth, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
-    gas_state_.divergence = CreateTexture(kGasWidth, kGasHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_NEAREST);
+    gas_state_.divergence = CreateTexture(kGasWidth, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
     for (int level = 0, size = kGasWidth; level < kGasLevels; ++level, size = (size + 1) / 2) {
         gas_state_.level_kind[level] = CreateTexture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
-        if (level + 1 < kGasLevels)
+        if (level + 1 < kGasLevels) {
             gas_state_.level_residual[level] = CreateTexture(size, size, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+            gas_state_.level_smoothed[level] = CreateTexture(size, size, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+        }
         if (level == 0) continue;
         gas_state_.level_pressure[level - 1] = CreateTexture(size, size, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
         gas_state_.level_rhs[level - 1] = CreateTexture(size, size, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
@@ -482,7 +477,7 @@ void PowderApp::CreateTextures() {
     sand_state_.occupancy = CreateTexture(kGridWidth, kGridHeight, GL_R16F, GL_RED, GL_HALF_FLOAT, GL_LINEAR);
     sand_state_.moisture = CreateTexture(kGridWidth, kGridHeight, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_LINEAR);
     sand_state_.packed = CreateTexture(kGridWidth, kGridHeight, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
-    sand_state_.packed_f = CreateTexture(kGridWidth, kGridHeight, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, GL_NEAREST);
+    sand_state_.packed_f = CreateTexture(kGridWidth, kGridHeight, GL_RGBA32F, GL_RGBA, GL_FLOAT, GL_NEAREST);
     water_state_.packed = CreateTexture(kGridWidth, kGridHeight, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
     water_state_.wake_velocity = CreateTexture(kGridWidth, kGridHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_NEAREST);
     sand_state_.grid_velocity =
@@ -571,6 +566,9 @@ void PowderApp::CreateBuffers() {
     glGenBuffers(1, &water_state_.pressure_state);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.pressure_state);
     glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(sizeof(GLuint) * 4), nullptr, GL_STREAM_READ);
+    glGenBuffers(1, &water_state_.pockets);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.pockets);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(CellCount()) * 16, nullptr, GL_DYNAMIC_DRAW);
     glGenBuffers(1, &water_state_.pressure_levels);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.pressure_levels);
     // Eight indirect argument and eight box slots, then a vec4 per coarse cell (pressure_mg.comp).
@@ -584,6 +582,10 @@ void PowderApp::CreateBuffers() {
     glGenBuffers(1, &water_state_.scratch_particles);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.scratch_particles);
     glBufferData(GL_SHADER_STORAGE_BUFFER, water_particles_bytes, nullptr, GL_DYNAMIC_DRAW);
+
+    glGenBuffers(1, &water_state_.bins);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.bins);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(sizeof(GLuint) * kWaterBinCount), nullptr, GL_DYNAMIC_DRAW);
 
     glGenBuffers(1, &water_state_.spawn_cursor);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.spawn_cursor);
@@ -641,6 +643,12 @@ void PowderApp::CreateBuffers() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.grid_moisture);
     glBufferData(GL_SHADER_STORAGE_BUFFER, sand_grid_uint_bytes, nullptr, GL_DYNAMIC_DRAW);
 
+    glGenBuffers(1, &sand_state_.tile_flags);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.tile_flags);
+    const int sand_tile_rows = (kGridHeight + 2 + kWorkgroupSize - 1) / kWorkgroupSize;
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(kSandTileStride * sand_tile_rows * sizeof(GLuint)),
+                 nullptr, GL_DYNAMIC_DRAW);
+
     glGenBuffers(1, &sand_state_.grid_momentum_x);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.grid_momentum_x);
     glBufferData(GL_SHADER_STORAGE_BUFFER, sand_grid_int_bytes, nullptr, GL_DYNAMIC_DRAW);
@@ -671,91 +679,87 @@ void PowderApp::CreateBuffers() {
 }
 
 void PowderApp::CreatePrograms() {
-    const std::filesystem::path shader_root = GetExecutableDirectory() / "shaders";
-
-    init_state_program_ = glutil::CreateComputeProgramFromFile(shader_root / "init_state.comp");
-    spawn_full_program_ = glutil::CreateComputeProgramFromFile(shader_root / "spawn_full.comp");
-    spawn_gas_program_ = glutil::CreateComputeProgramFromFile(shader_root / "spawn_smoke.comp");
+    init_state_program_ = glutil::CreateComputeProgram("init_state.comp");
+    spawn_full_program_ = glutil::CreateComputeProgram("spawn_full.comp");
+    spawn_gas_program_ = glutil::CreateComputeProgram("spawn_smoke.comp");
     sand_particle_spawn_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "sand_particle_spawn.comp");
+        glutil::CreateComputeProgram("sand_particle_spawn.comp");
     sand_particle_compact_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "sand_particle_compact.comp");
+        glutil::CreateComputeProgram("sand_particle_compact.comp");
     sand_particle_clear_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "sand_particle_clear.comp");
-    sand_particle_p2g_program_ = glutil::CreateComputeProgramFromFile(shader_root / "sand_particle_p2g.comp");
-    sand_grid_update_program_ = glutil::CreateComputeProgramFromFile(shader_root / "sand_grid_update.comp");
+        glutil::CreateComputeProgram("sand_particle_clear.comp");
+    sand_particle_p2g_program_ = glutil::CreateComputeProgram("sand_particle_p2g.comp");
+    sand_grid_update_program_ = glutil::CreateComputeProgram("sand_grid_update.comp");
     sand_particle_step_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "sand_particle_step.comp");
-    sand_rasterize_program_ = glutil::CreateComputeProgramFromFile(shader_root / "sand_rasterize.comp");
-    sand_sleep_program_ = glutil::CreateComputeProgramFromFile(shader_root / "sand_sleep.comp");
-    sand_pack_program_ = glutil::CreateComputeProgramFromFile(shader_root / "sand_pack.comp");
-    water_sleep_program_ = glutil::CreateComputeProgramFromFile(shader_root / "water_sleep.comp");
-    water_pack_program_ = glutil::CreateComputeProgramFromFile(shader_root / "water_pack.comp");
-    boundary_build_program_ = glutil::CreateComputeProgramFromFile(shader_root / "boundary_build.comp");
+        glutil::CreateComputeProgram("sand_particle_step.comp");
+    sand_rasterize_program_ = glutil::CreateComputeProgram("sand_rasterize.comp");
+    sand_sleep_program_ = glutil::CreateComputeProgram("sand_sleep.comp");
+    sand_pack_program_ = glutil::CreateComputeProgram("sand_pack.comp");
+    water_sleep_program_ = glutil::CreateComputeProgram("water_sleep.comp");
+    water_pack_program_ = glutil::CreateComputeProgram("water_pack.comp");
+    boundary_build_program_ = glutil::CreateComputeProgram("boundary_build.comp");
     boundary_downsample_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "boundary_downsample.comp");
-    boundary_seed_program_ = glutil::CreateComputeProgramFromFile(shader_root / "boundary_seed.comp");
+        glutil::CreateComputeProgram("boundary_downsample.comp");
+    boundary_seed_program_ = glutil::CreateComputeProgram("boundary_seed.comp");
     boundary_jumpflood_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "boundary_jumpflood.comp");
+        glutil::CreateComputeProgram("boundary_jumpflood.comp");
     boundary_distance_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "boundary_distance.comp");
+        glutil::CreateComputeProgram("boundary_distance.comp");
     water_particle_p2g_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_p2g.comp");
+        glutil::CreateComputeProgram("water_particle_p2g.comp");
     water_particle_spawn_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_spawn.comp");
+        glutil::CreateComputeProgram("water_particle_spawn.comp");
     water_particle_compact_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_compact.comp");
+        glutil::CreateComputeProgram("water_particle_compact.comp");
     water_particle_clear_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_clear.comp");
+        glutil::CreateComputeProgram("water_particle_clear.comp");
     water_particle_step_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_step.comp");
+        glutil::CreateComputeProgram("water_particle_step.comp");
     water_particle_finalize_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_particle_finalize.comp");
-    water_mac_build_program_ = glutil::CreateComputeProgramFromFile(shader_root / "water_mac_build.comp");
+        glutil::CreateComputeProgram("water_particle_finalize.comp");
+    water_mac_build_program_ = glutil::CreateComputeProgram("water_mac_build.comp");
     water_mac_finalize_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_mac_finalize.comp");
+        glutil::CreateComputeProgram("water_mac_finalize.comp");
     water_divergence_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "water_divergence.comp");
-    pressure_cg_program_ = glutil::CreateComputeProgramFromFile(shader_root / "pressure_cg.comp");
-    pressure_cg_reduce_program_ = glutil::CreateComputeProgramFromFile(shader_root / "pressure_cg_reduce.comp");
-    pressure_mg_program_ = glutil::CreateComputeProgramFromFile(shader_root / "pressure_mg.comp");
-    water_project_program_ = glutil::CreateComputeProgramFromFile(shader_root / "water_project.comp");
+        glutil::CreateComputeProgram("water_divergence.comp");
+    pressure_cg_program_ = glutil::CreateComputeProgram("pressure_cg.comp");
+    pressure_pockets_program_ = glutil::CreateComputeProgram("pressure_pockets.comp");
+    pressure_cg_reduce_program_ = glutil::CreateComputeProgram("pressure_cg_reduce.comp");
+    pressure_mg_program_ = glutil::CreateComputeProgram("pressure_mg.comp");
+    water_project_program_ = glutil::CreateComputeProgram("water_project.comp");
 
-    smoke_advect_program_ = glutil::CreateComputeProgramFromFile(shader_root / "smoke_advect.comp");
-    smoke_correct_program_ = glutil::CreateComputeProgramFromFile(shader_root / "smoke_correct.comp");
+    smoke_advect_program_ = glutil::CreateComputeProgram("smoke_advect.comp");
+    smoke_correct_program_ = glutil::CreateComputeProgram("smoke_correct.comp");
     gas_velocity_advect_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_velocity_advect.comp");
+        glutil::CreateComputeProgram("gas_velocity_advect.comp");
     gas_velocity_correct_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_velocity_correct.comp");
+        glutil::CreateComputeProgram("gas_velocity_correct.comp");
     gas_face_to_center_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_face_to_center.comp");
-    smoke_divergence_program_ = glutil::CreateComputeProgramFromFile(shader_root / "smoke_divergence.comp");
-    gas_pressure_kind_program_ = glutil::CreateComputeProgramFromFile(shader_root / "gas_pressure_kind.comp");
-    gas_cg_program_ = glutil::CreateComputeProgramFromFile(shader_root / "gas_cg.comp");
-    wood_burn_program_ = glutil::CreateComputeProgramFromFile(shader_root / "wood_burn.comp");
-    phase_particles_program_ = glutil::CreateComputeProgramFromFile(shader_root / "phase_particles.comp");
-    oil_field_program_ = glutil::CreateComputeProgramFromFile(shader_root / "oil_field.comp");
-    steam_update_program_ = glutil::CreateComputeProgramFromFile(shader_root / "steam_update.comp");
+        glutil::CreateComputeProgram("gas_face_to_center.comp");
+    smoke_divergence_program_ = glutil::CreateComputeProgram("smoke_divergence.comp");
+    gas_pressure_kind_program_ = glutil::CreateComputeProgram("gas_pressure_kind.comp");
+    gas_cg_program_ = glutil::CreateComputeProgram("gas_cg.comp");
+    wood_burn_program_ = glutil::CreateComputeProgram("wood_burn.comp");
+    phase_particles_program_ = glutil::CreateComputeProgram("phase_particles.comp");
+    oil_field_program_ = glutil::CreateComputeProgram("oil_field.comp");
+    steam_update_program_ = glutil::CreateComputeProgram("steam_update.comp");
     gas_pressure_restrict_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_pressure_restrict.comp");
+        glutil::CreateComputeProgram("gas_pressure_restrict.comp");
     gas_pressure_relax_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_pressure_relax.comp");
-    gas_pressure_prolongate_program_ =
-        glutil::CreateComputeProgramFromFile(shader_root / "gas_pressure_prolongate.comp");
-    smoke_project_program_ = glutil::CreateComputeProgramFromFile(shader_root / "smoke_project.comp");
-    pressure_residual_program_ = glutil::CreateComputeProgramFromFile(shader_root / "pressure_residual.comp");
+        glutil::CreateComputeProgram("gas_pressure_relax.comp");
+    smoke_project_program_ = glutil::CreateComputeProgram("smoke_project.comp");
+    pressure_residual_program_ = glutil::CreateComputeProgram("pressure_residual.comp");
 
-    fire_rd_program_ = glutil::CreateComputeProgramFromFile(shader_root / "fire_rd.comp");
+    fire_rd_program_ = glutil::CreateComputeProgram("fire_rd.comp");
 
-    coupling_fire_program_ = glutil::CreateComputeProgramFromFile(shader_root / "coupling_fire.comp");
-    coupling_heat_program_ = glutil::CreateComputeProgramFromFile(shader_root / "coupling_heat.comp");
-    render_extract_program_ = glutil::CreateComputeProgramFromFile(shader_root / "render_extract.comp");
-    light_build_program_ = glutil::CreateComputeProgramFromFile(shader_root / "light_build.comp");
+    coupling_fire_program_ = glutil::CreateComputeProgram("coupling_fire.comp");
+    coupling_heat_program_ = glutil::CreateComputeProgram("coupling_heat.comp");
+    render_extract_program_ = glutil::CreateComputeProgram("render_extract.comp");
+    light_build_program_ = glutil::CreateComputeProgram("light_build.comp");
 
-    render_program_ = glutil::CreateProgramFromFiles(shader_root / "fullscreen.vert",
-                                                     shader_root / "composite.frag");
+    render_program_ = glutil::CreateProgram("fullscreen.vert", "composite.frag");
 
-    hud_program_ = glutil::CreateProgramFromFiles(shader_root / "fullscreen.vert", shader_root / "hud.frag");
+    hud_program_ = glutil::CreateProgram("fullscreen.vert", "hud.frag");
     hud_font_texture_ =
         CreateTexture(hud::kAtlasWidth, hud::kAtlasHeight, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST);
     const std::vector<std::uint8_t> atlas = hud::BakeAtlas();
@@ -808,6 +812,12 @@ void PowderApp::InitializeState() {
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32I, GL_RED_INTEGER, GL_INT, &zero_int);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.particles);
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.scratch_particles);
+    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.cell_fsum);
+    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.tile_flags);
+    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.spawn_cursor);
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.grid_mass);
@@ -818,7 +828,7 @@ void PowderApp::InitializeState() {
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32I, GL_RED_INTEGER, GL_INT, &zero_int);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.cell_tally);
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
-    sand_state_.live_count = 0U;
+    sand_state_.live_count = sand_state_.record_bound = 0U;
     water_state_.live_count = water_state_.record_bound = 0U;
     sand_state_.node_box = {0, 0, kGridWidth + 2, kGridHeight + 2};
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug_state_.counters);
@@ -846,9 +856,9 @@ void PowderApp::InitializeState() {
     glBindTexture(GL_TEXTURE_2D, sand_state_.grid_velocity);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kGridWidth + 2, kGridHeight + 2, GL_RG, GL_FLOAT, zero_rg32.data());
     {
-        const std::vector<std::uint16_t> zero_rgba16(static_cast<std::size_t>(kGridWidth * kGridHeight * 4), 0U);
+        const std::vector<float> zero_rgba32(static_cast<std::size_t>(kGridWidth * kGridHeight * 4), 0.0F);
         glBindTexture(GL_TEXTURE_2D, sand_state_.packed_f);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kGridWidth, kGridHeight, GL_RGBA, GL_HALF_FLOAT, zero_rgba16.data());
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kGridWidth, kGridHeight, GL_RGBA, GL_FLOAT, zero_rgba32.data());
         const std::vector<std::uint8_t> zero_r8(static_cast<std::size_t>(kGridWidth * kGridHeight), 0U);
         glBindTexture(GL_TEXTURE_2D, sand_state_.packed);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kGridWidth, kGridHeight, GL_RED_INTEGER, GL_UNSIGNED_BYTE, zero_r8.data());
@@ -973,6 +983,8 @@ void PowderApp::KeyCallback(GLFWwindow* window, int key, int, int action, int) {
 
 // Cursor events arrive at event rate, between rendered frames and fixed ticks. Only cells in the simulation join
 // the trail; an event outside it ends the stroke, so leaving and re-entering between ticks does not connect.
+// Windows coalesces the mouse moves between two events into the last one; the moves it coalesced come back from its
+// mouse-move history, so a fast stroke keeps its curve even at a low frame rate. Elsewhere the events alone count.
 void PowderApp::CursorPosCallback(GLFWwindow* window, double x, double y) {
     auto* app = static_cast<PowderApp*>(glfwGetWindowUserPointer(window));
     if (app == nullptr || app->replay_mode_) return;
@@ -982,17 +994,59 @@ void PowderApp::CursorPosCallback(GLFWwindow* window, double x, double y) {
     int framebuffer_width = 1;
     int framebuffer_height = 1;
     glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
-    std::array<int, 2> cell{};
-    if (!MapCursorToGrid(x, y, window_width, window_height, framebuffer_width, framebuffer_height, cell[0], cell[1])) {
-        app->stroke_.active = false;
-        app->cursor_trail_.clear();
-        return;
-    }
     auto& trail = app->cursor_trail_;
-    if (!trail.empty() && trail.back() == cell) return;
-    // shortcut: past kMaxCursorTrail unstamped events the newest overwrites the last slot, cutting the path straight; keep a ring only if stalls that long matter.
-    if (trail.size() == kMaxCursorTrail) trail.back() = cell;
-    else trail.push_back(cell);
+    const auto add = [&](double cursor_x, double cursor_y) {
+        std::array<int, 2> cell{};
+        if (!MapCursorToGrid(cursor_x, cursor_y, window_width, window_height, framebuffer_width, framebuffer_height, cell[0], cell[1])) {
+            app->stroke_.active = false;
+            trail.clear();
+            return;
+        }
+        if (!trail.empty() && trail.back() == cell) return;
+        // shortcut: past kMaxCursorTrail unstamped events the newest overwrites the last slot, cutting the path straight; keep a ring only if stalls that long matter.
+        if (trail.size() == kMaxCursorTrail) trail.back() = cell;
+        else trail.push_back(cell);
+    };
+#ifdef _WIN32
+    if (HWND hwnd = glfwGetWin32Window(window); hwnd != nullptr) {
+        POINT at{static_cast<LONG>(std::floor(x)), static_cast<LONG>(std::floor(y))};
+        ClientToScreen(hwnd, &at);
+        MOUSEMOVEPOINT query{};
+        query.x = at.x & 0xFFFF;
+        query.y = at.y & 0xFFFF;
+        query.time = static_cast<DWORD>(GetMessageTime());
+        std::array<MOUSEMOVEPOINT, 64> raw{};
+        const int count = GetMouseMovePointsEx(sizeof(MOUSEMOVEPOINT), &query, raw.data(), static_cast<int>(raw.size()),
+                                               GMMP_USE_DISPLAY_POINTS);
+        std::vector<MovePoint> history;
+        for (int i = 0; i < count; ++i) {
+            // Display points are 16-bit; monitors left of or above the primary one have negative coordinates.
+            history.push_back({raw[i].x > 32767 ? raw[i].x - 65536 : raw[i].x, raw[i].y > 32767 ? raw[i].y - 65536 : raw[i].y,
+                               static_cast<std::uint32_t>(raw[i].time)});
+        }
+        if (!history.empty()) {
+            if (app->last_move_valid_) {
+                for (const MovePoint& move : MovesSince(history, app->last_move_)) {
+                    POINT client{move.x, move.y};
+                    ScreenToClient(hwnd, &client);
+                    add(client.x + 0.5, client.y + 0.5);
+                }
+            }
+            app->last_move_ = history.front();
+            app->last_move_valid_ = true;
+        }
+    }
+#endif
+    add(x, y);
+}
+
+// Of a mouse-move history listed newest first, starting with the current event, the moves after `last` and before the
+// current event, oldest first; none when `last` is not in the history (then the gap is bridged by a straight line).
+std::vector<PowderApp::MovePoint> PowderApp::MovesSince(const std::vector<MovePoint>& newest_first, const MovePoint& last) {
+    for (std::size_t i = 1; i < newest_first.size(); ++i) {
+        if (newest_first[i] == last) return {newest_first.rend() - static_cast<std::ptrdiff_t>(i), newest_first.rend() - 1};
+    }
+    return {};
 }
 
 // A press starts the stroke at the cursor, so motion before the first tick that sees the button is not lost.
@@ -1001,6 +1055,7 @@ void PowderApp::MouseButtonCallback(GLFWwindow* window, int button, int action, 
     if (app == nullptr || app->replay_mode_ || button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
     app->stroke_.active = false;
     app->cursor_trail_.clear();
+    app->last_move_valid_ = false;
     double x = 0.0;
     double y = 0.0;
     glfwGetCursorPos(window, &x, &y);
@@ -1077,7 +1132,7 @@ void PowderApp::RunFrame(float dt, const BrushConfig* scripted_brush, bool reset
     RunWaterPass(dt);
     EndTimedPass(TimedPass::Water);
     BeginTimedPass(TimedPass::Gas);
-    RunGasPass(dt);
+    RunGasTick(dt);
     EndTimedPass(TimedPass::Gas);
     BeginTimedPass(TimedPass::Sand);
     RunSandPass(dt);
@@ -1415,8 +1470,8 @@ void PowderApp::RunSpawnGas(const BrushConfig& config, const DispatchRegion& reg
     glUniform1f(CachedUniform(spawn_gas_program_, "velocitySpread"), config.velocity_spread);
     glUniform1ui(CachedUniform(spawn_gas_program_, "spawnSeed"), frame_index_ * 977U + static_cast<GLuint>(brush_x_ * 131 + brush_y_));
 
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
     glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
@@ -1431,8 +1486,8 @@ void PowderApp::RunSpawnGas(const BrushConfig& config, const DispatchRegion& reg
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
     glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
@@ -1468,10 +1523,21 @@ void PowderApp::RunSpawnSandParticles(const BrushConfig& config, const DispatchR
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, debug_state_.counters);
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    const std::uint64_t spawned = static_cast<std::uint64_t>(region.width) * region.height * std::max(1, config.sand_particles);
+    sand_state_.record_bound = static_cast<GLuint>(
+        std::min<std::uint64_t>(sand_state_.record_bound + spawned, static_cast<std::uint64_t>(kMaxSandParticles)));
 }
 
 void PowderApp::RunSpawnWaterParticles(const BrushConfig& config, const DispatchRegion& region) {
     if (region.Empty()) {
+        return;
+    }
+    // A stamp that might not fit is skipped whole, keeping kWaterWakeReserve slots for waking packed water: the brush
+    // stops at a full pool. record_bound is the exact live count read back after compaction plus every earlier stamp's
+    // upper bound, so the decision is the same every run, where the GPU's per-particle reservation at the cap dropped
+    // particles in atomic order and counted each as overflow.
+    const std::uint64_t spawned = static_cast<std::uint64_t>(region.width) * region.height * std::max(1, config.water_particles);
+    if (water_state_.record_bound + spawned > static_cast<std::uint64_t>(kMaxWaterParticles - kWaterWakeReserve)) {
         return;
     }
 
@@ -1492,6 +1558,8 @@ void PowderApp::RunSpawnWaterParticles(const BrushConfig& config, const Dispatch
     glUniform1ui(CachedUniform(water_particle_spawn_program_, "spawnSeed"), frame_index_ * 977U + static_cast<GLuint>(brush_x_ * 131 + brush_y_));
     glUniform1f(CachedUniform(water_particle_spawn_program_, "velocitySpread"), config.velocity_spread);
     glUniform1f(CachedUniform(water_particle_spawn_program_, "oilFlag"), config.oil ? 1.0F : 0.0F);
+    glUniform1f(CachedUniform(water_particle_spawn_program_, "tickDt"), config_.fixed_dt);
+    glUniform2f(CachedUniform(water_particle_spawn_program_, "gravity"), 0.0F, config_.water_gravity);
     if (config.oil) oil_present_ = true;
     glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
@@ -1500,7 +1568,6 @@ void PowderApp::RunSpawnWaterParticles(const BrushConfig& config, const Dispatch
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, debug_state_.counters);
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    const std::uint64_t spawned = static_cast<std::uint64_t>(region.width) * region.height * std::max(1, config.water_particles);
     water_state_.record_bound = static_cast<GLuint>(
         std::min<std::uint64_t>(water_state_.record_bound + spawned, static_cast<std::uint64_t>(kMaxWaterParticles)));
 }
@@ -1513,9 +1580,9 @@ void PowderApp::RunClearSandParticles(const DispatchRegion& region) {
     glUseProgram(sand_particle_clear_program_);
     glUniform2i(CachedUniform(sand_particle_clear_program_, "brushCenter"), brush_x_, brush_y_);
     glUniform1i(CachedUniform(sand_particle_clear_program_, "brushRadius"), brush_radius_);
-    glUniform1i(CachedUniform(sand_particle_clear_program_, "maxParticles"), kMaxSandParticles);
+    glUniform1i(CachedUniform(sand_particle_clear_program_, "maxParticles"), static_cast<GLint>(sand_state_.record_bound));
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
-    glDispatchCompute(static_cast<GLuint>((kMaxSandParticles + 255) / 256), 1, 1);
+    if (sand_state_.record_bound > 0U) glDispatchCompute((sand_state_.record_bound + 255U) / 256U, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
@@ -1586,8 +1653,8 @@ void PowderApp::RunClearGas(const DispatchRegion& region) {
     glUniform1i(CachedUniform(spawn_gas_program_, "blockedByWater"), 0);
     glUniform1i(CachedUniform(spawn_gas_program_, "clearMode"), 1);
 
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
     glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
@@ -1600,8 +1667,8 @@ void PowderApp::RunClearGas(const DispatchRegion& region) {
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
     glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
@@ -1660,8 +1727,13 @@ void PowderApp::RunBoundaryPass() {
     glUniform2i(CachedUniform(boundary_downsample_program_, "srcSize"), kGridWidth, kGridHeight);
     glUniform2i(CachedUniform(boundary_downsample_program_, "dstSize"), kGasWidth, kGasHeight);
     glUniform1i(CachedUniform(boundary_downsample_program_, "scale"), 2);
+    // Half the rest volume: a settled body, not spray or a thin film. The liquid volume is the previous tick's.
+    glUniform1f(CachedUniform(boundary_downsample_program_, "waterBlockVolume"),
+                0.5F * config_.water_rest_density * config_.water_amount_per_particle);
     glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindImageTexture(1, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+    glBindImageTexture(2, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(3, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -1702,6 +1774,8 @@ void PowderApp::RunSandPass(float dt) {
 
     // Grid passes cover node rows/columns [x0, x1) x [y0, y1); rows are contiguous in the grid buffers.
     std::array<int, 4> grid_box = sand_state_.node_box;
+    // Cleared once per tick: within it the grid update zeroes the momentum it reads and the particle step the mass (the
+    // occupancy transfer's momentum is left for the next tick's clear).
     const auto clear_sand_grid = [this, zero_uint, zero_int, &grid_box]() {
         const int y0 = grid_box[1];
         const int y1 = grid_box[3];
@@ -1733,49 +1807,40 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_particle_p2g_program_, "referenceDensity"), config_.sand_reference_density);
         // The stress-free occupancy transfer also gathers moisture for sand_rasterize.comp.
         glUniform1i(CachedUniform(sand_particle_p2g_program_, "depositMoisture"), stress_dt == 0.0F ? 1 : 0);
+        glUniform1i(CachedUniform(sand_particle_p2g_program_, "tileStride"), kSandTileStride);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.grid_momentum_x);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, sand_state_.grid_momentum_y);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, sand_state_.grid_moisture);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, sand_state_.tile_flags);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (particle_groups() > 0U) glDispatchCompute(particle_groups(), 1, 1);  // zero groups is an error on some drivers
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     };
 
-    // Sleep-packing, before compaction: tally still grains per cell, decide pack/wake per cell, then apply. Woken
-    // grains are appended at the cursor; compaction drops exactly the grains of the cells that packed.
+    // Sleep-packing: tally still grains per cell and decide pack/wake per cell before compaction, which drops exactly
+    // the grains of the cells that pack; apply after it, so woken grains are appended at the compacted cursor (and join
+    // its live box and fastest speed). The apply phase zeroes the tally it consumed, so neither it nor the full pools are
+    // cleared per tick.
     const bool sleeping = config_.sand_sleep_ticks > 0;
-    if (sleeping) {
-        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-        for (GLuint buffer : {sand_state_.cell_tally, sand_state_.cell_fsum}) {
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
-            glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
-        }
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        glUseProgram(sand_sleep_program_);
-        glUniform2i(CachedUniform(sand_sleep_program_, "gridSize"), kGridWidth, kGridHeight);
-        glUniform1i(CachedUniform(sand_sleep_program_, "maxParticles"), kMaxSandParticles);
-        glUniform1f(CachedUniform(sand_sleep_program_, "sleepSpeed"), config_.sand_sleep_speed);
-        glUniform1i(CachedUniform(sand_sleep_program_, "sleepTicks"), config_.sand_sleep_ticks);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.cell_tally);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.cell_fsum);
-        glDispatchCompute(static_cast<GLuint>((kMaxSandParticles + 255) / 256), 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
+    const auto pack_phase = [this, dt](int phase) {
         glUseProgram(sand_pack_program_);
         glUniform2i(CachedUniform(sand_pack_program_, "gridSize"), kGridWidth, kGridHeight);
+        glUniform1i(CachedUniform(sand_pack_program_, "phase"), phase);
         glUniform1i(CachedUniform(sand_pack_program_, "maxPacked"), kMaxPackedGrains);
         glUniform1f(CachedUniform(sand_pack_program_, "impactSpeed"), config_.sand_wake_impact_speed);
+        glUniform1f(CachedUniform(sand_pack_program_, "sleepSpeed"), config_.sand_sleep_speed);
+        glUniform1f(CachedUniform(sand_pack_program_, "pressSpeed"), config_.sand_wake_press_speed);
         glUniform1f(CachedUniform(sand_pack_program_, "waterSpeed"), config_.sand_wake_water_speed);
         glUniform1f(CachedUniform(sand_pack_program_, "waterFullVolume"), 4.0F * config_.water_amount_per_particle);
         glUniform1f(CachedUniform(sand_pack_program_, "wettingRate"), config_.sand_wetting_rate);
+        glUniform1f(CachedUniform(sand_pack_program_, "dryingRate"), config_.sand_drying_rate);
         glUniform1f(CachedUniform(sand_pack_program_, "dt"), dt);
         glUniform1i(CachedUniform(sand_pack_program_, "maxParticles"), kMaxSandParticles);
         glUniform1ui(CachedUniform(sand_pack_program_, "seed"), frame_index_ * 2654435761U + 12345U);
         glBindImageTexture(0, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-        glBindImageTexture(1, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+        glBindImageTexture(1, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
         glBindImageTexture(2, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(3, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(4, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
@@ -1785,32 +1850,41 @@ void PowderApp::RunSandPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.cell_fsum);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, sand_state_.spawn_cursor);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
-        for (int phase = 0; phase < 2; ++phase) {
-            glUniform1i(CachedUniform(sand_pack_program_, "phase"), phase);
-            DispatchGrid(kGridWidth, kGridHeight);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
-                            GL_TEXTURE_FETCH_BARRIER_BIT);
-        }
+        DispatchGrid(kGridWidth, kGridHeight);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    };
+    if (sleeping) {
+        glUseProgram(sand_sleep_program_);
+        glUniform2i(CachedUniform(sand_sleep_program_, "gridSize"), kGridWidth, kGridHeight);
+        glUniform1i(CachedUniform(sand_sleep_program_, "maxParticles"), static_cast<GLint>(sand_state_.record_bound));
+        glUniform1f(CachedUniform(sand_sleep_program_, "sleepSpeed"), config_.sand_sleep_speed);
+        glUniform1i(CachedUniform(sand_sleep_program_, "sleepTicks"), config_.sand_sleep_ticks);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.cell_tally);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.cell_fsum);
+        if (sand_state_.record_bound > 0U) glDispatchCompute((sand_state_.record_bound + 255U) / 256U, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        pack_phase(0);
     }
 
+    // No scratch clear: compaction deactivates every record it reads, so the source it leaves is all inactive.
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.scratch_particles);
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.spawn_cursor);
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     glUseProgram(sand_particle_compact_program_);
-    glUniform1i(CachedUniform(sand_particle_compact_program_, "maxParticles"), kMaxSandParticles);
+    glUniform1i(CachedUniform(sand_particle_compact_program_, "maxParticles"), static_cast<GLint>(sand_state_.record_bound));
     glUniform2i(CachedUniform(sand_particle_compact_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1i(CachedUniform(sand_particle_compact_program_, "dropPacked"), sleeping ? 1 : 0);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.scratch_particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.spawn_cursor);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, sand_state_.cell_tally);
-    glDispatchCompute(static_cast<GLuint>((kMaxSandParticles + 255) / 256), 1, 1);
+    if (sand_state_.record_bound > 0U) glDispatchCompute((sand_state_.record_bound + 255U) / 256U, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
     std::swap(sand_state_.particles, sand_state_.scratch_particles);
+    if (sleeping) pack_phase(1);
 
     // Live count, fastest grain's float bits, live cell box (see sand_particle_compact.comp). This read is the tick's
     // one sync: the particle passes dispatch the live count and the grid passes the box instead of the whole pool.
@@ -1818,7 +1892,7 @@ void PowderApp::RunSandPass(float dt) {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sand_state_.spawn_cursor);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(cursor), cursor.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    sand_state_.live_count = std::min<GLuint>(cursor[0], static_cast<GLuint>(kMaxSandParticles));
+    sand_state_.live_count = sand_state_.record_bound = std::min<GLuint>(cursor[0], static_cast<GLuint>(kMaxSandParticles));
     const float fastest = std::bit_cast<float>(cursor[1]);
     const double speed_bound =
         std::isfinite(fastest) ? std::min<double>(config_.sand_max_velocity, fastest) : config_.sand_max_velocity;
@@ -1846,12 +1920,16 @@ void PowderApp::RunSandPass(float dt) {
     sand_state_.node_box = live_box;
 
     for (int substep = 0; substep < sand_state_.substeps; ++substep) {
-        clear_sand_grid();
+        if (substep == 0) clear_sand_grid();
         particle_to_grid(sub_dt);
 
         glUseProgram(sand_grid_update_program_);
+        // Tile-aligned origin: each workgroup is one deposit tile (sand_particle_p2g.comp).
+        const int tile_x0 = grid_box[0] / kWorkgroupSize * kWorkgroupSize;
+        const int tile_y0 = grid_box[1] / kWorkgroupSize * kWorkgroupSize;
         glUniform2i(CachedUniform(sand_grid_update_program_, "gridSize"), kGridWidth, kGridHeight);
-        glUniform2i(CachedUniform(sand_grid_update_program_, "nodeOrigin"), grid_box[0], grid_box[1]);
+        glUniform2i(CachedUniform(sand_grid_update_program_, "nodeOrigin"), tile_x0, tile_y0);
+        glUniform1i(CachedUniform(sand_grid_update_program_, "tileStride"), kSandTileStride);
         glUniform1f(CachedUniform(sand_grid_update_program_, "dt"), sub_dt);
         glUniform1f(CachedUniform(sand_grid_update_program_, "gravity"), config_.sand_gravity);
         glUniform1f(CachedUniform(sand_grid_update_program_, "damping"), config_.sand_damping);
@@ -1862,17 +1940,26 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_grid_update_program_, "wallFriction"), config_.sand_friction_coefficient);
         glUniform1f(CachedUniform(sand_grid_update_program_, "massScale"), 4096.0F);
         glUniform1f(CachedUniform(sand_grid_update_program_, "velocityScale"), 4096.0F);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "shearModulus"), config_.sand_shear_modulus);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "lameLambda"), config_.sand_lame_lambda);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "referenceDensity"), config_.sand_reference_density);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "frictionAlpha"), config_.sand_friction_alpha);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "cohesion"), config_.sand_cohesion);
+        glUniform1f(CachedUniform(sand_grid_update_program_, "cohesionSoftening"), config_.sand_cohesion_softening);
+        glUniform1i(CachedUniform(sand_grid_update_program_, "skipEmptyTiles"), substep + 1 < sand_state_.substeps ? 1 : 0);
         glBindImageTexture(0, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(2, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
         glBindImageTexture(3, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32F);
         glBindImageTexture(4, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        glBindImageTexture(5, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.grid_mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_momentum_x);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.grid_momentum_y);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, sand_state_.tile_flags);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (grid_box[2] > grid_box[0] && grid_box[3] > grid_box[1]) {
-            DispatchGrid(grid_box[2] - grid_box[0], grid_box[3] - grid_box[1]);
+            DispatchGrid(grid_box[2] - tile_x0, grid_box[3] - tile_y0);
         }
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -1892,6 +1979,7 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_particle_step_program_, "grainDiameter"), config_.sand_grain_diameter);
         glUniform1f(CachedUniform(sand_particle_step_program_, "referenceDensity"), config_.sand_reference_density);
         glUniform1f(CachedUniform(sand_particle_step_program_, "cohesion"), config_.sand_cohesion);
+        glUniform1f(CachedUniform(sand_particle_step_program_, "cohesionSoftening"), config_.sand_cohesion_softening);
         glUniform1f(CachedUniform(sand_particle_step_program_, "maxDilation"), config_.sand_max_dilation);
         glUniform1f(CachedUniform(sand_particle_step_program_, "wettingRate"), config_.sand_wetting_rate);
         glUniform1f(CachedUniform(sand_particle_step_program_, "dryingRate"), config_.sand_drying_rate);
@@ -1902,12 +1990,12 @@ void PowderApp::RunSandPass(float dt) {
         glBindImageTexture(2, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
         glBindImageTexture(3, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (particle_groups() > 0U) glDispatchCompute(particle_groups(), 1, 1);  // zero groups is an error on some drivers
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     }
 
-    clear_sand_grid();
     // Moisture is gathered only here, so like the mass it is zero outside the rows this clear covers.
     if (grid_box[3] > grid_box[1]) {
         const GLintptr row_bytes = (kGridWidth + 2) * 4;
@@ -1925,7 +2013,7 @@ void PowderApp::RunSandPass(float dt) {
     glBindImageTexture(0, sand_state_.occupancy, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
     glBindImageTexture(1, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindImageTexture(2, sand_state_.moisture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
-    glBindImageTexture(3, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+    glBindImageTexture(3, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.grid_mass);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_moisture);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
@@ -2081,16 +2169,28 @@ void PowderApp::RunWaterPass(float dt) {
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.bins);
+    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    // Compaction sorts the records by bin (count, scan, scatter), so the particle passes touch nearby cells together.
     glUseProgram(water_particle_compact_program_);
     glUniform1i(CachedUniform(water_particle_compact_program_, "maxParticles"), static_cast<GLint>(water_state_.record_bound));
     glUniform2i(CachedUniform(water_particle_compact_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1i(CachedUniform(water_particle_compact_program_, "dropPacked"), packing ? 1 : 0);
+    glUniform1i(CachedUniform(water_particle_compact_program_, "binSize"), kWaterBinSize);
+    glUniform1i(CachedUniform(water_particle_compact_program_, "binCount"), kWaterBinCount);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, water_state_.scratch_particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, water_state_.spawn_cursor);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, water_state_.cell_tally);
-    if (water_state_.record_bound > 0U) glDispatchCompute((water_state_.record_bound + 255U) / 256U, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, water_state_.bins);
+    for (int phase = 0; phase < 3; ++phase) {
+        glUniform1i(CachedUniform(water_particle_compact_program_, "phase"), phase);
+        if (phase == 1) glDispatchCompute(1, 1, 1);
+        else if (water_state_.record_bound > 0U) glDispatchCompute((water_state_.record_bound + 255U) / 256U, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | (phase == 2 ? GL_BUFFER_UPDATE_BARRIER_BIT : 0U));
+    }
     std::swap(water_state_.particles, water_state_.scratch_particles);
     if (packing) pack_phase(1);
 
@@ -2132,6 +2232,7 @@ void PowderApp::RunWaterPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth, kGridHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        RemovePocketMeans(false);
 
         RunWaterProjection();
 
@@ -2179,7 +2280,7 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_particle_step_program_, "restVolume"),
                     config_.water_rest_density * config_.water_amount_per_particle);
         glUniform1f(CachedUniform(water_particle_step_program_, "oilBuoyancy"),
-                    oil_present_ ? -config_.water_gravity * (1.0F - kOilDensity) : 0.0F);
+                    oil_present_ ? 1.0F / kOilDensity - 1.0F : 0.0F);
         glUniform1f(CachedUniform(water_particle_step_program_, "advectionCfl"), config_.water_advection_cfl);
         glUniform1f(CachedUniform(water_particle_step_program_, "clumpVolume"),
                     3.0F * config_.water_rest_density * config_.water_amount_per_particle);
@@ -2265,6 +2366,33 @@ void PowderApp::ApplyWaterMultigrid(int slot, bool initial) {
     for (int l = kWaterMultigridLevels - 1; l >= 0; --l) {
         glUniform1i(level, l);
         DispatchWaterLevel(water_state_.pressure_levels, water_state_.pressure_tiles, l == 0 ? -1 : l + 1);
+    }
+}
+
+// Removes the right-hand side's mean over every sealed pocket of a pressure system, liquid or gas walled in by Neumann
+// faces alone with no Dirichlet or porous neighbour, so each such singular system is compatible (pressure_pockets.comp).
+void PowderApp::RemovePocketMeans(bool gas) {
+    const int width = gas ? kGasWidth : kGridWidth, height = gas ? kGasHeight : kGridHeight;
+    const GLuint rhs = gas ? gas_state_.divergence : CurrentWaterDivergence();
+    const GLenum rhs_format = gas ? GL_R32F : GL_R16F;
+    const bool wide = rhs_format == GL_R32F;
+    glUseProgram(pressure_pockets_program_);
+    glUniform2i(CachedUniform(pressure_pockets_program_, "gridSize"), width, height);
+    glUniform1i(CachedUniform(pressure_pockets_program_, "gas"), gas ? 1 : 0);
+    glUniform1i(CachedUniform(pressure_pockets_program_, "openTop"), config_.gas_open_top ? 1 : 0);
+    glUniform1i(CachedUniform(pressure_pockets_program_, "wide"), wide ? 1 : 0);
+    glUniform1f(CachedUniform(pressure_pockets_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
+    glBindImageTexture(wide ? 1 : 0, rhs, 0, GL_FALSE, 0, GL_READ_WRITE, rhs_format);
+    glBindImageTexture(wide ? 0 : 1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, wide ? GL_R16F : GL_R32F);
+    glBindImageTexture(2, gas ? gas_state_.level_kind[0] : boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    glBindImageTexture(3, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.pockets);
+    const GLint phase = CachedUniform(pressure_pockets_program_, "phase");
+    for (int p = 0; p < 5; ++p) {
+        glUniform1i(phase, p);
+        DispatchGrid(width, height);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                        (p == 4 ? GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT : 0U));
     }
 }
 
@@ -2402,7 +2530,14 @@ void PowderApp::RunWaterProjection() {
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
-void PowderApp::RunGasPass(float dt) {
+// The gas runs every kGasTickStride-th tick (the first tick after InitializeState included) over the elapsed time of
+// that many ticks, with transport substeps but one projection. Brush stamps and coupling still act every tick, so the
+// other passes see gas that is up to a tick old.
+void PowderApp::RunGasTick(float dt) {
+    if ((frame_index_ - 1U) % kGasTickStride == 0U) RunGasPass(dt * static_cast<float>(kGasTickStride), false);
+}
+
+void PowderApp::RunGasPass(float dt, bool project_each_substep) {
     const float gas_speed_bound = std::sqrt(2.0F) * config_.gas_max_velocity;
     const int transport_substeps = powder_config::SubstepCount(gas_speed_bound, dt, config_.gas_cfl_limit,
                                                     config_.gas_min_substeps, config_.gas_max_substeps,
@@ -2416,29 +2551,29 @@ void PowderApp::RunGasPass(float dt) {
     gas_state_.substeps = substeps;
     const float sub_dt = dt / static_cast<float>(substeps);
     for (int step = 0; step < substeps; ++step) {
-        RunSmokePass(sub_dt);
+        RunSmokePass(sub_dt, project_each_substep || step == substeps - 1);
         RunFireHeatPass(sub_dt);
     }
 }
 
-void PowderApp::RunSmokePass(float dt) {
+void PowderApp::RunSmokePass(float dt, bool project) {
     glUseProgram(gas_velocity_advect_program_);
     glUniform2i(CachedUniform(gas_velocity_advect_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1f(CachedUniform(gas_velocity_advect_program_, "dt"), dt);
     glUniform1f(CachedUniform(gas_velocity_advect_program_, "maxVelocity"), config_.gas_max_velocity);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
     glBindImageTexture(5, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, gas_state_.velocity_center_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
     glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
@@ -2502,16 +2637,16 @@ void PowderApp::RunSmokePass(float dt) {
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "buoyancySmoke"), config_.gas_buoyancy_smoke);
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "maxVelocity"), config_.gas_max_velocity);
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "vorticity"), config_.gas_vorticity);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(5, gas_state_.velocity_center_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glBindImageTexture(6, NextSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(7, NextTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(8, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(9, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(8, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+    glBindImageTexture(9, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
     glBindImageTexture(10, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
@@ -2520,15 +2655,15 @@ void PowderApp::RunSmokePass(float dt) {
     SwapSmokePing();
     SwapGasMacPing();
 
-    RunGasProjection();
+    if (project) RunGasProjection();
 }
 
 void PowderApp::RunGasProjection() {
     glUseProgram(smoke_divergence_program_);
     glUniform2i(CachedUniform(smoke_divergence_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, gas_state_.divergence, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(2, gas_state_.divergence, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
     glBindImageTexture(4, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
     glUniform1f(CachedUniform(smoke_divergence_program_, "expansion"), config_.gas_expansion);
     glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
@@ -2557,6 +2692,9 @@ void PowderApp::RunGasProjection() {
         DispatchGrid(sizes[level], sizes[level]);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     }
+    // Only burning (fire, wood, lit oil) adds a source; wall faces carry no flux, so without one a sealed pocket's
+    // divergence already sums to zero.
+    if (oil_present_ || heat_present_) RemovePocketMeans(true);
 
     const auto check_residual = [this, open_top](bool collect_stats) {
         glUseProgram(pressure_residual_program_);
@@ -2569,19 +2707,20 @@ void PowderApp::RunGasProjection() {
         glUniform1i(CachedUniform(pressure_residual_program_, "porousSand"), 1);
         glUniform1f(CachedUniform(pressure_residual_program_, "sandLeak"), kSandLeak);
         glUniform1f(CachedUniform(pressure_residual_program_, "liquidPhiThreshold"), 0.0F);
-        glBindImageTexture(0, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+        glUniform1i(CachedUniform(pressure_residual_program_, "wideRhs"), 1);
+        glBindImageTexture(4, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
         glUniform1i(CachedUniform(pressure_residual_program_, "pressureTex"), 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gas_state_.pressure_a);
         glBindImageTexture(2, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(3, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, debug_state_.counters);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gas_state_.pressure_check);
         DispatchGrid(kGasWidth, kGasHeight);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        // The water solve shares this program and has a closed top and its own sand rule.
+        // The water solve shares this program and has a closed top, its own sand rule and a half-float right-hand side.
         glUniform1i(CachedUniform(pressure_residual_program_, "openTop"), 0);
         glUniform1i(CachedUniform(pressure_residual_program_, "porousSand"), 0);
+        glUniform1i(CachedUniform(pressure_residual_program_, "wideRhs"), 0);
     };
     const auto needs_iteration = [&]() {
         check_residual(true);
@@ -2604,8 +2743,10 @@ void PowderApp::RunGasProjection() {
                                square_sum > count * rms_limit * rms_limit);
     };
 
-    // Red-black Gauss-Seidel sweeps in place: each sweep is a red and a black dispatch. Post-smoothing runs the
-    // colours in reverse, so the V-cycle is close to symmetric for the conjugate gradient around it.
+    // Red-black Gauss-Seidel sweeps: each sweep is a red and a black step, all of a level's steps in one fused dispatch
+    // from level_pressure into level_smoothed (pre-smoothing, which also forms the residual) or back (post-smoothing,
+    // which first adds the coarse correction). Post-smoothing runs the colours in reverse, so the V-cycle is close to
+    // symmetric for the conjugate gradient around it. The bottom level runs all its sweeps in place in one workgroup.
     const auto relax_level = [&](int level, int sweeps, bool reverse) {
         glUseProgram(gas_pressure_relax_program_);
         glUniform2i(CachedUniform(gas_pressure_relax_program_, "gridSize"), sizes[level], sizes[level]);
@@ -2615,18 +2756,27 @@ void PowderApp::RunGasProjection() {
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "fineHeight"), kGasHeight);
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "bottomSweeps"), level == kGasLevels - 1 ? sweeps : 0);
         glBindImageTexture(0, level_rhs(level), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(1, level_pressure(level), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
         glBindImageTexture(3, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        if (level == kGasLevels - 1) {
+        const bool bottom = level == kGasLevels - 1;
+        glUniform1i(CachedUniform(gas_pressure_relax_program_, "smoothSteps"), bottom ? 0 : 2 * sweeps);
+        if (bottom) {
+            glBindImageTexture(1, level_pressure(level), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
             DispatchGrid(sizes[level], sizes[level]);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
             return;
         }
-        for (int sweep = 0; sweep < 2 * sweeps; ++sweep) {
-            glUniform1i(CachedUniform(gas_pressure_relax_program_, "parity"), (sweep & 1) ^ (reverse ? 1 : 0));
-            DispatchGrid(sizes[level], sizes[level]);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-        }
+        const GLuint from = reverse ? gas_state_.level_smoothed[level] : level_pressure(level);
+        const GLuint to = reverse ? level_pressure(level) : gas_state_.level_smoothed[level];
+        glUniform1i(CachedUniform(gas_pressure_relax_program_, "parity"), reverse ? 1 : 0);
+        glUniform1i(CachedUniform(gas_pressure_relax_program_, "prolongate"), reverse ? 1 : 0);
+        glUniform2i(CachedUniform(gas_pressure_relax_program_, "coarseSize"), sizes[level + 1], sizes[level + 1]);
+        glBindImageTexture(1, from, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+        glBindImageTexture(2, to, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+        glBindImageTexture(4, gas_state_.level_residual[level], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+        glBindImageTexture(5, level_pressure(level + 1), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+        glBindImageTexture(6, gas_state_.level_kind[level + 1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        DispatchGrid(sizes[level], sizes[level]);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     };
     // The preconditioner: one V-cycle from zero for z ~ L^-1 s.
     const auto v_cycle = [&]() {
@@ -2646,25 +2796,14 @@ void PowderApp::RunGasProjection() {
             glBindImageTexture(4, level_pressure(level + 1), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
             glBindImageTexture(5, gas_state_.level_kind[level + 1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
             glBindImageTexture(6, gas_state_.level_residual[level], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-            for (int pass = 0; pass < 2; ++pass) {
-                glUniform1i(CachedUniform(gas_pressure_restrict_program_, "gatherPass"), pass);
-                DispatchGrid(sizes[level + pass], sizes[level + pass]);
-                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-            }
+            // The residual (gatherPass 0) came with the fused pre-smoothing.
+            glUniform1i(CachedUniform(gas_pressure_restrict_program_, "gatherPass"), 1);
+            DispatchGrid(sizes[level + 1], sizes[level + 1]);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
         relax_level(kGasLevels - 1, kGasCoarsestSweeps, false);
-        for (int level = kGasLevels - 2; level >= 0; --level) {
-            glUseProgram(gas_pressure_prolongate_program_);
-            glUniform2i(CachedUniform(gas_pressure_prolongate_program_, "fineSize"), sizes[level], sizes[level]);
-            glUniform2i(CachedUniform(gas_pressure_prolongate_program_, "coarseSize"), sizes[level + 1], sizes[level + 1]);
-            glBindImageTexture(0, level_pressure(level + 1), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-            glBindImageTexture(1, level_pressure(level), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-            glBindImageTexture(2, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-            glBindImageTexture(3, gas_state_.level_kind[level + 1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-            DispatchGrid(sizes[level], sizes[level]);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-            relax_level(level, kGasSmoothSweeps, true);
-        }
+        // Prolongation is fused into each level's post-smoothing.
+        for (int level = kGasLevels - 2; level >= 0; --level) relax_level(level, kGasSmoothSweeps, true);
     };
     constexpr int partial_count = ((kGasWidth + 15) / 16) * ((kGasHeight + 15) / 16);
     const auto cg_phase = [&](int phase, bool first = false) {
@@ -2675,7 +2814,7 @@ void PowderApp::RunGasProjection() {
         glUniform1f(CachedUniform(gas_cg_program_, "sandLeak"), kSandLeak);
         glUniform1i(CachedUniform(gas_cg_program_, "partialCount"), partial_count);
         glUniform1i(CachedUniform(gas_cg_program_, "first"), first ? 1 : 0);
-        glBindImageTexture(0, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+        glBindImageTexture(0, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
         glBindImageTexture(1, gas_state_.pressure_a, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
         glBindImageTexture(2, gas_state_.cg_s, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
         glBindImageTexture(3, gas_state_.cg_z, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
@@ -2731,11 +2870,12 @@ void PowderApp::RunGasProjection() {
     glUseProgram(smoke_project_program_);
     glUniform2i(CachedUniform(smoke_project_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1i(CachedUniform(smoke_project_program_, "openTop"), open_top);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glUniform1f(CachedUniform(smoke_project_program_, "sandLeak"), kSandLeak);
+    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, gas_state_.pressure_a, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(3, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(4, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    glBindImageTexture(3, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+    glBindImageTexture(4, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
     glBindImageTexture(5, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
@@ -2743,8 +2883,8 @@ void PowderApp::RunGasProjection() {
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, NextGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, NextGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(0, NextGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+    glBindImageTexture(1, NextGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(2, NextGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
     glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
@@ -2839,6 +2979,8 @@ void PowderApp::RunPhasePass(float dt) {
     glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
     glBindImageTexture(3, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(4, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glUniform1f(CachedUniform(phase_particles_program_, "flashRate"), oil_present_ ? kWaterFlashRate : 0.0F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, phase_state_.cell_counts);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, phase_state_.gas_sources);
@@ -2866,6 +3008,7 @@ void PowderApp::RunPhasePass(float dt) {
     glBindImageTexture(3, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
     glBindImageTexture(5, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
+    glBindImageTexture(6, CurrentOxidizer(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, CurrentSteam());
     glUniform1i(CachedUniform(steam_update_program_, "steamSrc"), 0);
@@ -2978,6 +3121,9 @@ void PowderApp::Render(bool letterbox) {
                                      : 0.0F;
     glUniform3f(CachedUniform(render_program_, "lantern"), static_cast<float>(brush_x_) + 0.5F,
                 static_cast<float>(brush_y_) + 0.5F, lantern_radius);
+    // Flame tongues, sparks and heat shimmer move with simulation time, so a frame stays a function of the state.
+    glUniform1f(CachedUniform(render_program_, "fxTime"),
+                static_cast<float>(std::fmod(static_cast<double>(frame_index_) * config_.fixed_dt, 3600.0)));
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, CurrentMaterial());
@@ -3421,7 +3567,7 @@ int PowderApp::RunReplay() {
                 RunWaterPass(config_.fixed_dt);
                 EndTimedPass(TimedPass::Water);
                 BeginTimedPass(TimedPass::Gas);
-                RunGasPass(config_.fixed_dt);
+                RunGasTick(config_.fixed_dt);
                 EndTimedPass(TimedPass::Gas);
                 BeginTimedPass(TimedPass::Sand);
                 RunSandPass(config_.fixed_dt);

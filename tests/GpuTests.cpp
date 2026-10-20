@@ -225,6 +225,7 @@ void HalfStorage() {
                 resources.Buffer(0, static_cast<GLsizeiptr>(mass.size() * sizeof(GLuint)), mass.data());
                 resources.Buffer(1, static_cast<GLsizeiptr>(momentum.size() * sizeof(momentum[0])), momentum.data());
                 resources.Buffer(2, static_cast<GLsizeiptr>(momentum.size() * sizeof(momentum[0])), momentum.data());
+                resources.Buffer(3, sizeof(no_errors), no_errors.data());  // deposit tile flags (skipping off)
                 std::array<float, size * size> distance{};
                 distance.fill(1.0F);
                 const GLuint sdf = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT, distance.data());
@@ -440,6 +441,69 @@ void WaterP2G() {
             failures << " [case " << scenario << " mass or momentum transfer failed]";
         }
         CheckGl("water mass/dense transfer");
+    }
+
+    // Workgroups whose particles sit in a small box sum in shared memory first; scattered ones deposit directly. The
+    // same particles sorted by cell (shared path) and shuffled (direct path) must give bit-identical grids, walls included.
+    {
+        constexpr int grid = 64;
+        constexpr int count = 16384;
+        std::vector<unsigned char> walls(grid * grid, 0);
+        for (int y = 20; y < 26; ++y) walls[static_cast<std::size_t>(y * grid + 30)] = 1;
+        std::vector<std::array<float, 12>> sorted(count);
+        std::uint32_t seed = 12345U;
+        const auto next = [&seed] { seed = seed * 1664525U + 1013904223U; return static_cast<float>(seed >> 8) / 16777216.0F; };
+        for (int i = 0; i < count; ++i) {
+            // Four per cell, 8x8-cell tiles in order (one tile per workgroup), and fast APIC motion so face momentum
+            // sums wrap their low words.
+            const int cell = i / 4, tile = cell / 64;
+            const int x = tile % (grid / 8) * 8 + cell % 8, y = tile / (grid / 8) * 8 + cell % 64 / 8;
+            sorted[static_cast<std::size_t>(i)] = {static_cast<float>(x) + next(), static_cast<float>(y) + next(),
+                                                   (next() - 0.5F) * 400000.0F, (next() - 0.5F) * 400000.0F, 1.0F, 1.0F,
+                                                   (next() - 0.5F) * 2000.0F, (next() - 0.5F) * 2000.0F, (next() - 0.5F) * 2000.0F,
+                                                   (next() - 0.5F) * 2000.0F};
+        }
+        std::vector<std::array<float, 12>> shuffled = sorted;
+        for (int i = count - 1; i > 0; --i) std::swap(shuffled[static_cast<std::size_t>(i)], shuffled[static_cast<std::size_t>(next() * (i + 1)) % (i + 1)]);
+        std::array<std::vector<std::uint32_t>, 2> results;
+        for (int pass = 0; pass < 2; ++pass) {
+            Resources resources;
+            const auto& particles = pass == 0 ? sorted : shuffled;
+            const std::vector<std::uint32_t> zero_faces(grid * (grid + 1) * 2, 0U);
+            const GLuint boundary = resources.Texture(grid, grid, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, walls.data());
+            resources.Buffer(0, static_cast<GLsizeiptr>(particles.size() * sizeof(particles[0])), particles.data());
+            const std::array<GLuint, 5> outputs{resources.Buffer(1, grid * (grid + 1) * 4, zero_faces.data()),
+                                                resources.Buffer(2, grid * (grid + 1) * 4, zero_faces.data()),
+                                                resources.Buffer(3, grid * (grid + 1) * 8, zero_faces.data()),
+                                                resources.Buffer(4, grid * (grid + 1) * 8, zero_faces.data()),
+                                                resources.Buffer(5, grid * grid * 4, zero_faces.data())};
+            const std::array<GLuint, 4> no_errors{};
+            const GLuint debug = resources.Buffer(7, sizeof(no_errors), no_errors.data());
+            const GLuint program = resources.Program("water_particle_p2g.comp");
+            glUseProgram(program);
+            glUniform2i(glGetUniformLocation(program, "gridSize"), grid, grid);
+            glUniform1i(glGetUniformLocation(program, "maxParticles"), count);
+            glUniform1f(glGetUniformLocation(program, "weightScale"), 4096.0F);
+            glUniform1f(glGetUniformLocation(program, "velocityScale"), 4096.0F);
+            BindImage(0, boundary, GL_READ_ONLY, GL_R8UI);
+            glDispatchCompute(count / 256, 1, 1);
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+            for (const GLuint buffer : outputs) {
+                GLint bytes = 0;
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+                glGetBufferParameteriv(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &bytes);
+                std::vector<std::uint32_t> words(static_cast<std::size_t>(bytes) / 4);
+                glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, words.data());
+                results[static_cast<std::size_t>(pass)].insert(results[static_cast<std::size_t>(pass)].end(), words.begin(), words.end());
+            }
+            std::array<GLuint, 4> counters{};
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug);
+            glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counters), counters.data());
+            if (counters != no_errors) failures << " [tile comparison pass " << pass << " raised debug counters]";
+            CheckGl("water P2G tile comparison");
+        }
+        if (results[0] != results[1]) failures << " [sorted (shared-memory) and shuffled (direct) deposits differ]";
+        std::cout << "  water P2G sorted/shuffled grids identical=" << (results[0] == results[1]) << '\n';
     }
     Require(failures.str().empty(), failures.str());
 }
@@ -1000,11 +1064,12 @@ void WaterSand() {
     near(result.particle[0], 7.3F, 0.0001F, "sealed particle keeps x");
     near(result.particle[1], 6.9F, 0.0001F, "sealed particle keeps y");
     near(result.particle[2], 0.0F, 0.0001F, "sealed particle stops");
-    // Caught next to the open last column: the escape lands in that cell's outer half, beyond the domain clamp. The
-    // move must start from the clamped edge (it once swept backward from there and left the domain at y < 0).
+    // Caught next to the open last column: the escape keeps its place in that cell (its outer half, which the old
+    // half-cell domain clamp cut off) and the move runs on inside the domain (it once swept backward from a clamped
+    // edge and left the domain at y < 0).
     result = step({{14, 1, 2}}, {14.97F, 1.485F, 2.0F, 28.0F, 1.0F, 1.0F}, 0.0F, 0.0F, 0.01F);
     std::cout << "sand escape at the edge: " << result.particle[0] << ',' << result.particle[1] << '\n';
-    near(result.particle[0], 15.4999F, 0.001F, "edge escape stays at the domain edge");
+    near(result.particle[0], 15.99F, 0.001F, "edge escape keeps its place in the edge cell");
     near(result.particle[1], 1.765F, 0.001F, "edge escape moves along y only");
     if (result.particle[4] != 1.0F || result.counters != std::array<GLuint, 5>{}) failures << " [edge escape must keep the particle without counters]";
     // Drag toward the sand: constant occupancy 0.5 at sand velocity (0,-30) relaxes the particle at rate*0.5.
@@ -1590,11 +1655,11 @@ void GasPressure() {
         const std::vector<float> expected_u{0, 0.5F, -1, 0, 0, 0.5F, 0.5F, 0, 0, -1, 0.5F, 0};
         const std::vector<float> expected_v{0, 0, 0, -0.5F, 1.5F, -1, -1, 1.5F, -0.5F, 0, 0, 0};
         const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
-        const GLuint source_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT, u.data());
-        const GLuint source_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT, v.data());
+        const GLuint source_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT, u.data());
+        const GLuint source_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT, v.data());
         const GLuint p = resources.Texture(size, size, GL_R32F, GL_RED, GL_FLOAT, pressure.data());
-        const GLuint output_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
-        const GLuint output_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
+        const GLuint output_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT);
+        const GLuint output_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT);
         const GLuint center = resources.Texture(size, size, GL_RG16F, GL_RG, GL_FLOAT);
         const GLuint divergence = resources.Texture(size, size, GL_R16F, GL_RED, GL_FLOAT);
         std::array<GLuint, 4> counters{};
@@ -1603,8 +1668,8 @@ void GasPressure() {
         const auto measure_divergence = [&](GLuint input_u, GLuint input_v) {
             glUseProgram(divergence_program);
             glUniform2i(glGetUniformLocation(divergence_program, "gasSize"), size, size);
-            BindImage(0, input_u, GL_READ_ONLY, GL_R16F);
-            BindImage(1, input_v, GL_READ_ONLY, GL_R16F);
+            BindImage(0, input_u, GL_READ_ONLY, GL_R32F);
+            BindImage(1, input_v, GL_READ_ONLY, GL_R32F);
             BindImage(2, divergence, GL_WRITE_ONLY, GL_R16F);
             BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
@@ -1614,11 +1679,11 @@ void GasPressure() {
         GLuint program = resources.Program("smoke_project.comp");
         glUseProgram(program);
         glUniform2i(glGetUniformLocation(program, "gasSize"), size, size);
-        BindImage(0, source_u, GL_READ_ONLY, GL_R16F);
-        BindImage(1, source_v, GL_READ_ONLY, GL_R16F);
+        BindImage(0, source_u, GL_READ_ONLY, GL_R32F);
+        BindImage(1, source_v, GL_READ_ONLY, GL_R32F);
         BindImage(2, p, GL_READ_ONLY, GL_R32F);
-        BindImage(3, output_u, GL_WRITE_ONLY, GL_R16F);
-        BindImage(4, output_v, GL_WRITE_ONLY, GL_R16F);
+        BindImage(3, output_u, GL_WRITE_ONLY, GL_R32F);
+        BindImage(4, output_v, GL_WRITE_ONLY, GL_R32F);
         BindImage(5, boundary, GL_READ_ONLY, GL_R8UI);
         Dispatch(size + 1, size + 1);
         Require(ReadScalar(output_u, size + 1, size) == expected_u && ReadScalar(output_v, size, size + 1) == expected_v,
@@ -1627,8 +1692,8 @@ void GasPressure() {
         program = resources.Program("gas_face_to_center.comp");
         glUseProgram(program);
         glUniform2i(glGetUniformLocation(program, "gasSize"), size, size);
-        BindImage(0, output_u, GL_READ_ONLY, GL_R16F);
-        BindImage(1, output_v, GL_READ_ONLY, GL_R16F);
+        BindImage(0, output_u, GL_READ_ONLY, GL_R32F);
+        BindImage(1, output_v, GL_READ_ONLY, GL_R32F);
         BindImage(2, center, GL_WRITE_ONLY, GL_RG16F);
         BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
         Dispatch(size, size);
@@ -1784,12 +1849,12 @@ void GasVelocityDissipation() {
                     }
                 }
                 const GLuint boundary = resources.Texture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, mask.data());
-                GLuint source_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT, u_values.data());
-                GLuint source_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT, v_values.data());
-                const GLuint forward_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
-                const GLuint forward_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
-                GLuint corrected_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
-                GLuint corrected_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
+                GLuint source_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT, u_values.data());
+                GLuint source_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT, v_values.data());
+                const GLuint forward_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT);
+                const GLuint forward_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT);
+                GLuint corrected_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT);
+                GLuint corrected_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT);
                 const GLuint source_center = resources.Texture(size, size, GL_RG16F, GL_RG, GL_FLOAT);
                 const GLuint forward_center = resources.Texture(size, size, GL_RG16F, GL_RG, GL_FLOAT);
                 const std::array<float, size * size> zeros{};
@@ -1805,8 +1870,8 @@ void GasVelocityDissipation() {
                 const auto reconstruct = [&](GLuint u, GLuint v, GLuint destination) {
                     glUseProgram(center);
                     glUniform2i(glGetUniformLocation(center, "gasSize"), size, size);
-                    BindImage(0, u, GL_READ_ONLY, GL_R16F);
-                    BindImage(1, v, GL_READ_ONLY, GL_R16F);
+                    BindImage(0, u, GL_READ_ONLY, GL_R32F);
+                    BindImage(1, v, GL_READ_ONLY, GL_R32F);
                     BindImage(2, destination, GL_WRITE_ONLY, GL_RG16F);
                     BindImage(3, boundary, GL_READ_ONLY, GL_R8UI);
                     Dispatch(size, size);
@@ -1820,16 +1885,17 @@ void GasVelocityDissipation() {
                     glUniform2i(glGetUniformLocation(advect, "gasSize"), size, size);
                     glUniform1f(glGetUniformLocation(advect, "dt"), dt);
                     glUniform1f(glGetUniformLocation(advect, "maxVelocity"), 20.0F);
-                    BindImage(0, source_u, GL_READ_ONLY, GL_R16F);
-                    BindImage(1, source_v, GL_READ_ONLY, GL_R16F);
+                    BindImage(0, source_u, GL_READ_ONLY, GL_R32F);
+                    BindImage(1, source_v, GL_READ_ONLY, GL_R32F);
                     BindImage(2, source_center, GL_READ_ONLY, GL_RG16F);
-                    BindImage(3, forward_u, GL_WRITE_ONLY, GL_R16F);
-                    BindImage(4, forward_v, GL_WRITE_ONLY, GL_R16F);
+                    BindImage(3, forward_u, GL_WRITE_ONLY, GL_R32F);
+                    BindImage(4, forward_v, GL_WRITE_ONLY, GL_R32F);
                     BindImage(5, boundary, GL_READ_ONLY, GL_R8UI);
                     Dispatch(size + 1, size + 1);
+                    // R32F faces keep the float rounding of the interpolation weights (a few ulp), which R16F used to hide.
                     pure_transport = pure_transport &&
-                        ReadScalar(forward_u, size + 1, size)[u_index] == ReadScalar(source_u, size + 1, size)[u_index] &&
-                        ReadScalar(forward_v, size, size + 1)[v_index] == ReadScalar(source_v, size, size + 1)[v_index];
+                        std::abs(ReadScalar(forward_u, size + 1, size)[u_index] - ReadScalar(source_u, size + 1, size)[u_index]) <= 1e-6F &&
+                        std::abs(ReadScalar(forward_v, size, size + 1)[v_index] - ReadScalar(source_v, size, size + 1)[v_index]) <= 1e-6F;
                     reconstruct(forward_u, forward_v, forward_center);
                     glUseProgram(correct);
                     glUniform2i(glGetUniformLocation(correct, "gasSize"), size, size);
@@ -1838,16 +1904,16 @@ void GasVelocityDissipation() {
                     glUniform1f(glGetUniformLocation(correct, "buoyancyTemperature"), 0.0F);
                     glUniform1f(glGetUniformLocation(correct, "buoyancySmoke"), buoyancy);
                     glUniform1f(glGetUniformLocation(correct, "maxVelocity"), 20.0F);
-                    BindImage(0, source_u, GL_READ_ONLY, GL_R16F);
-                    BindImage(1, source_v, GL_READ_ONLY, GL_R16F);
+                    BindImage(0, source_u, GL_READ_ONLY, GL_R32F);
+                    BindImage(1, source_v, GL_READ_ONLY, GL_R32F);
                     BindImage(2, source_center, GL_READ_ONLY, GL_RG16F);
-                    BindImage(3, forward_u, GL_READ_ONLY, GL_R16F);
-                    BindImage(4, forward_v, GL_READ_ONLY, GL_R16F);
+                    BindImage(3, forward_u, GL_READ_ONLY, GL_R32F);
+                    BindImage(4, forward_v, GL_READ_ONLY, GL_R32F);
                     BindImage(5, forward_center, GL_READ_ONLY, GL_RG16F);
                     BindImage(6, smoke, GL_READ_ONLY, GL_R16F);
                     BindImage(7, temperature, GL_READ_ONLY, GL_R16F);
-                    BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R16F);
-                    BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R16F);
+                    BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R32F);
+                    BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R32F);
                     BindImage(10, boundary, GL_READ_ONLY, GL_R8UI);
                     Dispatch(size + 1, size + 1);
                     std::swap(source_u, corrected_u);
@@ -1858,7 +1924,7 @@ void GasVelocityDissipation() {
                 const float expected_u = initial_u * retention;
                 const float expected_v = initial_v * retention - buoyancy / 60.0F;
                 std::cout << "  " << label << " -> u=" << actual_u[u_index] << ", v=" << actual_v[v_index] << '\n';
-                // Constant interior transport is exact; allow initial upload plus three rounded R16F decay stores.
+                // Constant interior transport is exact to float rounding; the tolerance still allows R16F-sized steps.
                 constexpr float tolerance = 0.002F;
                 Require(std::abs(actual_u[u_index] - expected_u) < tolerance &&
                             std::abs(actual_v[v_index] - expected_v) < tolerance,
@@ -2061,22 +2127,22 @@ void GasWallTransport() {
                 v_values.fill(endpoint_mode == 1 ? initial : 0.0F);
                 u_values[endpoint_u] = v_values[endpoint_v] = initial;
             }
-            const GLuint source_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT, u_values.data());
-            const GLuint source_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT, v_values.data());
-            const GLuint forward_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
-            const GLuint forward_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
-            const GLuint corrected_u = resources.Texture(size + 1, size, GL_R16F, GL_RED, GL_FLOAT);
-            const GLuint corrected_v = resources.Texture(size, size + 1, GL_R16F, GL_RED, GL_FLOAT);
+            const GLuint source_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT, u_values.data());
+            const GLuint source_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT, v_values.data());
+            const GLuint forward_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT);
+            const GLuint forward_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT);
+            const GLuint corrected_u = resources.Texture(size + 1, size, GL_R32F, GL_RED, GL_FLOAT);
+            const GLuint corrected_v = resources.Texture(size, size + 1, GL_R32F, GL_RED, GL_FLOAT);
             program = resources.Program("gas_velocity_advect.comp");
             glUseProgram(program);
             glUniform2i(glGetUniformLocation(program, "gasSize"), size, size);
             glUniform1f(glGetUniformLocation(program, "dt"), dt);
             glUniform1f(glGetUniformLocation(program, "maxVelocity"), bounded_trace ? 15.0F : 200.0F);
-            BindImage(0, source_u, GL_READ_ONLY, GL_R16F);
-            BindImage(1, source_v, GL_READ_ONLY, GL_R16F);
+            BindImage(0, source_u, GL_READ_ONLY, GL_R32F);
+            BindImage(1, source_v, GL_READ_ONLY, GL_R32F);
             BindImage(2, velocity, GL_READ_ONLY, GL_RG16F);
-            BindImage(3, forward_u, GL_WRITE_ONLY, GL_R16F);
-            BindImage(4, forward_v, GL_WRITE_ONLY, GL_R16F);
+            BindImage(3, forward_u, GL_WRITE_ONLY, GL_R32F);
+            BindImage(4, forward_v, GL_WRITE_ONLY, GL_R32F);
             BindImage(5, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size + 1, size + 1);
             std::array<float, 2> endpoint_face_forward{};
@@ -2104,16 +2170,16 @@ void GasWallTransport() {
             glUniform1f(glGetUniformLocation(program, "buoyancyTemperature"), 0.0F);
             glUniform1f(glGetUniformLocation(program, "buoyancySmoke"), 0.0F);
             glUniform1f(glGetUniformLocation(program, "maxVelocity"), bounded_trace ? 15.0F : 200.0F);
-            BindImage(0, source_u, GL_READ_ONLY, GL_R16F);
-            BindImage(1, source_v, GL_READ_ONLY, GL_R16F);
+            BindImage(0, source_u, GL_READ_ONLY, GL_R32F);
+            BindImage(1, source_v, GL_READ_ONLY, GL_R32F);
             BindImage(2, velocity, GL_READ_ONLY, GL_RG16F);
-            BindImage(3, forward_u, GL_READ_ONLY, GL_R16F);
-            BindImage(4, forward_v, GL_READ_ONLY, GL_R16F);
+            BindImage(3, forward_u, GL_READ_ONLY, GL_R32F);
+            BindImage(4, forward_v, GL_READ_ONLY, GL_R32F);
             BindImage(5, bounded_trace ? reverse_velocity : velocity, GL_READ_ONLY, GL_RG16F);
             BindImage(6, source, GL_READ_ONLY, GL_R16F);
             BindImage(7, source, GL_READ_ONLY, GL_R16F);
-            BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R16F);
-            BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R16F);
+            BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R32F);
+            BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R32F);
             BindImage(10, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size + 1, size + 1);
 
@@ -2311,11 +2377,11 @@ void GasBrushBlocking() {
             BindImage(0, boundary_full, GL_READ_ONLY, GL_R8UI);
             BindImage(1, boundary_gas, GL_WRITE_ONLY, GL_R8UI);
             Dispatch(size, size);
-            const auto scalar = [&](int width, int height) {
+            const auto scalar = [&](int width, int height, GLenum format = GL_R16F) {
                 const std::vector<float> values(static_cast<std::size_t>(width * height), 0.125F);
-                return resources.Texture(width, height, GL_R16F, GL_RED, GL_FLOAT, values.data());
+                return resources.Texture(width, height, format, GL_RED, GL_FLOAT, values.data());
             };
-            const GLuint u = scalar(size + 1, size), v = scalar(size, size + 1);
+            const GLuint u = scalar(size + 1, size, GL_R32F), v = scalar(size, size + 1, GL_R32F);
             const std::array<GLuint, 4> fields{scalar(size, size), scalar(size, size), scalar(size, size), scalar(size, size)};
             std::array<float, size * size * 2> center_values;
             center_values.fill(0.125F);
@@ -2337,8 +2403,8 @@ void GasBrushBlocking() {
             glUniform1i(glGetUniformLocation(program, "blockedBySolid"), 1);
             glUniform1i(glGetUniformLocation(program, "blockedByWater"), test.block_water ? 1 : 0);
             glUniform1i(glGetUniformLocation(program, "clearMode"), test.clear ? 1 : 0);
-            BindImage(0, u, GL_READ_WRITE, GL_R16F);
-            BindImage(1, v, GL_READ_WRITE, GL_R16F);
+            BindImage(0, u, GL_READ_WRITE, GL_R32F);
+            BindImage(1, v, GL_READ_WRITE, GL_R32F);
             BindImage(2, center, GL_READ_WRITE, GL_RG16F);
             for (GLuint field = 0; field < fields.size(); ++field) BindImage(3 + field, fields[field], GL_READ_WRITE, GL_R16F);
             BindImage(7, reaction, GL_READ_WRITE, GL_RG16F);

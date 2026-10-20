@@ -4,20 +4,30 @@
 
 class FixedStepClock {
 public:
-    // Ticks for one rendered frame. A frame that kept up (at most 1.5 ticks of wall time) may catch up two ticks; after
-    // an overrun only one runs. Either way the backlog beyond one tick is dropped, so a tick that costs more than its
-    // own duration slows the simulation down instead of compounding into ever longer frames.
-    // shortcut: displays below 40 Hz count as overrun and run one tick per frame (slow motion); pass the display
-    // interval in if such displays matter.
+    // Ticks for one rendered frame: the whole ticks that elapsed, at most two, and only one when the measured tick cost
+    // (MeasureTicks) says two would not fit in kCatchUpBudget of a tick, leaving the rest of the frame for rendering.
+    // Backlog beyond one tick is dropped. So a tick that fits a frame runs once per frame at the display rate instead of
+    // occasionally doubling up into a long frame, and a tick that costs more than a frame slows the simulation down
+    // (fewer ticks per second of wall time) instead of compounding into ever longer frames.
     int Advance(double elapsed, double fixed_dt) {
-        const double frame = std::max(0.0, elapsed);
-        accumulated_ += frame;
-        const int cap = frame > 1.5 * fixed_dt ? 1 : 2;
+        accumulated_ += std::max(0.0, elapsed);
+        const int cap = 2.0 * tick_cost_ > kCatchUpBudget * fixed_dt ? 1 : 2;
         const int steps = std::min(cap, static_cast<int>(accumulated_ / fixed_dt));
         accumulated_ = std::min(accumulated_ - steps * fixed_dt, fixed_dt);
         return steps;
     }
 
+    // Wall seconds the last frame's ticks took. The estimate rises at once and decays slowly, so one slow tick stops
+    // catch-up immediately and a brief lull does not restart it.
+    void MeasureTicks(double seconds, int ticks) {
+        if (ticks <= 0 || !(seconds >= 0.0)) return;
+        const double per_tick = seconds / ticks;
+        tick_cost_ = per_tick > tick_cost_ ? per_tick : tick_cost_ + 0.05 * (per_tick - tick_cost_);
+    }
+
+    static constexpr double kCatchUpBudget = 0.75;
+
 private:
     double accumulated_ = 0.0;
+    double tick_cost_ = 0.0;
 };
