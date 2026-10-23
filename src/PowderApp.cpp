@@ -118,6 +118,17 @@ int PowderApp::Run() {
 
         while (glfwWindowShouldClose(window_) == GLFW_FALSE) {
             glfwPollEvents();
+            // Minimized: nothing is drawn or simulated, and the thread sleeps until the next event. The clocks restart
+            // on return, so the time spent hidden is not simulated as a backlog.
+            int framebuffer_width = 0;
+            int framebuffer_height = 0;
+            glfwGetFramebufferSize(window_, &framebuffer_width, &framebuffer_height);
+            if (glfwGetWindowAttrib(window_, GLFW_ICONIFIED) == GLFW_TRUE || framebuffer_width == 0 || framebuffer_height == 0) {
+                glfwWaitEvents();
+                previous_time = title_time = glfwGetTime();
+                title_frames = 0;
+                continue;
+            }
             UpdateInput();
             const double current_time = glfwGetTime();
             RunInteractiveFrame(clock, current_time - previous_time);
@@ -142,6 +153,9 @@ int PowderApp::Run() {
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         Shutdown();
+#ifdef _WIN32
+        if (!replay_mode_) ShowErrorDialog(error.what());  // replays stay headless and scriptable
+#endif
         return 1;
     }
 }
@@ -153,9 +167,6 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
     const double tick_start = glfwGetTime();
     const bool show_timings = render_mode_ == RenderMode::DebugCounters;
     if (show_timings && steps > 0) timing_set_ ^= 1U;
-#ifdef _WIN32
-        if (!replay_mode_) ShowErrorDialog(error.what());  // replays stay headless and scriptable
-#endif
     for (int step = 0; step < steps; ++step) RunFrame(config_.fixed_dt, nullptr, step == 0);
     clock.MeasureTicks(glfwGetTime() - tick_start, steps);
     if (show_timings) ReadBackInteractiveTimings();
@@ -166,6 +177,7 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
 }
 
 void PowderApp::Initialize() {
+    replay_mode_ = std::getenv("POWDER_REPLAY") != nullptr;  // before anything that can throw, so Run() knows
     config_ = powder_config::LoadConfigFromEnvironment();
 
     glfwSetErrorCallback(GlfwErrorCallback);
@@ -176,7 +188,6 @@ void PowderApp::Initialize() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    replay_mode_ = std::getenv("POWDER_REPLAY") != nullptr;  // before anything that can throw, so Run() knows
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     // Replays keep the reference 1280x900. Interactive windows take 85% of the work area's height and just enough
