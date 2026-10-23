@@ -5,7 +5,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -378,7 +380,12 @@ private:
 
     GLFWwindow* window_ = nullptr;
     bool gl_ready_ = false;
-    std::unordered_map<GLuint, std::unordered_map<std::string, GLint>> uniform_locations_;
+    // Transparent hashing lets CachedUniform look a name up by string_view without building a std::string.
+    struct UniformNameHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view name) const noexcept { return std::hash<std::string_view>{}(name); }
+    };
+    std::unordered_map<GLuint, std::unordered_map<std::string, GLint, UniformNameHash, std::equal_to<>>> uniform_locations_;
 
     bool gas_mac_ping_ = true;
     bool smoke_ping_ = true;
