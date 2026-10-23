@@ -11,7 +11,11 @@
 #include <utility>
 
 #ifdef _WIN32
-#include <process.h>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <cstring>
 #endif
 
 namespace {
@@ -33,6 +37,44 @@ void SetValue(const char* value, const char* name = kSetting) {
 #endif
     Require(result == 0, "could not set test environment variable");
 }
+
+#ifdef _WIN32
+// _putenv_s(name, "") removes a variable, so an empty value needs a child process. The child
+// gets this process's full environment plus the empty fixture: the CRT's _spawnve with a
+// one-entry environment crashed this process on the GitHub Windows runner.
+int RunEmptyChild() {
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    Require(length > 0 && length < MAX_PATH, "could not locate the test executable");
+
+    LPCH strings = GetEnvironmentStringsA();
+    Require(strings != nullptr, "could not read the environment");
+    const std::string fixture = std::string(kEmptySetting) + "=";
+    std::string block;
+    for (const char* entry = strings; *entry != '\0'; entry += std::strlen(entry) + 1) {
+        if (std::strncmp(entry, fixture.c_str(), fixture.size()) != 0) {
+            block.append(entry).push_back('\0');
+        }
+    }
+    FreeEnvironmentStringsA(strings);
+    block.append(fixture).push_back('\0');
+    block.push_back('\0');
+
+    std::string command = "\"" + std::string(path) + "\" --empty";
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    Require(CreateProcessA(path, command.data(), nullptr, nullptr, TRUE, 0, block.data(), nullptr, &startup,
+                           &process) != 0,
+            "could not start the explicit-empty child");
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(code);
+}
+#endif
 
 template <typename T>
 void ExpectInvalid(const char* name, bool (*parse)(const char*, T&)) {
@@ -453,9 +495,7 @@ int main(int argc, char** argv) {
         });
         run("empty values rejected", [&] {
 #ifdef _WIN32
-            const char* arguments[] = {"powder_config_tests", "--empty", nullptr};
-            const char* environment[] = {"POWDER_CONFIG_TEST_EMPTY=", nullptr};
-            const auto result = _spawnve(_P_WAIT, argv[0], arguments, environment);
+            const int result = RunEmptyChild();
             Require(result == 0, "explicit-empty child failed with exit " + std::to_string(result));
 #else
             Require(setenv(kEmptySetting, "", 1) == 0, "could not create empty environment fixture");
