@@ -381,6 +381,8 @@ void CheckSimulationConfig(const Run& run) {
 int main(int argc, char** argv) {
     int failures = 0;
     int checks = 0;
+    // Flush each result line so a crash still shows the last check that ran.
+    std::cout << std::unitbuf;
     const auto run = [&](const std::string& name, const auto& check) {
         ++checks;
         try {
