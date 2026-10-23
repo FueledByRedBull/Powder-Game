@@ -23,6 +23,8 @@ inline constexpr std::array<std::string_view, 8> kBrushNames{"SAND", "WATER", "S
 // The help panel is key labels (kHelpKeys) beside their descriptions (kHelpActions), row by row.
 inline constexpr std::array<std::string_view, 6> kHelpKeys{"LMB", "1-8", "[ ]", "F1-F10", "H", "ESC"};
 inline constexpr std::array<std::string_view, 6> kHelpActions{"PAINT", "SELECT", "SIZE", "VIEWS", "HELP", "QUIT"};
+static_assert(kHelpKeys.size() <= 6 && kHelpActions.size() <= 6 && kBrushNames.size() <= 8,
+              "hud.frag declares keyRects[6], actionRects[6] and labelRects[8]; enlarge those arrays to match");
 inline constexpr std::string_view kHintKey = "H";
 inline constexpr std::string_view kHintText = "HELP";
 // Glyph strip for numbers: digit d is cell d, 'R' (cell 10) labels the brush radius readout.
