@@ -87,9 +87,7 @@ std::string WithGlfwError(std::string message) {
 
 int PowderApp::Run() {
     try {
-        if (!Initialize()) {
-            return 1;
-        }
+        Initialize();
 
         if (replay_mode_) {
             const int replay_result = RunReplay();
@@ -150,10 +148,10 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
     return steps;
 }
 
-bool PowderApp::Initialize() {
-    glfwSetErrorCallback(GlfwErrorCallback);
+void PowderApp::Initialize() {
     config_ = powder_config::LoadConfigFromEnvironment();
 
+    glfwSetErrorCallback(GlfwErrorCallback);
     if (glfwInit() == GLFW_FALSE) {
         throw std::runtime_error(WithGlfwError("Failed to initialize GLFW."));
     }
@@ -219,10 +217,12 @@ bool PowderApp::Initialize() {
 
     glDisable(GL_DEPTH_TEST);
 
-    while (glGetError() != GL_NO_ERROR) {
-    }  // drop stale errors so only the allocations below can raise one
     glGenVertexArrays(1, &fullscreen_vao_);
 
+    while (glGetError() != GL_NO_ERROR) {
+    }  // drop stale errors so only the allocations below can raise one
+    CreateTextures();
+    CreateBuffers();
     bool out_of_memory = false;
     for (GLenum error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
         out_of_memory = out_of_memory || error == GL_OUT_OF_MEMORY;
@@ -235,12 +235,8 @@ bool PowderApp::Initialize() {
                                  " MiB; sand pool " + std::to_string(kMaxSandParticles) + " grains, " +
                                  std::to_string(kMaxSandParticles * 4LL * kSandParticleComponents / kMiB) + " MiB).");
     }
-    CreateTextures();
-    CreateBuffers();
     CreatePrograms();
     InitializeState();
-
-    return true;
 }
 
 void PowderApp::Shutdown() {
@@ -1368,13 +1364,13 @@ void PowderApp::StampBrush(const BrushConfig& config) {
         return;
     }
 
-    if (config.replace_material || config.clear_water || config.clear_gas) {
+    if (config.replace_material) {
         RunSpawnFullRes(config, full_region);
     }
 
     // Particles frozen inside a new wall would still draw, count toward caps and feed P2G.
     const bool fills = config.replace_material && config.material_value != kEmptyMaterial;
-    if (config.clear_water || fills) {
+    if (fills) {
         RunClearWaterParticles(full_region);
     }
     if (fills) {
@@ -1390,9 +1386,6 @@ void PowderApp::StampBrush(const BrushConfig& config) {
     }
 
     const DispatchRegion gas_region = ComputeDispatchRegion(2, kGasWidth, kGasHeight);
-    if (config.clear_gas) {
-        RunClearGas(gas_region);
-    }
     if (config.spawn_gas) {
         RunSpawnGas(config, gas_region);
     }
@@ -1496,8 +1489,7 @@ void PowderApp::RunSpawnFullRes(const BrushConfig& config, const DispatchRegion&
     glUniform1ui(CachedUniform(spawn_full_program_, "materialValue"), config.material_value);
     glUniform1i(CachedUniform(spawn_full_program_, "blockedBySolid"), config.blocked_by_solid ? 1 : 0);
     glUniform1i(CachedUniform(spawn_full_program_, "blockedByWater"), config.blocked_by_water ? 1 : 0);
-    glUniform1i(CachedUniform(spawn_full_program_, "clearWater"), config.clear_water ? 1 : 0);
-    glUniform1i(CachedUniform(spawn_full_program_, "clearGas"), 0);
+    glUniform1i(CachedUniform(spawn_full_program_, "clearWater"), 0);
     glUniform1i(CachedUniform(spawn_full_program_, "clearMode"), 0);
 
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
@@ -1665,7 +1657,6 @@ void PowderApp::RunClearWaterParticles(const DispatchRegion& region) {
     if (region.Empty()) {
         return;
     }
-    (void)region;
 
     glUseProgram(water_particle_clear_program_);
     glUniform2i(CachedUniform(water_particle_clear_program_, "brushCenter"), brush_x_, brush_y_);
@@ -1692,7 +1683,6 @@ void PowderApp::RunClearFullRes(const DispatchRegion& region) {
     glUniform1i(CachedUniform(spawn_full_program_, "blockedBySolid"), 0);
     glUniform1i(CachedUniform(spawn_full_program_, "blockedByWater"), 0);
     glUniform1i(CachedUniform(spawn_full_program_, "clearWater"), 1);
-    glUniform1i(CachedUniform(spawn_full_program_, "clearGas"), 0);
     glUniform1i(CachedUniform(spawn_full_program_, "clearMode"), 1);
 
     glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
@@ -2588,20 +2578,20 @@ void PowderApp::RunWaterProjection() {
     // cap. Each pass queues that restart (a no-op unless the solve has just stopped), copies the state behind a fence and,
     // once a pass has found the solve running, keeps the GPU busy with 1, then 2, then up to 4 more iterations while the
     // CPU waits for the fence (they launch nothing once the solve has stopped).
-        if (waited == GL_WAIT_FAILED) throw std::runtime_error("Waiting for the water pressure solve failed.");
     for (int ahead = 0; dispatched < cap;) {
         if (dispatched > 0) start(true);  // a solve that never iterated has formed its true residual already
-        if (copied == nullptr) throw std::runtime_error("Mapping the water pressure state failed.");
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_COPY_READ_BUFFER, water_state_.pressure_scalars);
         glBindBuffer(GL_COPY_WRITE_BUFFER, water_state_.pressure_state);
         glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 4 * sizeof(float), 0, sizeof(state));
         GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         iterate(std::min(ahead, cap - dispatched));
-        glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
+        const GLenum waited = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
         glDeleteSync(fence);
+        if (waited == GL_WAIT_FAILED) throw std::runtime_error("Waiting for the water pressure solve failed.");
         // The copy finished before the fence, so mapping it does not wait for the speculative iterations.
         const void* copied = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, sizeof(state), GL_MAP_READ_BIT);
+        if (copied == nullptr) throw std::runtime_error("Mapping the water pressure state failed.");
         std::memcpy(state.data(), copied, sizeof(state));
         glUnmapBuffer(GL_COPY_WRITE_BUFFER);
         if (state[0] == 0 || dispatched >= cap) break;
@@ -3297,7 +3287,6 @@ void PowderApp::Render(bool letterbox) {
     glUniform2i(CachedUniform(render_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform2i(CachedUniform(render_program_, "fbSize"), fb_width, fb_height);
     glUniform4i(CachedUniform(render_program_, "simRect"), sim.x, sim.y, sim.width, sim.height);
-    glUniform2i(CachedUniform(render_program_, "smokeSize"), kSmokeWidth, kSmokeHeight);
     glUniform2i(CachedUniform(render_program_, "heatSize"), kHeatWidth, kHeatHeight);
     glUniform1i(CachedUniform(render_program_, "renderMode"), static_cast<int>(render_mode_));
     glUniform1i(CachedUniform(render_program_, "lighting"), lit ? 1 : 0);
