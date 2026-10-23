@@ -1,15 +1,151 @@
 # Powder Game Validation
 
 Use these commands from the repository root. The command reference (Configure, Build, Run Interactive App, Run
-Acceptance Replay, Expected Replay Checks) is near the end of this file.
+Acceptance Replay, Expected Replay Checks) follows this paragraph; the measured results come after it, newest first.
+`build/goal-baseline/` is a local, ignored evidence folder that is not present in a clone, so the raw logs cited below exist
+only on the machine that ran them.
 
-## Current status - v0.7.0 integration, 2026-10-23 (uncommitted, on `61e2965`)
+## Configure
+
+Windows with a Visual Studio Developer PowerShell:
+
+```powershell
+cmake -S . -B build-msvc -A x64
+```
+
+If `cmake` is not on PATH, use the installed Visual Studio bundled CMake:
+
+```powershell
+& 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe' -S . -B build-msvc -A x64
+```
+
+Linux:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+```
+
+## Build
+
+Windows:
+
+```powershell
+cmake -E env PYTHONUTF8=1 cmake --build build-msvc --config Release --parallel 8
+ctest --test-dir build-msvc -C Release --output-on-failure -j 1
+```
+
+With Visual Studio bundled CMake:
+
+```powershell
+$cmake = 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
+& $cmake -E env PYTHONUTF8=1 $cmake --build build-msvc --config Release --parallel 8
+& (Join-Path (Split-Path $cmake) 'ctest.exe') --test-dir build-msvc -C Release --output-on-failure -j 1
+```
+
+Linux:
+
+```bash
+cmake --build build --target powder_game -j
+```
+
+## Run Interactive App
+
+Windows:
+
+```powershell
+.\build-msvc\Release\powder_game.exe
+```
+
+If the generator places the executable directly under `build-msvc`, use:
+
+```powershell
+.\build-msvc\powder_game.exe
+```
+
+Linux:
+
+```bash
+./build/powder_game
+```
+
+Controls are in README. The interactive window draws the HUD (help panel toggled
+with `H`, material slots, brush ring and lantern) and letterboxes the square simulation; replays
+set `POWDER_REPLAY`, run hidden and never draw it.
+
+## Run Acceptance Replay
+
+Replay mode compiles all runtime shaders, runs scripted scenes, reads validation aggregates, and returns nonzero on failure.
+Each requested scene runs twice by default and compares tolerance-based deterministic signatures.
+
+Run every scene:
+
+```powershell
+$env:POWDER_REPLAY = "all"
+.\build-msvc\Release\powder_game.exe
+Remove-Item Env:\POWDER_REPLAY
+```
+
+Run one scene:
+
+```powershell
+$env:POWDER_REPLAY = "boundary"
+.\build-msvc\Release\powder_game.exe
+Remove-Item Env:\POWDER_REPLAY
+```
+
+Available scenes:
+
+- `water`
+- `gas`
+- `sand`
+- `boundary`
+- `leakage`
+- `combined`
+
+Useful replay/config overrides:
+
+- `POWDER_REPLAY_REPEAT`: replay repetitions per scene, default `2`.
+- `POWDER_REPLAY_DETERMINISM_REL_TOL`: relative signature tolerance, default `0.15`.
+- `POWDER_REPLAY_DETERMINISM_ABS_TOL`: absolute signature tolerance, default `0.05`.
+- `POWDER_FIXED_DT`: fixed simulation timestep.
+- `POWDER_WATER_PRESSURE_ITERATIONS`, `POWDER_WATER_PRESSURE_RESIDUAL`
+- `POWDER_WATER_MAX_VELOCITY` (clamp, counted in `water_velocity_clamped`), `POWDER_WATER_MAX_SUBSTEPS`, `POWDER_WATER_DENSITY_RATE` (`0` disables density control)
+- `POWDER_GAS_PRESSURE_ITERATIONS`, `POWDER_GAS_PRESSURE_RESIDUAL`
+- `POWDER_GAS_COMBUSTION_RATE`, `POWDER_GAS_WATER_COOLING`, `POWDER_GAS_BUOYANCY_TEMPERATURE`, `POWDER_GAS_BUOYANCY_SMOKE`
+- `POWDER_SAND_DRAG`, `POWDER_SAND_MAX_VELOCITY`, `POWDER_SAND_FRICTION`
+- `POWDER_SAND_REFERENCE_DENSITY`, `POWDER_SAND_SHEAR_MODULUS`, `POWDER_SAND_LAME_LAMBDA`
+- `POWDER_SAND_FRICTION_ALPHA`, `POWDER_SAND_CFL`, `POWDER_SAND_MAX_SUBSTEPS`
+- `POWDER_COMBINED_TARGET_FRAME_MS`, `POWDER_COMBINED_WORST_FRAME_MS`
+
+## Expected Replay Checks
+
+Replay fails if:
+
+- any accumulated debug counter is nonzero:
+  - `nan_inf_detected`
+  - `particle_overflow_blocked`
+  - `pressure_nonconverged`
+  - reserved counter index 3 (the former `inactive_tile_misses` counter; no longer
+    evidence of coupling coverage after removal of tile scheduling)
+- timing queries return invalid values
+- replay deterministic signatures drift beyond configured tolerance
+- water source growth is not monotonic in the source window
+- water replay finishes with zero live particles, unexpected count/mass changes,
+  or exceeds the configured water particle cap
+- gas never ignites or suppression does not extinguish within the fixed window
+- sand mass drifts by more than `0.5%`
+- boundary/leakage water never reaches its obstacle or crosses the blocker
+- combined scene has missing water/sand or inactive gas, violates source-free mass
+  conservation, or exceeds the configured GPU-time budget
+
+## Current status - v0.7.0 integration, 2026-10-23 (committed as `12c1343`; measured on the pre-commit tree on `61e2965`)
 
 This is the current result. The five pass sections that follow it are the work merged here, each measured in its own
 tree on a GPU shared with the other passes (their timings are noisy; their correctness numbers stand). Everything after
 them is a historical record; where an older section contradicts this one, this section wins.
 
-Tree: `61e2965` plus the gas scheduling pass (one gas pressure solve split across a tick pair), the water host
+Tree: the integration is committed as `12c1343`. The evidence below was measured on the tree before that commit, which
+was `61e2965` plus the gas scheduling pass (one gas pressure solve split across a tick pair), the water host
 synchronisation pass (restart from the true residual armed on the GPU), sand pass 5 (hole collapse, per-grain damp
 bonds, stochastic hardening rounding, sand spawn budget, brush-like benchmark bed), the water surface pass (ghost-fluid
 free surface on a blurred density) and the spark pass (sparks and embers as GPU particles). Two changes were made
@@ -27,7 +163,7 @@ during the integration:
   here; 18.9 and 17.1 for the single stream in the gas and water-surface trees, 7.1 on `61e2965`). Steam that does not
   rise still fails all five.
 
-Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602`; no other GPU worker and no
+Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602`; no other GPU job and no
 Unity editor ran. Hashes (SHA256 prefix): `powder_game.exe` a1a08d84c430, `powder_app_lifecycle_tests.exe`
 71cf99a949d1, `powder_gpu_tests.exe` b88a00197ca5, `powder_sand_tests.exe` c99259d11484, `powder_config_tests.exe`
 a5f1cfa0e559; every changed file, the binaries and the release-shaped zip in `SHA256SUMS.txt`, raw logs and exit codes
@@ -50,7 +186,7 @@ GPU, the preferred 60 FPS combined target is met (about 61 FPS). Not verified he
 gas and spark look in a native window, HiDPI, other GPUs and drivers, the Linux and MinGW builds, the hosted CI and
 release workflows.
 
-## Gas scheduling pass - 2026-10-23 (uncommitted, on `61e2965`)
+## Gas scheduling pass - 2026-10-23 (measured before the `12c1343` commit, on `61e2965`)
 
 Where it contradicts the sections below, this one wins for the gas schedule (they describe the 30 Hz gas step).
 
@@ -68,7 +204,7 @@ against 0.159 and 0.165, 0.0044 and 0.0012 before; the gate is 0.25) and reports
 add in between (max 68 and 83 /s); `benchmark-profile` prints gas and tick ms by tick parity; `benchmark-gas-activity`
 (not a CTest case) prints how many gas tiles hold non-trivial scalars.
 
-Machine and conditions: Windows 11, AMD Radeon RX 7800 XT, driver 26.6.2, four other workers ran GPU tests the whole time,
+Machine and conditions: Windows 11, AMD Radeon RX 7800 XT, driver 26.6.2, four other GPU jobs ran GPU tests the whole time,
 so every timing is the minimum of interleaved baseline/new rounds and the spread is large (the same baseline binary
 measured 8.7 to 30 ms mean combined frame). Hashes (SHA256 prefix): `powder_game.exe` 4647ee0bf59c (1,084,416 bytes),
 `powder_app_lifecycle_tests.exe` c29574326a1e, `powder_gpu_tests.exe` c6e21d67aa31, `PowderApp.cpp` 959d5cb97bb4,
@@ -122,16 +258,16 @@ latency-bound and are where a further saving would be.
 | --- | --- |
 | Release build, all targets | exit 0 |
 | `ctest --test-dir build-msvc -C Release --output-on-failure -j 1` | exit 0, 94/94 passed (323.9 s), including the new `app-gas-split-solve` and the reworked `app-gas-rhs-precision` |
-| `cmake -E env POWDER_REPLAY=all .\build-msvc\Release\powder_game.exe` | exit 0 on the sixth attempt: five earlier attempts failed only the combined scene's maximum-frame gate (62-148 ms frames with other workers on the GPU; the baseline binary failed the same way in four of four interleaved runs); the passing run has all six scenes pass both repeats with matching signatures, combined 13.08/25.33 and 13.00/24.72 ms avg/max (v0.6.0: 14.1/31.4) |
+| `cmake -E env POWDER_REPLAY=all .\build-msvc\Release\powder_game.exe` | exit 0 on the sixth attempt: five earlier attempts failed only the combined scene's maximum-frame gate (62-148 ms frames with other GPU jobs on the GPU; the baseline binary failed the same way in four of four interleaved runs); the passing run has all six scenes pass both repeats with matching signatures, combined 13.08/25.33 and 13.00/24.72 ms avg/max (v0.6.0: 14.1/31.4) |
 | `benchmark-realtime` | new exit 0 (earlier runs under heavier load: new exit 0 and 1, baseline 1 and 1, the failures all the 33.3 ms combined mean gate): idle GPU mean 1.72 ms, combined GPU mean/p95/max 23.7/31.7/39.1 ms, drift 0, counters 0/0/0/0, gas CG mean 16.9, max 22. Baseline exit 0 in the same window: 22.1/38.8/48.0 ms, CG 14.6 / 18 |
 
 Not verified: the gas look in a native window (scalars now step every tick, the velocity projection lags a tick), other GPUs
 and drivers, uncontended timings.
 
-## Water host synchronisation pass - 2026-10-23 (uncommitted, on baseline `61e2965`)
+## Water host synchronisation pass - 2026-10-23 (measured before the `12c1343` commit, on baseline `61e2965`)
 
 Subject: how many times the CPU waits on the GPU in a water tick. Machine: Windows 11, AMD Radeon RX 7800 XT, driver
-`4.3.0 Core Profile Context 26.6.2.260602`, shared with four other GPU workers and Unity throughout, so every wall or
+`4.3.0 Core Profile Context 26.6.2.260602`, shared with four other GPU jobs and Unity throughout, so every wall or
 GPU time below is noisy (identical shaders ran 0.6 to 1.2 times each other in paired runs, a quiet-machine sweep tick
 that takes 9.4 ms ran 9.6 to 31 ms). The synchronisation counts are exact; the time evidence is the minimum of
 repeated runs. Source hashes (SHA256 prefix): `PowderApp.cpp` e969d22ffce4, `pressure_cg.comp` 46963a42c73d,
@@ -166,7 +302,7 @@ dispatched a fixed 11 iterations, no readbacks and no restart, which is incorrec
 against 9.4 to 9.5 for the baseline, and a quiet profile shows the CPU submitting for 0.2 to 0.4 ms per tick and
 blocked for the rest: the GPU, not the CPU, sets the frame time, and the whole gap between the two is 4 to 6%.
 
-Rejected, with the evidence: spinning on `glClientWaitSync` with a zero timeout (CPU burn with four other workers, no
+Rejected, with the evidence: spinning on `glClientWaitSync` with a zero timeout (CPU burn with four other GPU jobs, no
 GPU gain); a persistent `ARB_buffer_storage` mapping for the state copy and the cursor (waits per tick 6.3, same
 solver micro-benchmark minima: pool 0.80 against 0.88, tank 1.657 against 1.663); a prediction margin of one
 iteration (an empty iteration costs 20 us on this GPU, about what a miss costs); subgroup reductions
@@ -188,9 +324,9 @@ a covered solve, and more than one fence when a restart fails. `app-water-pressu
 | `POWDER_REPLAY=all` | water, gas and sand pass both repeats with signatures identical to the baseline's; `combined` passes when the machine is quiet (frame avg 17.7 ms) and fails its frame-time gate under load, as the baseline does (24.7 to 32.6 ms) |
 | `benchmark-realtime` | exit 1 in every run of this loaded session, for the baseline and this tree alike: combined GPU mean 36 to 50 ms and idle 3 to 7 ms (quiet: 18.4 and 2.4). Counters 0/0/0/0 and mass drift 0 each time. In two interleaved pairs this tree measured combined GPU 36.3 and 37.5 ms against 51.5 and 44.2 ms for the baseline. No quiet-machine pass was obtained, so the 30 FPS gate is not re-verified |
 
-## Sand pass 5: hole collapse, damp clumps, hardening precision, spawn budget, benchmark bed - 2026-10-23 (uncommitted, on `61e2965`)
+## Sand pass 5: hole collapse, damp clumps, hardening precision, spawn budget, benchmark bed - 2026-10-23 (measured before the `12c1343` commit, on `61e2965`)
 
-GPU: AMD Radeon RX 7800 XT, driver 26.6.2, shared with four other workers' GPU jobs (frame times are noisy: the same
+GPU: AMD Radeon RX 7800 XT, driver 26.6.2, shared with four other GPU jobs (frame times are noisy: the same
 binary measured 17.5 ms and 27 ms combined minutes apart, so timing claims below are interleaved runs and their lower
 end). Working-tree hashes (SHA256 prefix): `powder_game.exe` 4870e4d3629f, `powder_app_lifecycle_tests.exe` 0c6cc0f857ec,
 `powder_sand_tests.exe` 3596f0836911, `sand_pack.comp` 55babc46f565, `sand_sleep.comp` 3ff1f6d7e5a0,
@@ -257,7 +393,7 @@ temporary probe case (not kept); the baseline numbers are the same probe on the 
   runs for all three configurations below). Combined GPU mean over 13 interleaved runs each, min / lower quartile /
   median (ms): baseline code with the lattice 17.88 / 19.08 / 24.35; new code with the lattice 17.94 / 21.21 / 25.47; new
   code with the brush-like bed 17.52 / 19.35 / 24.19 (55.9 / 55.7 / 57.1 FPS at the minimum); sand pass in the last tick
-  min 3.01 / 3.08 / 3.07. The spread is the other workers' load (quiet runs cluster at 17.5-18, loaded ones at 25-30). The
+  min 3.01 / 3.08 / 3.07. The spread is the other GPU jobs' load (quiet runs cluster at 17.5-18, loaded ones at 25-30). The
   preferred 60 FPS combined target is still not met.
 
 | Command | Result |
@@ -270,14 +406,14 @@ temporary probe case (not kept); the baseline numbers are the same probe on the 
 Not verified here: the unchanged `BenchmarkGas` lattice scene, live play, other GPUs. The combined FPS before and after is
 a tie within the shared GPU's noise; whether a quiet GPU separates the beds was not measured beyond the 13 runs above.
 
-## Water surface and pool capacity pass - 2026-10-23 (on `61e2965`, scratch tree `water-surf`)
+## Water surface and pool capacity pass - 2026-10-23 (on `61e2965`, parallel branch `water-surf`)
 
 Changes: the liquid phi of the pressure solve is now a blurred particle density, the free surface a ghost-fluid
 condition on it (PLAN Water, ALGORITHMS 4.5 and 4.8), the multigrid preconditioner carries half the fine ghost-fluid
 excess to its coarse diagonals, and four tests were added. Pool size, budget and packing are unchanged; the pool
 capacity items were measured and not kept (second half of this section).
 
-Same machine as below (RX 7800 XT). Other workers and Unity used the GPU in parts of the session, so every timing
+Same machine as below (RX 7800 XT). Other GPU jobs and Unity used the GPU in parts of the session, so every timing
 claim is an interleaved pair against a baseline build of `61e2965` made in a second tree (`powder_game.exe` ccf638559539),
 repeated, and the GPU was quiet for the pairs quoted. The simulation is deterministic, so CG iterations and substeps
 repeat exactly between repeats. Hashes of this tree (SHA256 prefix): `powder_game.exe` 420533bbfd39 (1,089,536 bytes),
@@ -436,7 +572,7 @@ pool or by packing, and the numbers say why.
   liquid (they land wherever they land); `app-oil-float` counts moving plus packed water; `config-parsing` covers the two
   settings.
 
-## Sparks and embers as particles - 2026-10-23 (worker tree on `61e2965`)
+## Sparks and embers as particles - 2026-10-23 (parallel branch on `61e2965`)
 
 Change: sparks and embers are a GPU particle ring (`spark_pick.comp`, `spark_step.comp`, drawn by `spark.vert` and
 `spark.frag`) instead of a lattice evaluated per pixel in `composite.frag`; `benchmark-interactive` now detaches the
@@ -445,7 +581,7 @@ are in docs/ALGORITHMS.md 11.4 and PLAN.md (Scheduling and rendering). The compo
 `sparks()` loop (about 40 lines); flame tongues and heat shimmer are unchanged, and unlit frames, the `render-modes`
 oracle and the `hud` pixel tests are untouched (no sampler, buffer or uniform was added to the composite).
 
-Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602`. Four other workers ran GPU tests
+Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602`. Four other GPU jobs ran tests
 the whole session (one to four other `powder_*` processes alive at any sample), so absolute frame times and the
 real-time gates below are contended; every timing claim is an interleaved A/B against the baseline binary (`61e2965`,
 built before the first edit, kept in the ignored `build/base-bin/`). Hashes (SHA256 prefix): `powder_game.exe`
@@ -460,7 +596,7 @@ afterwards with a timestamp touch). Raw logs and `exit-codes.txt` are in the ign
 | Release build, `powder_game` and `powder_app_lifecycle_tests` | exit 0, no compiler warnings (full log kept) |
 | `ctest --test-dir build-msvc -C Release --output-on-failure -j 1` | exit 0, 94/94 passed (260.5 s, contended); the new `app-sparks` among them, the other 93 as before |
 | `app-sparks` | passes alone in 9 s. Below |
-| `POWDER_REPLAY=all` | exit 1: water, gas and sand pass both repeats with matching signatures; `combined` fails its frame gate only (average at most 33.34 ms, worst frame at most 45 ms) under contention: frame avg/max 21.0/71.2 and 31.4/79.8 ms in the two `all` runs, the content part (water, sand, smoke, ignition) holding. The baseline binary fails the same scene the same way in 8 of 8 interleaved runs (avg/max 25.7/351, 35.5/101, 35.7/90, 34.3/125 ms and so on) while the other workers ran; this tree's 11 runs ranged 20.7/51.9 to 50.2/133 ms. Boundary and leakage pass under CTest |
+| `POWDER_REPLAY=all` | exit 1: water, gas and sand pass both repeats with matching signatures; `combined` fails its frame gate only (average at most 33.34 ms, worst frame at most 45 ms) under contention: frame avg/max 21.0/71.2 and 31.4/79.8 ms in the two `all` runs, the content part (water, sand, smoke, ignition) holding. The baseline binary fails the same scene the same way in 8 of 8 interleaved runs (avg/max 25.7/351, 35.5/101, 35.7/90, 34.3/125 ms and so on) while the other GPU jobs ran; this tree's 11 runs ranged 20.7/51.9 to 50.2/133 ms. Boundary and leakage pass under CTest |
 | `benchmark-realtime`, 8 interleaved runs (4 new, 4 baseline) | exit 0 in one new run (idle GPU mean 1.85 ms, combined 24.5 ms, p95 33.0) and one baseline run (idle 1.53, combined 20.7, p95 27.7, the only run that started with the GPU quiet), exit 1 in the other six, all with the combined gate lost to contention (combined GPU mean 37.7-54.4 new, 38.7-58.6 baseline) |
 | Extract pass (now includes the spark passes), last-tick mean in the combined scene | new 0.088, 0.156, 0.166, 0.196 ms; baseline 0.064, 0.065, 0.070, 0.072 ms: about +0.02 ms a tick in the quietest pair (0.088 against 0.065), the rest is contention noise |
 | `benchmark-interactive` (`POWDER_BENCH_SCENE=sweep`, 3 s) | exit 0, runs with the callbacks detached |
@@ -498,7 +634,7 @@ thresholds; where it contradicts this section on those, it wins.
 Tree: the v0.6.0 integration and single-executable packaging below, plus the final pre-release pass: the gas
 projection fix, the `app-gas-rhs-precision` sand pass, and comment and documentation corrections (no other code
 change). Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602`; Unity was open,
-no other GPU worker ran. Hashes (SHA256 prefix): `powder_game.exe` a055b247e5a2 (1,077,248 bytes),
+no other GPU job ran. Hashes (SHA256 prefix): `powder_game.exe` a055b247e5a2 (1,077,248 bytes),
 `powder_app_lifecycle_tests.exe` 57adcc1727dd, `powder_gpu_tests.exe` accfc924e14c, `powder_sand_tests.exe`
 f642d8a1243a, `powder_config_tests.exe` fad073b4a464, `PowderApp.cpp` 520f988913b2, `Config.hpp` a3ac0f6f74b7,
 `AppLifecycleTests.cpp` 0cd12360b46e, `smoke_project.comp` 1d17244e1be1, `composite.frag` 2969215ea3d0 (working files
@@ -540,7 +676,7 @@ Tree: `main` at `c4efd24` plus the uncommitted integration of the water and oil 
 merge, the pinhole fix, sand passes 2-4, the water leftovers pass (sealed-pocket mean removal, water to the domain
 face, sub-tick spawn age, flash quench, R32F gas right-hand side) and performance pass 2 (cost-aware clock, 30 Hz gas,
 binned water compaction, shared-memory P2G). Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context
-26.6.2.260602`; Unity was open but no other GPU worker ran. A/B partner: the pre-merge build (main with the water
+26.6.2.260602`; Unity was open but no other GPU job ran. A/B partner: the pre-merge build (main with the water
 leftovers pass, before performance pass 2 and sand pass 4), copied as `premerge-bin`. Hashes (SHA256 prefix):
 `powder_game.exe` b29a5baea32a, `powder_app_lifecycle_tests.exe` 61399112f9b1, `powder_gpu_tests.exe` 9ef2bf3df8a1,
 `powder_sand_tests.exe` fd1d0df09b79, `powder_config_tests.exe` f18e42885cb7, `PowderApp.cpp` 7102293a7bf4,
@@ -655,7 +791,7 @@ rerun: the change is packaging only, but the static CRT is a different binary.
 
 ## Historical session records
 
-Everything from here to "Configure" is the raw per-session record, newest first, kept as written. Section titles
+Everything from here to the end of the file is the raw per-session record, newest first, kept as written. Section titles
 marked "historical" were "uncommitted" or "INCOMPLETE" working-tree snapshots when written.
 
 ## v0.5.0 release candidate status - 2026-10-20 (historical)
@@ -723,7 +859,7 @@ sums sorted workgroups in shared memory (bit-identical integer sums); the app no
 `gas_pressure_prolongate.comp` (the GPU fixture still uses it). `composite.frag` and `light_build.comp` are unchanged:
 `Render(true)` measures 0.15 ms without fire and 0.25-0.35 ms with it at 1766x1210 (light build, mips and composite),
 so the look pass is not where the combined frame lost ~2 ms, and there is nothing worth taking from it.
-Same machine and driver. Two other workers' GPU tests and Unity ran on the GPU throughout: every figure is the min of
+Same machine and driver. Two other GPU jobs' tests and Unity ran on the GPU throughout: every figure is the min of
 interleaved repeats against the pre-pass binary (`5bd8ed0`), and the spread was large. Hashes (SHA256 prefix):
 `powder_game.exe` e67956d0a096, `powder_app_lifecycle_tests.exe` ddab4c36d634, `powder_gpu_tests.exe` 82eb1e6a1b0a,
 `PowderApp.cpp` f29a9cdb97cc, `water_particle_p2g.comp` 55facf242e4d, `water_particle_compact.comp` 1b1045e123c3,
@@ -780,7 +916,7 @@ three spots (one spot burned 21-98% of the oil as liquid details changed: flame 
 
 Not reproduced: water clinging to walls (droplets, a film, splashes thrown at domain and painted walls and a stream
 poured down the left edge all drain, `app-water-wall`); the screenshot's left-edge column is probably a falling drip
-line. Not done: ghost-fluid free surface and air-band extrapolation (touches the pressure operator the perf worker is
+line. Not done: ghost-fluid free surface and air-band extrapolation (touches the pressure operator the parallel performance branch is
 restructuring), water-on-burning-oil steam splatter (water sinks through oil and the slick burns on, unchanged), and
 the dark-patch shading question (render side).
 
@@ -791,7 +927,7 @@ flame tongues, sparks and heat shimmer on `fxTime`, water closes gas in `boundar
 Windows coalesced mouse moves; new `app-gas-water`; `gpu-gas-velocity-dissipation` compares advected faces within 1e-6 instead of exactly) and the gas solver
 perf pass (fused per-level smoothing in `gas_pressure_relax.comp`, PLAN Gas; new `benchmark-profile`, not in CTest:
 `POWDER_PROFILE_SCENE` sweep|pour|combined|user, `POWDER_PROFILE_FRAMES` (600), `POWDER_PROFILE_DISPATCH`,
-`POWDER_PROFILE_GROUPS`). A sand worker's GPU tests ran on the same GPU during part of these checks, as did Unity.
+`POWDER_PROFILE_GROUPS`). A parallel sand branch's GPU tests ran on the same GPU during part of these checks, as did Unity.
 Hashes (SHA256 prefix): `powder_game.exe` c4c4f9ce8bab, `powder_app_lifecycle_tests.exe` 4730dd688f9e,
 `PowderApp.cpp` f6f5f45ce669, `AppLifecycleTests.cpp` 375e7f1de117, `composite.frag` 2969215ea3d0,
 `gas_pressure_relax.comp` 25d7e3eadf29, `water_particle_step.comp` a7108f3afc74. Raw logs:
@@ -847,7 +983,7 @@ Merged the sand copy's `609c7ae..06d8707` (Sand pass 2 and 3 below) by 3-way `gi
 `sand-domain-edge` added beside the main tree's new cases. The sand shaders are byte-identical to the sand copy's
 (hashes match Sand pass 3). Nothing else in the main tree reads the sand packed texture (now RGBA32F); composite and
 light passes do not. Sand now reaches the domain face while water stays at [0.5, N - 0.5]; water reads sand velocity
-only at in-bounds cells, so edge coupling is unchanged (PLAN, Sand and water). GPU shared with a sand worker's runs:
+only at in-bounds cells, so edge coupling is unchanged (PLAN, Sand and water). GPU shared with a parallel sand branch's runs:
 A/B interleaved with the pre-merge binary, contended runs repeated. Hashes (SHA256 prefix): `powder_game.exe`
 192fbfd1dfdd, `powder_app_lifecycle_tests.exe` b7ad54d5d8b5, `PowderApp.cpp` 34829f689625, `AppLifecycleTests.cpp`
 b4a8bda1fac2; full list and raw logs in `build/goal-baseline/2026-10-20-merge-sand/`.
@@ -856,7 +992,7 @@ b4a8bda1fac2; full list and raw logs in `build/goal-baseline/2026-10-20-merge-sa
 | --- | --- |
 | Release build, all targets (reconfigured) | exit 0, no warnings |
 | `ctest -C Release --output-on-failure -j 1` | exit 0, 86/86 passed (171.5 s) |
-| `POWDER_REPLAY=all` | exit 0 uncontended (`replay-all-post-5`): combined 16.3/27.0 and 16.8/26.7 ms, sand pass 2.69/2.79 (pre-merge 17.2/17.3 ms, sand 2.73/2.76). Four runs while the other worker's tests ran failed only combined repeat 2's 45 ms worst frame (45.8-52.6); the pre-merge binary failed the same way when contended (53-388 ms), and with the timing gates lifted the combined content and determinism pass |
+| `POWDER_REPLAY=all` | exit 0 uncontended (`replay-all-post-5`): combined 16.3/27.0 and 16.8/26.7 ms, sand pass 2.69/2.79 (pre-merge 17.2/17.3 ms, sand 2.73/2.76). Four runs while the other GPU job's tests ran failed only combined repeat 2's 45 ms worst frame (45.8-52.6); the pre-merge binary failed the same way when contended (53-388 ms), and with the timing gates lifted the combined content and determinism pass |
 | `benchmark-realtime` | uncontended exit 0 twice: idle GPU mean 2.41/2.46 ms (pre 2.93/2.93), combined GPU mean 23.7/24.2 ms, p95 34.0/34.1 (pre 24.8/25.0, p95 29.2/29.4), sand pass idle 0.36/0.37 (pre 0.84), combined 2.19/2.22 (pre 2.02/2.01); counters 0/0/0/0. The first run (contended) failed combined for both binaries |
 | `POWDER_PROFILE_SCENE=user benchmark-profile` | exit 0, counters 0/0/0/0: frame mean 13.45 ms (pre 12.41), sand 1.99 (pre 1.62, 46 substeps against 23), gas 6.40 (pre 5.30, last gas CG 16.5 against 13.5); 1824 sand grains still moving at the end (pre 75) |
 
@@ -866,8 +1002,8 @@ p95 is about 5 ms above the pre-merge binary (still under 50 ms).
 
 ## Water leftovers pass - 2026-10-20 (uncommitted, on the sand merge)
 
-Same machine and driver (`4.3.0 Core Profile Context 26.6.2.260602`, RX 7800 XT). A performance worker and a sand
-worker ran GPU tests on the same GPU throughout, as did Unity: timings are noisy, so timing claims below are interleaved
+Same machine and driver (`4.3.0 Core Profile Context 26.6.2.260602`, RX 7800 XT). A parallel performance branch and a sand
+branch ran GPU tests on the same GPU throughout, as did Unity: timings are noisy, so timing claims below are interleaved
 A/B pairs against the pre-pass binaries (`baseline-bin`, the sand-merge build: `powder_game.exe` 192fbfd1dfdd,
 `powder_app_lifecycle_tests.exe` b7ad54d5d8b5). Hashes (SHA256 prefix): `powder_game.exe` 16b2b4837c81,
 `powder_app_lifecycle_tests.exe` e567fcb2f10b, `powder_gpu_tests.exe` 60dad7bc93db, `powder_sand_tests.exe`
@@ -939,7 +1075,7 @@ it; the test's bound is half. Not done: a smooth particle level set for a ghost-
 
 ## Sand pass 4: packed flank angle (sleep readiness), submerged bed - 2026-10-20 (historical)
 
-GPU: AMD Radeon RX 7800 XT, shared with another worker's GPU tests (ms noisy; A/B interleaved on one binary through
+GPU: AMD Radeon RX 7800 XT, shared with another GPU job's GPU tests (ms noisy; A/B interleaved on one binary through
 `POWDER_SAND_SLEEP_TICKS`). Working-tree hashes (SHA256 prefix): `Config.hpp` c20494f7c95d, `sand_pack.comp`
 e986d9a42088 and `sand_sleep.comp` d762200005ae (unchanged), `AppLifecycleTests.cpp` 6491b0ede3ac, `powder_game.exe`
 3bd3880cbb38, `powder_app_lifecycle_tests.exe` 1e9f9dffba6c. Design: PLAN, Sand (Sleeping sand).
@@ -978,12 +1114,12 @@ e986d9a42088 and `sand_sleep.comp` d762200005ae (unchanged), `AppLifecycleTests.
 |---|---|
 | `ctest --test-dir build-sand -C Release --output-on-failure -j 1` | 82/82 passed (184.8 s; new app-sand-sleep-submerged; updated app-sand-sleep-bias eight seeds with a 2-degree mean flank gate, 30-35 degrees and a 3.5-cell collapse gate, app-sand-sleep-no-flicker 420 settle ticks, config-parsing default 60) |
 | `POWDER_REPLAY=sand` | exit 0, both repeats pass (frame 8.28/15.8 and 8.28/14.2 ms, sand pass 3.43 and 3.42) |
-| `POWDER_REPLAY=all` | exit 0, all six scenes pass both repeats (combined 15.5/26.4 and 15.5/25.9, sand pass 2.91/2.90). Separate combined-only runs under the other worker's load failed the 45 ms worst-frame gate in 5 of 18 runs (51.9 ms on 26/23 ms water/gas spikes), 3 at the old readiness and 2 at the new |
+| `POWDER_REPLAY=all` | exit 0, all six scenes pass both repeats (combined 15.5/26.4 and 15.5/25.9, sand pass 2.91/2.90). Separate combined-only runs under the other GPU job's load failed the 45 ms worst-frame gate in 5 of 18 runs (51.9 ms on 26/23 ms water/gas spikes), 3 at the old readiness and 2 at the new |
 | `benchmark-realtime` | not run |
 
 ## Sand pass 3: packed pile support, damp clumps packing, sand pass cost - 2026-10-20 (historical)
 
-GPU: AMD Radeon RX 7800 XT, driver 26.6.2, shared with a performance worker's benchmarks and Unity (ms noisy; A/B runs
+GPU: AMD Radeon RX 7800 XT, driver 26.6.2, shared with a parallel performance branch's benchmarks and Unity (ms noisy; A/B runs
 interleaved with the d9d5fe9 binary). Working-tree hashes (SHA256 prefix): `sand_grid_update.comp` 79717a61a02f,
 `sand_pack.comp` e986d9a42088, `sand_sleep.comp` d762200005ae, `sand_particle_p2g.comp` f5cdcff90e52,
 `sand_particle_step.comp` a54f290e0878, `sand_particle_compact.comp` f1aefae96f32, `PowderApp.cpp` 524928400997,
@@ -1023,7 +1159,7 @@ interleaved with the d9d5fe9 binary). Working-tree hashes (SHA256 prefix): `sand
 
 ## Sand pass 2: repose root cause, Klar hardening, damp-sand fracture, packed drying, domain edge - 2026-10-20 (historical)
 
-GPU shared with other workers (ms noisy). Working-tree hashes (SHA256 prefix): `sand_particle_step.comp` c64181fe2100,
+GPU shared with other GPU jobs (ms noisy). Working-tree hashes (SHA256 prefix): `sand_particle_step.comp` c64181fe2100,
 `sand_pack.comp` c8656f5cd6ae, `sand_sleep.comp` 467310e91638, `sand_grid_update.comp` 4dac398bea14, `PowderApp.cpp`
 4dfd7801f3b3, `powder_game.exe` 6905253ac8c1, `powder_app_lifecycle_tests.exe` e5a21d8b08a8. Design: PLAN, Scale and
 constants and Sand.
@@ -1053,7 +1189,7 @@ constants and Sand.
 | `POWDER_REPLAY=sand` | exit 0, both repeats pass (frame avg 10.3/9.6 ms) |
 | `POWDER_REPLAY=all` | first run exit 1: combined repeat 1 worst frame 50.5 ms (water pass max 29 ms; sand pass 5.3/10.3 avg/max). Combined alone twice: one repeat failed at 63.8 ms on a 42 ms water-pass spike, the other run passed both (15.5/36.2, 15.0/25.1). Second full run exit 0, all six scenes pass both repeats (sand 8.2/14.8, combined 15.1/27.6 and 16.4/36.4) |
 | `benchmark-realtime` | not run |
-| Frames | `scratchpad/sand2-frames/before` (dry/wet columns, repose) and `after` (same plus bias_moving/packed, silo_*), sheet_*.png |
+| Frames | `sand2-frames/before` (dry/wet columns, repose) and `after` (same plus bias_moving/packed, silo_*), sheet_*.png (not retained) |
 
 ## Feel and defaults pass - 2026-10-20 (historical)
 
@@ -1112,7 +1248,7 @@ dae8fc610328, `powder_game.exe` f942a0fb25c2, `powder_app_lifecycle_tests.exe` 2
 
 PLAN, Water, "Calm water (packing)". Hashes (SHA256 prefix): `water_pack.comp` d0c1a7fb93de,
 `water_sleep.comp` 470c8dc2d151, `water_mac_build.comp` fe1ebd0a7844,
-`water_divergence.comp` 79295d09bd23; RX 7800 XT shared with Unity and other workers, so ms are noisy (the fixed gas
+`water_divergence.comp` 79295d09bd23; RX 7800 XT shared with Unity and other GPU jobs, so ms are noisy (the fixed gas
 pass, normally 0.4-0.6 ms, read 1.1-3.1 ms in the same runs).
 
 - Evidence that set the rules: with exactly the rest count required, settled water packs under a third of its cells
@@ -1138,7 +1274,7 @@ pass, normally 0.4-0.6 ms, read 1.1-3.1 ms in the same runs).
 | `POWDER_REPLAY=all` | **exit 1**: water, gas, sand pass both repeats; combined fails its 33.34 ms frame gate at 47 ms (gas pass 15 ms under load); combined alone with packing off also fails, 58 ms, and 37-68 ms with it on. `app-replay-boundary`/`-leakage` pass in ctest |
 | `benchmark-water-fill` (manual, placed pool, 300 settle ticks) | packing on **exit 1** at 17.2 ms mean (p95 25.3); packing off exit 0 at 14.5 ms, same load window; earlier quieter runs 8.4 ms on, 7.6-9.5 ms off |
 | `benchmark-interactive` 60 Hz | exit 0: sweep 21.9 FPS mean (2.1M particles moving + packed; 30.7-34.6 under lighter load earlier) |
-| Frames | `scratchpad/water-pack-frames/{packed,moving}/water-fill-settled.ppm`: mean abs difference 0.046/255, 0.1% of bytes differ by more than 8 |
+| Frames | `water-pack-frames/{packed,moving}/water-fill-settled.ppm` (not retained): mean abs difference 0.046/255, 0.1% of bytes differ by more than 8 |
 
 ## Sand rheology: volume correction, mu(I), wet sand, sweep rounding - 2026-10-20 (historical)
 
@@ -1164,7 +1300,7 @@ GPU shared with Unity (ms noisy). Hashes (SHA256 prefix): `sand_particle_step.co
 | `ctest ... -j 1` | 73/73 passed (new: sand-rheology, sand-wall-rounding, app-sand-silo, app-sand-wet) |
 | `POWDER_REPLAY=sand` | exit 0 (both repeats pass) |
 | `POWDER_REPLAY=all` | **exit 1**: water, gas, sand, boundary, leakage pass; combined fails its frame gate. The baseline binary, run alternately under the same load, also fails it (frame avg 37/47 ms vs 43/57 ms here; sand pass 6.4/7.9 vs 7.4/9.5 ms) |
-| Frames | `scratchpad/sand-frames/before` and `after` (benchmark-feel sandpour, sandwater; after also silo_*, dry_*, wet_*, wet_packed_* via `POWDER_SAND_FRAMES`) |
+| Frames | `sand-frames/before` and `after` (benchmark-feel sandpour, sandwater; after also silo_*, dry_*, wet_*, wet_packed_* via `POWDER_SAND_FRAMES`; not retained) |
 
 ## Fire/gas merge integration - 2026-10-20 (historical)
 
@@ -1215,7 +1351,7 @@ after the sweep, and the bed packs during the fill.
 
 ## Unlimited matter, sand part (pools, live-count sand, sleep-packing) - 2026-10-20 (historical, INCOMPLETE)
 
-GPU shared with Unity and other workers. Pools: water 2,097,152 and sand 1,048,576 records (block-size check at
+GPU shared with Unity and other GPU jobs. Pools: water 2,097,152 and sand 1,048,576 records (block-size check at
 startup). Sand P2G/step dispatch the live count, sand grid clears/updates cover the live box joined with last tick's,
 and settled sand packs into per-cell counts (PLAN, Sleeping sand). Water passes still dispatch the whole (now 8x) pool:
 water's live-count dispatch is the water-performance slot's work.
@@ -1233,7 +1369,7 @@ water's live-count dispatch is the water-performance slot's work.
 - `app-sand-sleep-no-flicker`: 6410 grains, 0 moving at the start and over 300 quiet ticks.
 - `app-sand-sleep-water`: a spout wakes up to 1644 of 6410 packed grains; 6x60 cells of still water spreading to the
   pile wakes 2.
-- Frames (scratchpad `unlimited/fill-*.png`, from `POWDER_FRAME_DIR`): a 93%-packed bed looks like the moving bed
+- Frames (not retained, `unlimited/fill-*.png`, from `POWDER_FRAME_DIR`): a 93%-packed bed looks like the moving bed
   (uniform fill, no seams). A side-by-side all-moving vs all-packed frame was not made.
 
 | Check | Result |
@@ -1289,7 +1425,7 @@ density), so 8 stays. The 60 FPS / < 14 ms GPU target is NOT met: the pressure s
 
 The gas projection is now a flexible MGPCG (see PLAN); one transport substep per tick (CFL 8); dense sand is
 porous to the gas pressure (kSandLeak); smoke is lighter-buoyant (10) and visible as a grey haze. GPU shared
-with another worker and a Unity editor: A/B pairs ran back to back, previous commit (A) then this tree (B).
+with another GPU job and a Unity editor: A/B pairs ran back to back, previous commit (A) then this tree (B).
 
 - `benchmark-realtime` combined, last-tick gas pass: A 24.8 / B 16.9 ms (pair 1, both loaded), A 53.5 /
   B 27.1 ms (pair 2, heavily loaded); after the restriction gather fix B alone on a calm GPU (idle 3.41 ms)
@@ -1310,7 +1446,7 @@ with another worker and a Unity editor: A/B pairs ran back to back, previous com
 Real-scale gas (cap 3 m/s, buoyancy, vorticity confinement, combustion expansion, open top), ambient
 oxygen, burn-out, a seven-level red-black multigrid with warm start, max-not-add stamps that inherit
 cursor velocity, blackbody flame colour and flame-only light (mips 1-4). Measured on the RX 7800 XT
-shared with another GPU worker and a Unity editor, so times are noisy.
+shared with another GPU job and a Unity editor, so times are noisy.
 
 - `ctest -C Release -j 1`: 60/60 pass, including the new `app-fire-dynamics` (held fire rises
   139 cells above its source within 0.5 s of release, reaction 346 -> 1.2 one second after release,
@@ -1331,7 +1467,7 @@ shared with another GPU worker and a Unity editor, so times are noisy.
   likely fix.
 - Not done: steam and water/sand coupling changes, wood and oil, stroke smoothing (Catmull-Rom),
   heat shimmer, flame particles and embers, the gas face R16F residual review. Smoke is nearly
-  invisible against the dark cave in lit frames. Frames: scratchpad `fire-frames/before` and
+  invisible against the dark cave in lit frames. Frames (not retained): `fire-frames/before` and
   `fire-frames/after`.
 
 ## Realism pass (scale, water and sand feel) - 2026-10-20 (historical, INCOMPLETE)
@@ -1370,7 +1506,7 @@ advection move; `app-sand-substeps` 23 wave substeps and cap budget 40; `app-san
 8 ticks (the block reached the floor in 30); `app-sand-repose` settles 800 ticks; `app-water-free-slip`
 uses the old gravity to isolate wall friction; `app-water-free-fall` stops before impact.
 
-Frames: scratchpad `realism/before`, `realism/after1` (pour iteration) and `realism/after`
+Frames (not retained): `realism/before`, `realism/after1` (pour iteration) and `realism/after`
 (`sheet_<scene>.png` contact sheets). Not done: Klar hardening/volume correction, mu(I), wet-sand
 cohesion and its render, splash/leveling/cone/cohesion/arc regression tests, benchmark-realtime.
 
@@ -1380,8 +1516,8 @@ Same machine and driver (RX 7800 XT, `26.6.2.260602`), VirtualBox VMs using abou
 CPU cores throughout. The block-Jacobi preconditioner is replaced by a multigrid V-cycle
 (MGPCG, PLAN Water). Final tree: `pressure_mg.comp` 9a60f8c8, `pressure_cg.comp` 87eb847a,
 `PowderApp.cpp` 5094a49c, `powder_app_lifecycle_tests.exe` 6a6f6c90 (sha256 prefixes). The
-"before" binary is the previous solver rebuilt in a scratch tree with the same benchmark
-code. Raw logs stayed in the session scratch directory, not `build/goal-baseline/`.
+"before" binary is the previous solver rebuilt in a separate tree with the same benchmark
+code. Raw logs were not retained and are not in `build/goal-baseline/`.
 
 | Check | Result |
 | --- | --- |
@@ -1436,8 +1572,8 @@ detail run accept through `POWDER_BENCH_PRESSURE_SNAPSHOT`.
 ## Live-frame performance pass - 2026-10-19 (historical)
 
 Same machine and driver as below (RX 7800 XT, `26.6.2.260602`, 240 Hz display),
-VirtualBox VMs running, uncommitted tree on `3f7055d`. Raw logs stayed in the session
-scratch directory, not `build/goal-baseline/`. Changes: `FixedStepClock` (at most two
+VirtualBox VMs running, uncommitted tree on `3f7055d`. Raw logs were not retained and are not in
+`build/goal-baseline/`. Changes: `FixedStepClock` (at most two
 ticks per frame, one after an overrun, backlog dropped), adaptive vsync, the
 tile-restricted three-dispatch water CG with one confirming readback per solve (PLAN,
 Water and Scheduling), and the `benchmark-interactive` profile.
@@ -1710,7 +1846,7 @@ neither wall nor displace water.
 
 ## Earlier verification status - 2026-10-02
 
-The user requested Computer Use after completing the stabilization goal with an
+Desktop automation was requested after completing the stabilization goal with an
 interactive-check waiver. Native testing exposed short key taps and mouse clicks
 being lost between polling and simulation ticks. Brush/view selection and Escape
 now use press callbacks; GLFW sticky mouse mode preserves brief clicks until a
@@ -1872,7 +2008,7 @@ standalone packaging. Evidence: `preconditioner-integration-{build,ctest}.log`.
 Its source/binaries/shaders/hashes are preserved in `preconditioner-checkpoint/`.
 The final 44-case run also covers subsequent pressure/coupling changes. Windows was
 locked when interactive checks were attempted; no input was sent to the lock screen.
-The user subsequently waived those checks. The later Computer Use follow-up and
+The maintainer subsequently waived those checks. The later desktop-automation follow-up and
 remaining limits are recorded in the current status above.
 
 Release build and all 25 then-registered CTest cases passed in 7.82 seconds, including
@@ -1938,140 +2074,7 @@ sampling (`render-modes-{red,green}.log`); interactive controls were unverified 
 that checkpoint. The later native observations and their limits are recorded above.
 `ROADMAP.md` records the current integration handoff.
 
-## Configure
-
-Windows with a Visual Studio Developer PowerShell:
-
-```powershell
-cmake -S . -B build-msvc -A x64
-```
-
-If `cmake` is not on PATH, use the installed Visual Studio bundled CMake:
-
-```powershell
-& 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe' -S . -B build-msvc -A x64
-```
-
-Linux:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-```
-
-## Build
-
-Windows:
-
-```powershell
-cmake -E env PYTHONUTF8=1 cmake --build build-msvc --config Release --parallel 8
-ctest --test-dir build-msvc -C Release --output-on-failure -j 1
-```
-
-With Visual Studio bundled CMake:
-
-```powershell
-$cmake = 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe'
-& $cmake -E env PYTHONUTF8=1 $cmake --build build-msvc --config Release --parallel 8
-& (Join-Path (Split-Path $cmake) 'ctest.exe') --test-dir build-msvc -C Release --output-on-failure -j 1
-```
-
-Linux:
-
-```bash
-cmake --build build --target powder_game -j
-```
-
-## Run Interactive App
-
-Windows:
-
-```powershell
-.\build-msvc\Release\powder_game.exe
-```
-
-If the generator places the executable directly under `build-msvc`, use:
-
-```powershell
-.\build-msvc\powder_game.exe
-```
-
-Linux:
-
-```bash
-./build/powder_game
-```
-
-Controls are in README. The interactive window draws the HUD (help panel toggled
-with `H`, material slots, brush ring and lantern) and letterboxes the square simulation; replays
-set `POWDER_REPLAY`, run hidden and never draw it.
-
-## Run Acceptance Replay
-
-Replay mode compiles all runtime shaders, runs scripted scenes, reads validation aggregates, and returns nonzero on failure.
-Each requested scene runs twice by default and compares tolerance-based deterministic signatures.
-
-Run every scene:
-
-```powershell
-$env:POWDER_REPLAY = "all"
-.\build-msvc\Release\powder_game.exe
-Remove-Item Env:\POWDER_REPLAY
-```
-
-Run one scene:
-
-```powershell
-$env:POWDER_REPLAY = "boundary"
-.\build-msvc\Release\powder_game.exe
-Remove-Item Env:\POWDER_REPLAY
-```
-
-Available scenes:
-
-- `water`
-- `gas`
-- `sand`
-- `boundary`
-- `leakage`
-- `combined`
-
-Useful replay/config overrides:
-
-- `POWDER_REPLAY_REPEAT`: replay repetitions per scene, default `2`.
-- `POWDER_REPLAY_DETERMINISM_REL_TOL`: relative signature tolerance, default `0.15`.
-- `POWDER_REPLAY_DETERMINISM_ABS_TOL`: absolute signature tolerance, default `0.05`.
-- `POWDER_FIXED_DT`: fixed simulation timestep.
-- `POWDER_WATER_PRESSURE_ITERATIONS`, `POWDER_WATER_PRESSURE_RESIDUAL`
-- `POWDER_WATER_MAX_VELOCITY` (clamp, counted in `water_velocity_clamped`), `POWDER_WATER_MAX_SUBSTEPS`, `POWDER_WATER_DENSITY_RATE` (`0` disables density control)
-- `POWDER_GAS_PRESSURE_ITERATIONS`, `POWDER_GAS_PRESSURE_RESIDUAL`
-- `POWDER_GAS_COMBUSTION_RATE`, `POWDER_GAS_WATER_COOLING`, `POWDER_GAS_BUOYANCY_TEMPERATURE`, `POWDER_GAS_BUOYANCY_SMOKE`
-- `POWDER_SAND_DRAG`, `POWDER_SAND_MAX_VELOCITY`, `POWDER_SAND_FRICTION`
-- `POWDER_SAND_REFERENCE_DENSITY`, `POWDER_SAND_SHEAR_MODULUS`, `POWDER_SAND_LAME_LAMBDA`
-- `POWDER_SAND_FRICTION_ALPHA`, `POWDER_SAND_CFL`, `POWDER_SAND_MAX_SUBSTEPS`
-- `POWDER_COMBINED_TARGET_FRAME_MS`, `POWDER_COMBINED_WORST_FRAME_MS`
-
-## Expected Replay Checks
-
-Replay fails if:
-
-- any accumulated debug counter is nonzero:
-  - `nan_inf_detected`
-  - `particle_overflow_blocked`
-  - `pressure_nonconverged`
-  - reserved counter index 3 (the former `inactive_tile_misses` counter; no longer
-    evidence of coupling coverage after removal of tile scheduling)
-- timing queries return invalid values
-- replay deterministic signatures drift beyond configured tolerance
-- water source growth is not monotonic in the source window
-- water replay finishes with zero live particles, unexpected count/mass changes,
-  or exceeds the configured water particle cap
-- gas never ignites or suppression does not extinguish within the fixed window
-- sand mass drifts by more than `0.5%`
-- boundary/leakage water never reaches its obstacle or crosses the blocker
-- combined scene has missing water/sand or inactive gas, violates source-free mass
-  conservation, or exceeds the configured GPU-time budget
-
-## Water Solver Review Pass
+## Water Solver Review Pass (historical)
 
 Density control, free-slip walls, near-wall density, speed-driven substeps and the
 `water_velocity_clamped` counter, measured on the RX 7800 XT (driver 26.6.2.260602) with
@@ -2101,4 +2104,4 @@ tolerance (deferred to the performance pass).
 
 ## Environment Note
 
-During the Milestone A audit, `cmake` was not available on PATH in the shell. If that happens, open a Visual Studio Developer PowerShell or add the installed CMake directory to PATH before running the commands above.
+If `cmake` is not on PATH in the shell, open a Visual Studio Developer PowerShell or add the installed CMake directory to PATH before running the commands at the top of this file.

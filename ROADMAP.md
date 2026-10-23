@@ -1,9 +1,39 @@
-# Powder Game Completion Roadmap
+# Handoff and history
 
-## Current handoff - v0.6.0, 2026-10-21
+## Current handoff - v0.7.0, 2026-10-23
 
 This section is the current handoff. Everything below it is history, kept as written;
 where an older section says "current", read it as the state on the date in its title.
+
+State: branch `release/v0.7.0`, with the integration in commit `12c1343`. Test counts, timings, hashes and exit codes are in VALIDATION, "Current
+status"; this file does not repeat them. The algorithms are documented pass by pass in
+`docs/ALGORITHMS.md`.
+
+What v0.7.0 adds over v0.6.0 (design in PLAN):
+
+- Water: a ghost-fluid free surface on a smoothed level set, and a conjugate-gradient
+  restart that the GPU arms from the true residual.
+- Gas: one pressure solve spread over a pair of ticks.
+- Sand: hole collapse, per-grain damp bonds, slow-creep hardening with stochastic
+  rounding, and a spawn budget on the sand pool.
+- Sparks and embers are GPU particles.
+- The benchmarks no longer see the real mouse cursor over their window.
+
+Open items:
+
+1. Native interactive checks: live mouse painting and fast strokes, the H key and help
+   timeout, HiDPI and DPI transitions, temporal flicker, and how the gas and sparks look
+   in a real window.
+2. Other GPUs and drivers. Everything was measured on one machine.
+3. The Linux and MinGW builds have not been run locally. Check the hosted CI, and the
+   draft release's ZIPs and `SHA256SUMS.txt`, before publishing.
+4. `app-sand-sleep-bias` passes its centroid gate with little margin.
+5. `app-oil-air` and `app-gas-water` move when the multigrid preconditioner changes. They
+   pass now, but re-run them after any change to it.
+
+## Handoff - v0.6.0, 2026-10-21 (historical)
+
+State and results below are as of v0.6.0. They are superseded by the v0.7.0 handoff above.
 
 State: `main` at `c4efd24` (v0.5.0) plus the working tree that is to be committed and
 tagged `v0.6.0`. Measured results, hashes and exit codes are in VALIDATION, "Current
@@ -176,8 +206,8 @@ Open items:
    scales and in a narrow-margin window. `docs/screenshot.png` still shows the cozy look.
 5. Sand pass leftovers. The gas pressure solve sits near its 0.015 gate beside small sand
    obstacles on the floor (the `combined` replay hit 0.0157 at every sand threshold below
-   0.6 before the shipped ones; 1 of 10 sand-brush offsets still does): the gas worker
-   should look at wedge geometry. The water solver has no particle density constraint, so
+   0.6 before the shipped ones; 1 of 10 sand-brush offsets still does): the gas solver
+   needs a look at wedge geometry. The water solver has no particle density constraint, so
    water moved by escape or drag stays displaced. Only the surface of a dense sand body is
    dragged and buoyed. The domain-wall half-cell (sand particles stop 0.5 cell inside the
    domain while painted walls stop at the face) was left: fixing it needs the grid wall
@@ -185,14 +215,13 @@ Open items:
 
 ## Completed goal and native follow-up - 2026-10-02
 
-This execution record supersedes the historical status claims below. Ponytail full
-mode applies throughout. Existing changes on `main` are the starting source;
+This execution record supersedes the historical status claims below. Existing changes on `main` are the starting source;
 `build/goal-baseline/` preserves that source and its SHA-256 inventory. No commits,
 branches, dependency upgrades, or publication are part of this goal.
 
-The user explicitly instructed "Proceed without it" after the desktop lock blocked
-native interactive verification. The original goal was completed under that waiver.
-The subsequent "do computer use" request verified native behavior and exposed missed
+Native interactive verification was waived by the maintainer ("Proceed without it") after
+the desktop lock blocked it. The original goal was completed under that waiver.
+The subsequent desktop-automation pass verified native behavior and exposed missed
 brief input, now fixed. Current correctness checks pass, but four fresh benchmark
 runs narrowly miss the unchanged 30 FPS mean target. The current handoff below
 records this open performance finding and the remaining native-check limits.
@@ -220,7 +249,7 @@ records this open performance finding and the remaining native-check limits.
   finding: four current-build runs reach 29.71-29.83 FPS against the 30 FPS gate.
 - [x] Verify reset isolation, particle capacity, sustained scripted combined runs,
   and standalone-package shader selection with native GPU tests.
-- [x] Subsequent Computer Use: brief input, material brushes, erasing, diagnostic
+- [x] Subsequent desktop automation: brief input, material brushes, erasing, diagnostic
   shortcuts, width resizing, pointer alignment, close and relaunch.
 - Still unverified: true held-key repeat timing, DPI transitions, continuous drag
   coverage between samples and sustained native stress at the benchmark load.
@@ -258,7 +287,7 @@ recorded even when their fixture or metric is corrected.
   review and inspect the final diff against the preserved starting source.
 
 Algorithm review and corrections run alongside Phase 1 where needed for correctness
-or performance, using the user's permission to reorder the work. Final algorithm
+or performance, with the maintainer's permission to reorder the work. Final algorithm
 acceptance requires re-running the gates on the complete implementation.
 No finite test set proves absence of every possible bug;
 completion means the full reviewed scope and the non-waived acceptance gates pass.
@@ -344,7 +373,7 @@ completion means the full reviewed scope and the non-waived acceptance gates pas
 
 Still on the original dirty `main` at `4030c32`; no branches, commits or published
 package changes. The source snapshot and compiled original baseline are preserved.
-Computer Use exposed missed brief input. `src/PowderApp.cpp` now handles brush/view
+Desktop automation exposed missed brief input. `src/PowderApp.cpp` now handles brush/view
 selection and Escape in the existing press callback, and installs GLFW sticky
 mouse mode so a click survives until the next simulation tick. The focused
 regression in `tests/AppLifecycleTests.cpp` fails before the fix (exit 1, brush key
@@ -411,7 +440,7 @@ with identical aggregate signatures and no debug failures (`water-cg-replay.log`
 These results cover the pressure, gas decay, particle collision, timestep and replay
 metric corrections below. Subsequent focused checkpoints are recorded here;
 the final integration and real-time benchmark above supersede their pending status.
-The original completion used the user's native-check waiver; the later follow-up
+The original completion used the maintainer's native-check waiver; the later follow-up
 and remaining limits are recorded above.
 
 Verified corrections since the first five shader fixes:
@@ -584,7 +613,7 @@ forcing alone; the actual half-storage output checks below cover additive overfl
 
 The host review removed render-rate-dependent bracket polling in favor of native
 key PRESS/REPEAT events, retaining radius limits 1..96. Public callback fixtures
-pass; actual held-key OS interaction remains unverified under the user waiver. A real
+pass; actual held-key OS interaction remains unverified under the maintainer's waiver. A real
 relinked GPU program reproduced stale uniform locations after retirement (0
 instead of 0.5, with a GL error). The cache now belongs to the app and entries are
 erased on program deletion, preserving hot lookup caching.
@@ -677,7 +706,7 @@ Additional focused checkpoints:
   ten render modes. Upper-edge interpolation formerly attenuated a unit corner
   to 0.997559; matching clamping preserves it. Reproduction and green logs:
   `render-modes-{red,green}.log`, `dense-render-build.log`. This does not replace
-  native interactive control/DPI verification, which the user subsequently waived.
+  native interactive control/DPI verification, which the maintainer subsequently waived.
 - Replay regression tests reproduced six false passes: single-particle/count or
   mass changes, empty combined content, and water that never reaches the obstacle.
   Counts are now exact, mass comparison allows only summation roundoff, barriers
@@ -690,10 +719,10 @@ fractional time and limiting stall catch-up to four steps. Clock tests cover
 30/60/144/240 Hz and stalls; 118 native configuration/clock checks plus three
 empty-value child checks pass. Cursor mapping uses logical window dimensions.
 The original interactive visual/DPI checks were unverified at this checkpoint.
-The Computer Use helper launched the verified checkpoint but could not activate it;
+The desktop-automation helper launched the verified checkpoint but could not activate it;
 window capture showed the locked Windows desktop. No input was sent to the lock
 screen. The owned test process was stopped to avoid contaminating GPU measurements.
-The user subsequently instructed proceeding without native interactive checks.
+The maintainer subsequently waived the native interactive checks.
 
 The original goal completed with the native-check waiver. The follow-up verified
 brief native behavior and fixed input loss, but reopened the mean performance
