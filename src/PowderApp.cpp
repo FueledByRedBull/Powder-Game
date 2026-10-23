@@ -536,9 +536,9 @@ void PowderApp::CreateTextures() {
 void PowderApp::CreateBuffers() {
     const GLsizeiptr count_bytes = static_cast<GLsizeiptr>(sizeof(GLuint));
     const GLsizeiptr water_particles_bytes =
-        static_cast<GLsizeiptr>(kMaxWaterParticles * static_cast<int>(sizeof(float) * 12));
+        static_cast<GLsizeiptr>(kMaxWaterParticles) * static_cast<GLsizeiptr>(sizeof(float)) * kWaterParticleComponents;
     const GLsizeiptr sand_particles_bytes =
-        static_cast<GLsizeiptr>(kMaxSandParticles * static_cast<int>(sizeof(float) * kSandParticleComponents));
+        static_cast<GLsizeiptr>(kMaxSandParticles) * static_cast<GLsizeiptr>(sizeof(float)) * kSandParticleComponents;
     const GLsizeiptr water_count_bytes = static_cast<GLsizeiptr>(CellCount() * static_cast<int>(sizeof(GLuint)));
     const GLsizeiptr sand_grid_uint_bytes =
         static_cast<GLsizeiptr>((kGridWidth + 2) * (kGridHeight + 2) * static_cast<int>(sizeof(GLuint)));
