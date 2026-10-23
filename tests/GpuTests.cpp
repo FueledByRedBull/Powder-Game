@@ -2865,8 +2865,9 @@ int main(int argc, char** argv) {
     if (argc > 2 || (selected != "all" && std::none_of(tests.begin(), tests.end(), [&](const auto& test) {
                          return selected == test.first;
                      }))) {
-        std::cerr << "Usage: powder_gpu_tests "
-                     "[all|compile|half-storage|water-transfer|water-p2g|water-affine|water-integration|water-sand|water-wall-density|water-density-term|boundary-mask|water-wall-pressure|gas-pressure|smoke-dissipation|gas-velocity-dissipation|gas-wall-transport|coupling-time|gas-brush-blocking|fire-reaction|particle-capacity|pressure-invalid]\n";
+        std::cerr << "Usage: powder_gpu_tests [all";
+        for (const auto& test : tests) std::cerr << '|' << test.first;
+        std::cerr << "]\n";
         return 2;
     }
 
