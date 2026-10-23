@@ -3814,7 +3814,13 @@ int PowderApp::RunReplay() {
         }
     }
 
-    return ran_scene ? 0 : 1;
+    if (!ran_scene) {
+        std::cerr << "Unknown POWDER_REPLAY scene: " << requested_scene << " (valid: all";
+        for (const ReplayScene& scene : scenes) std::cerr << ", " << scene.name;
+        std::cerr << ")\n";
+        return 1;
+    }
+    return 0;
 }
 
 void PowderApp::ApplyReplayBrush(const ReplayBrushEvent& event) {
