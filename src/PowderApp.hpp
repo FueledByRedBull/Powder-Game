@@ -539,7 +539,11 @@ private:
     GLuint hud_font_texture_ = 0;
 
     GLuint fullscreen_vao_ = 0;
-    std::array<GLuint, kReplayQueryCount> timing_queries_{};
+    // Two sets of pass queries: replays and tests use set 0; the interactive F10 view alternates them so it
+    // can read one a frame later without waiting on the GPU or restarting a query it has not read.
+    std::array<GLuint, 2 * kReplayQueryCount> timing_queries_{};
+    std::array<bool, 2> timing_set_pending_{};
+    std::size_t timing_set_ = 0;
     std::array<GLuint, 2> replay_frame_queries_{};
     std::array<float, kReplayQueryCount> pass_timings_ms_{};
     std::array<ReplayTimingAggregate, kReplayQueryCount> replay_timing_aggregates_{};
@@ -628,8 +632,8 @@ private:
     void AccumulateReplayDebugCounters();
     void BeginTimedPass(TimedPass pass);
     void EndTimedPass(TimedPass pass);
-    void ReadBackTimingQueries();
     void ReadBackTimingQueries(bool accumulate);
+    void ReadBackInteractiveTimings();
     bool ReplayMetricsOk() const;
     std::array<GLuint, 5> ReadDebugCounters() const;
     ParticleMetrics ReadParticleMetrics(GLuint buffer, int capacity, int components) const;

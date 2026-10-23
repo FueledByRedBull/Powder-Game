@@ -140,8 +140,11 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
     const int steps = clock.Advance(elapsed, config_.fixed_dt);
     // Ticks end in blocking readbacks, so their wall time tracks their GPU cost.
     const double tick_start = glfwGetTime();
+    const bool show_timings = render_mode_ == RenderMode::DebugCounters;
+    if (show_timings && steps > 0) timing_set_ ^= 1U;
     for (int step = 0; step < steps; ++step) RunFrame(config_.fixed_dt, nullptr, step == 0);
     clock.MeasureTicks(glfwGetTime() - tick_start, steps);
+    if (show_timings) ReadBackInteractiveTimings();
     Render(true);
     DrawHud();
     glfwSwapBuffers(window_);
@@ -3975,23 +3978,43 @@ void PowderApp::AccumulateReplayDebugCounters() {
 }
 
 void PowderApp::BeginTimedPass(TimedPass pass) {
-    const GLuint query = timing_queries_[static_cast<std::size_t>(pass)];
+    const GLuint query = timing_queries_[timing_set_ * kReplayQueryCount + static_cast<std::size_t>(pass)];
     if (query == 0U) {
         return;
     }
+    timing_set_pending_[timing_set_] = true;
     glBeginQuery(GL_TIME_ELAPSED, query);
 }
 
 void PowderApp::EndTimedPass(TimedPass pass) {
-    const GLuint query = timing_queries_[static_cast<std::size_t>(pass)];
+    const GLuint query = timing_queries_[timing_set_ * kReplayQueryCount + static_cast<std::size_t>(pass)];
     if (query == 0U) {
         return;
     }
     glEndQuery(GL_TIME_ELAPSED);
 }
 
-void PowderApp::ReadBackTimingQueries() {
-    ReadBackTimingQueries(false);
+// Reads the set written before the current one, and only once the GPU has finished all of it, so the F10
+// bars never stall the frame; until then they keep their last values.
+void PowderApp::ReadBackInteractiveTimings() {
+    const std::size_t set = timing_set_ ^ 1U;
+    if (!timing_set_pending_[set]) {
+        return;
+    }
+    const GLuint* queries = &timing_queries_[set * kReplayQueryCount];
+    for (int i = 0; i < kReplayQueryCount; ++i) {
+        GLint available = GL_FALSE;
+        glGetQueryObjectiv(queries[i], GL_QUERY_RESULT_AVAILABLE, &available);
+        if (available == GL_FALSE) {
+            return;
+        }
+    }
+    for (int i = 0; i < kReplayQueryCount; ++i) {
+        GLuint64 elapsed_ns = 0;
+        glGetQueryObjectui64v(queries[i], GL_QUERY_RESULT, &elapsed_ns);
+        pass_timings_ms_[static_cast<std::size_t>(i)] = static_cast<float>(elapsed_ns) / 1000000.0F;
+    }
+    timing_set_pending_[set] = false;
 }
 
 void PowderApp::ReadBackTimingQueries(bool accumulate) {
@@ -4000,7 +4023,7 @@ void PowderApp::ReadBackTimingQueries(bool accumulate) {
     }
 
     bool timings_valid = true;
-    for (std::size_t i = 0; i < timing_queries_.size(); ++i) {
+    for (std::size_t i = 0; i < kReplayQueryCount; ++i) {
         if (timing_queries_[i] == 0U) {
             pass_timings_ms_[i] = -1.0F;
             timings_valid = false;
