@@ -73,26 +73,7 @@ jobs:
 
           Copy-Item $exe.FullName (Join-Path $outDir "powder_game.exe") -Force
 
-          $readme = @(
-            "Powder Game (Windows 11 x64)",
-            "",
-            "Run:",
-            "- Double-click powder_game.exe",
-            "",
-            "Controls:",
-            "- 1: Sand, 2: Water, 3: Solid, 4: Erase",
-            "- 5: Smoke, 6: Fire, 7: Wood, 8: Oil",
-            "- [ / ]: Decrease / increase brush radius (1 to 96)",
-            "- Left mouse: paint",
-            "- H: show / hide the on-screen help",
-            "- F1: normal view; F2-F10: debug views",
-            "- Esc: quit",
-            "",
-            "Notes:",
-            "- powder_game.exe is self-contained (shaders built in, static runtime); run it from any folder.",
-            "- Requires OpenGL 4.3 and the resource limits listed in the source README."
-          )
-          $readme | Set-Content -Path (Join-Path $outDir "README.txt")
+          Copy-Item packaging/README.txt (Join-Path $outDir "README.txt")
 
           New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
           Compress-Archive -Path "$outDir/*" -DestinationPath "dist/win11/PowderGame-win11-x64.zip" -Force
