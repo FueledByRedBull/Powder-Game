@@ -2588,8 +2588,10 @@ void PowderApp::RunWaterProjection() {
     // cap. Each pass queues that restart (a no-op unless the solve has just stopped), copies the state behind a fence and,
     // once a pass has found the solve running, keeps the GPU busy with 1, then 2, then up to 4 more iterations while the
     // CPU waits for the fence (they launch nothing once the solve has stopped).
+        if (waited == GL_WAIT_FAILED) throw std::runtime_error("Waiting for the water pressure solve failed.");
     for (int ahead = 0; dispatched < cap;) {
         if (dispatched > 0) start(true);  // a solve that never iterated has formed its true residual already
+        if (copied == nullptr) throw std::runtime_error("Mapping the water pressure state failed.");
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
         glBindBuffer(GL_COPY_READ_BUFFER, water_state_.pressure_scalars);
         glBindBuffer(GL_COPY_WRITE_BUFFER, water_state_.pressure_state);
