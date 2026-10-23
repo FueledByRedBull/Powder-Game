@@ -19,8 +19,8 @@ layout(std430, binding = 1) buffer SandCellTally {
     uint tally[];
 };
 
-// Per cell: sums of the ready grains' volume ratio J = det F, hardening fraction (state1.x's) and moisture, times 4096
-// (.w spare).
+// Per cell: sums of the ready grains' volume ratio J = det F, hardening fraction (state1.x's), moisture and bond
+// exp(-q / cohesionSoftening) (the share of the capillary cohesion each grain still holds), times 4096.
 layout(std430, binding = 2) buffer SandCellFSum {
     int fsum[];
 };
@@ -29,6 +29,8 @@ uniform ivec2 gridSize;
 uniform int maxParticles;
 uniform float sleepSpeed;
 uniform int sleepTicks;
+// sand_particle_step.comp's cohesionSoftening: plastic strain over which a grain's liquid bridges decay by e.
+uniform float cohesionSoftening;
 
 bool invalid(vec2 value) {
     return any(isnan(value)) || any(isinf(value));
@@ -63,9 +65,13 @@ void main() {
     atomicAdd(tally[cellIndex], ready ? 4097u : 1u);
     if (ready) {
         // Woken grains restart isotropic at the mean J (sand_pack.comp), so J is all of F a packed cell keeps; the
-        // hardening and moisture fractions come back with them (sand_particle_step.comp's record layout).
-        vec3 kept = vec3(volume, fract(particle.state1.x), particle.state2.w - floor(particle.state2.w));
-        for (int k = 0; k < 3; ++k) {
+        // hardening and moisture fractions come back with them (sand_particle_step.comp's record layout). The bond
+        // (the mean of exp(-q / softening), not the exponential of the mean q) tells a mixed cell's intact grains from
+        // its cracked ones.
+        float hardened = fract(particle.state1.x);
+        float bond = exp(-4.0 * hardened / max(1.0 - hardened, 1e-4) / cohesionSoftening);
+        vec4 kept = vec4(volume, hardened, particle.state2.w - floor(particle.state2.w), bond);
+        for (int k = 0; k < 4; ++k) {
             atomicAdd(fsum[4 * cellIndex + k], int(round(kept[k] * 4096.0)));
         }
     }

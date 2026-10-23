@@ -56,6 +56,7 @@ struct SandFixture {
     float cohesion = 0.0F, cohesion_softening = 0.5F, friction_rate_gain = 0.0F;
     float gravity = 0.0F, wall_friction = 0.0F;
     float drag = 0.0F, buoyancy = 0.0F, water_full_volume = 1.0F;
+    GLuint round_seed = 0;  // the step's stochastic rounding of the hardening fraction
 
     GLuint Texture(GLenum format, GLenum external, float value = 0.0F, int width = kSize, int height = kSize) {
         GLuint texture = 0;
@@ -226,6 +227,7 @@ struct SandFixture {
         glUniform1f(glGetUniformLocation(step, "cohesionSoftening"), cohesion_softening);
         glUniform1f(glGetUniformLocation(step, "maxDilation"), 0.15F);  // a round cap for the rheology checks
         glUniform1f(glGetUniformLocation(step, "waterFullVolume"), water_full_volume);
+        glUniform1ui(glGetUniformLocation(step, "roundSeed"), round_seed);
         Image(0, sdf, GL_READ_ONLY, GL_R16F);
         Image(1, velocity, GL_READ_ONLY, GL_RG32F);
         Image(2, packed, GL_READ_ONLY, GL_R8UI);
@@ -1078,6 +1080,28 @@ void Rheology() {
     Require(failures.str().empty(), "sand rheology mismatch:" + failures.str());
 }
 
+// The hardening fraction q / (q + 4) shares state1.x with the still-tick timer (255 here, where the float step is 1.5e-5),
+// so slow creep's increments are far below the step: rounded to nearest they vanish and the grain never hardens. A grain
+// at q 4 pulled apart by 1e-5 per step (a plastic strain of 1.4e-5 each) must gain the fraction its 2000 steps add (q
+// 4.028, 1.77e-3 of fraction) on average, with the timer untouched.
+void Hardening() {
+    constexpr int steps = 2000;
+    constexpr float stretch = 1.00001F;
+    SandFixture fixture;
+    float state = 255.0F + 0.5F;
+    for (int i = 0; i < steps; ++i) {
+        fixture.round_seed = static_cast<GLuint>(i);
+        fixture.Upload({8.5F, 8.5F, 0.0F, 0.0F, state, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, stretch, 0.0F, 0.0F, stretch});
+        fixture.Step(0.0F, 1000.0F);
+        state = fixture.Read()[4];
+    }
+    const double q = 4.0 + steps * std::sqrt(2.0) * std::log(static_cast<double>(stretch));
+    const double expected = q / (q + 4.0) - 0.5, gained = state - 255.0 - 0.5;
+    std::cout << "hardening: fraction gained " << gained << " of the expected " << expected << ", timer " << std::floor(state) << '\n';
+    Require(std::floor(state) == 255.0F, "rounding the fraction must not touch the timer");
+    Require(gained > 0.75 * expected && gained < 1.25 * expected, "slow creep must harden at its rate on average");
+}
+
 // A swept contact's hit point can round a few ulps into the next cell (ulp 6e-5 at x 512-1024), which may be a wall:
 // the grain then starts its next move inside it and freezes. Grains in a one-cell wall checkerboard at x >= 600 aim
 // diagonally at a cell corner, where the two crossing times differ by rounding only; none may end inside a wall.
@@ -1137,14 +1161,14 @@ void WallRounding() {
 
 int main(int argc, char** argv) {
     const std::string selected = argc > 1 ? argv[1] : "all";
-    const std::array<std::pair<const char*, void (*)()>, 13> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 14> tests{{
         {"transfer", Transfer}, {"integration", Integration}, {"support", Support}, {"material", Material},
         {"pile", Pile}, {"collisions", Collisions}, {"coupling", Coupling}, {"thin-wall", ThinWall},
-        {"occupancy", Occupancy}, {"repair", Repair}, {"impact", Impact}, {"rheology", Rheology}, {"wall-rounding", WallRounding}}};
+        {"occupancy", Occupancy}, {"repair", Repair}, {"impact", Impact}, {"rheology", Rheology}, {"hardening", Hardening}, {"wall-rounding", WallRounding}}};
     if (argc > 2 || (selected != "all" && std::none_of(tests.begin(), tests.end(), [&](const auto& test) {
                         return selected == test.first;
                     }))) {
-        std::cerr << "Usage: powder_sand_tests [all|transfer|integration|support|material|pile|collisions|coupling|thin-wall|occupancy|repair|impact|rheology|wall-rounding]\n";
+        std::cerr << "Usage: powder_sand_tests [all|transfer|integration|support|material|pile|collisions|coupling|thin-wall|occupancy|repair|impact|rheology|hardening|wall-rounding]\n";
         return 2;
     }
     GLFWwindow* window = nullptr;

@@ -1,0 +1,156 @@
+#version 430
+
+// Sparks and embers: a fixed ring of capacity records, advanced once per simulation tick. Each tick owns the `perTick`
+// slots that follow the previous tick's, so a slot is overwritten only after the ring period (longer than any life) and
+// the spawn needs no counter: slot `first + b` takes the winner of bucket b (spark_pick.comp), or is retired if the
+// bucket is empty. The other invocations advance their spark: drag toward the gas velocity, gravity less the lift of
+// its heat, a little turbulence, then a swept move that bounces off rock and dies in sand, water, or past the top.
+// Everything is a pure function of the slot, the tick and the fields, so a run repeats exactly.
+// Record, two vec4: (x, y, vx, vy) in cells and cells/s; (age, life, drag time, seed * 2 + ember) with life 0 = dead.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Sparks {
+    vec4 sparks[];
+};
+layout(std430, binding = 1) buffer Buckets {
+    uint buckets[];
+};
+
+layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;  // gas cell centres, gas cells/s
+layout(r8ui, binding = 1) uniform readonly uimage2D boundaryTex;     // 0 open, 1 rock, 2-3 sand
+layout(r16f, binding = 2) uniform readonly image2D waterAmountTex;
+
+uniform ivec2 gridSize;
+uniform ivec2 gasSize;
+uniform uint tick;
+uniform float dt;
+uniform uint capacity;
+uniform uint perTick;
+uniform float gravity;  // cells/s^2
+
+const float kMaxSpeed = 700.0;      // cells/s, above the 600 of a gas at its cap
+const float kWaterThreshold = 0.03;  // composite.frag draws water from about this amount
+
+uint hash(uvec2 p, uint salt) {
+    uint h = p.x * 0x8da6b343u ^ p.y * 0xd8163841u ^ salt * 0xcb1ab31fu;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+float unit(uint h) {
+    return float(h >> 8) * (1.0 / 16777216.0);
+}
+
+// Gas velocity at a point in cells, in cells/s: bilinear between gas cell centres, a gas cell being 2x2 cells.
+vec2 gasVelocity(vec2 p) {
+    vec2 g = clamp(p * 0.5 - 0.5, vec2(0.0), vec2(gasSize) - 1.0);
+    ivec2 b = ivec2(floor(g));
+    vec2 f = g - vec2(b);
+    ivec2 hi = min(b + 1, gasSize - 1);
+    vec2 v = mix(mix(imageLoad(gasVelocityTex, b).xy, imageLoad(gasVelocityTex, ivec2(hi.x, b.y)).xy, f.x),
+                 mix(imageLoad(gasVelocityTex, ivec2(b.x, hi.y)).xy, imageLoad(gasVelocityTex, hi).xy, f.x), f.y);
+    return 2.0 * v;
+}
+
+// 0 open, 1 rock or the domain's sides and floor, 2 sand or beyond the top (a spark leaves there).
+uint cellKind(vec2 p) {
+    ivec2 c = ivec2(floor(p));
+    if (c.y >= gridSize.y) return 2u;
+    if (any(lessThan(c, ivec2(0))) || c.x >= gridSize.x) return 1u;
+    return min(imageLoad(boundaryTex, c).r, 2u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= capacity) {
+        return;
+    }
+    uint first = (tick % (capacity / perTick)) * perTick;
+    uint slot = (i + capacity - first) % capacity;
+    if (slot < perTick) {
+        // This tick's spawn: the bucket's winner, born in its gas cell. The slot held a spark of a full ring ago, dead.
+        uint key = buckets[slot];
+        buckets[slot] = 0u;
+        sparks[2u * i + 1u] = vec4(0.0);
+        if (key == 0u) {
+            return;
+        }
+        uint cell = (key & 0x3FFFFu) - 1u;
+        bool ember = ((key >> 18) & 1u) != 0u;
+        ivec2 gas = ivec2(int(cell % uint(gasSize.x)), int(cell / uint(gasSize.x)));
+        uint s = hash(uvec2(cell, tick), 0x5bd1e995u);
+        vec2 pos = (vec2(gas) + vec2(unit(s), unit(s * 0x2545f491u + 1u))) * 2.0;
+        if (cellKind(pos) != 0u) {
+            return;
+        }
+        s = hash(uvec2(cell, tick), 0x1b873593u);
+        float angle = (unit(s) - 0.5) * (ember ? 2.0 : 3.2);  // from straight up
+        float speed = ember ? 60.0 + 120.0 * unit(s * 0x2545f491u) : 10.0 + 50.0 * unit(s * 0x2545f491u);
+        float life = ember ? 0.9 + 1.2 * unit(s * 0x9e3779b1u) : 0.30 + 0.35 * unit(s * 0x9e3779b1u);
+        float drag = ember ? 0.12 + 0.14 * unit(s * 0x85ebca6bu) : 0.04 + 0.05 * unit(s * 0x85ebca6bu);
+        uint seed = (hash(uvec2(cell, tick), 0xcc9e2d51u) >> 17) & 0x7FFFu;
+        sparks[2u * i] = vec4(pos, gasVelocity(pos) + speed * vec2(sin(angle), cos(angle)));
+        sparks[2u * i + 1u] = vec4(0.0, life, drag, float(seed * 2u + (ember ? 1u : 0u)));
+        return;
+    }
+
+    vec4 state = sparks[2u * i + 1u];
+    float age = state.x + dt;
+    if (state.y <= 0.0 || age >= state.y) {
+        sparks[2u * i + 1u] = vec4(0.0);
+        return;
+    }
+    bool ember = (int(state.w) & 1) != 0;
+    vec4 motion = sparks[2u * i];
+    vec2 pos = motion.xy;
+    vec2 v = motion.zw;
+
+    // Drag toward the gas, exactly integrated for a constant acceleration: v approaches u + a tau. A hot spark is
+    // lifted (it rises in still air), a cool one falls, so the colour change shows in the path.
+    float heat = 1.0 - age / state.y;
+    uint s = hash(uvec2(i, tick), 0x68e31da4u);
+    vec2 turbulence = (vec2(unit(s), unit(s * 0x2545f491u)) - 0.5) * (ember ? 600.0 : 1800.0);
+    vec2 terminal = gasVelocity(pos) + (turbulence + vec2(0.0, -gravity * (1.0 - (ember ? 0.5 : 0.9) * heat))) * state.z;
+    v = terminal + (v - terminal) * exp(-dt / state.z);
+    float speed = length(v);
+    v *= min(1.0, kMaxSpeed / max(speed, 1e-4));
+
+    // Swept move in sub-steps of at most a cell. Rock: reflect the blocked axis and cool; sand or the top: gone.
+    float rest = ember ? 0.4 : 0.2;
+    int steps = int(clamp(ceil(max(abs(v.x), abs(v.y)) * dt), 1.0, 8.0));
+    bool dead = false;
+    for (int k = 0; k < steps && !dead; ++k) {
+        vec2 next = pos + v * (dt / float(steps));
+        uint kind = cellKind(next);
+        if (kind == 2u) {
+            dead = true;
+        } else if (kind == 1u) {
+            float impact = length(v);
+            bool blockX = cellKind(vec2(next.x, pos.y)) != 0u;
+            bool blockY = cellKind(vec2(pos.x, next.y)) != 0u;
+            if (!blockX && !blockY) blockX = blockY = true;  // a corner
+            if (blockX) {
+                v.x = -v.x * rest;
+                next.x = pos.x;
+            }
+            if (blockY) {
+                v.y = abs(v.y) < 40.0 ? 0.0 : -v.y * rest;  // settles instead of hopping
+                v.x *= 0.7;
+                next.y = pos.y;
+            }
+            age += state.y * 0.1 * clamp(impact / 150.0, 0.0, 1.0);  // a hard hit cools it
+        }
+        pos = next;
+    }
+    // A hard hit can cool a spark past its life: it dies now rather than being stored older than its life.
+    if (dead || age >= state.y || imageLoad(waterAmountTex, ivec2(pos)).x > kWaterThreshold) {
+        sparks[2u * i + 1u] = vec4(0.0);
+        return;
+    }
+    sparks[2u * i] = vec4(pos, v);
+    sparks[2u * i + 1u] = vec4(age, state.yzw);
+}

@@ -80,6 +80,12 @@ struct SimulationConfig {
     // Rate (1/s) at which a cell's density error is relaxed; higher rates also slow thin flows.
     float water_density_rate = 20.0F;
     float water_liquid_phi_threshold = 0.42F;
+    // Free surface of the pressure solve (water_particle_finalize.comp): the liquid phi is the particle density blurred
+    // over 3x3 cells, its zero contour at surface_level of the rest density. A liquid-air face conducts 1 / theta (ghost
+    // fluid, pressure_cg.comp), theta the contour position between the two cell centres, clamped below by
+    // ghost_theta_min; 0 puts the pressure zero at the air cell centre instead.
+    float water_surface_level = 0.25F;
+    float water_ghost_theta_min = 0.25F;
     int water_pressure_iterations = 1024;
     float water_pressure_residual_threshold = 0.12F;
     // Gas rates are per second and gas cells (1 cm, two simulation cells); see PLAN "Scale and constants".
@@ -118,7 +124,7 @@ struct SimulationConfig {
     // Zero pressure above the top edge: hot gas and smoke leave through the cave roof.
     bool gas_open_top = true;
     // About one half-float step of a face at the speed cap (8e-4 of the cap). The faces and right-hand side are R32F now;
-    // the gate stays tied to the speed cap (AGENTS, Physics and evidence contracts).
+    // the gate stays tied to the speed cap (PLAN, Scale and constants).
     float gas_pressure_residual_threshold = 0.25F;
     float sand_gravity = 1962.0F;
     // Retained per 1/60 s: none; dissipation comes from plasticity, wall friction and the grid transfer.
@@ -178,7 +184,8 @@ struct SimulationConfig {
     int sand_max_substeps = 64;
     // Sleep-packing: a grain slower than sand_sleep_speed (cells/s) for sand_sleep_ticks ticks is ready; a supported cell
     // whose grains are all ready becomes an integer count in the packed texture (0 ticks disables packing). A packed cell
-    // wakes when it loses support, a side opens steeper than 45 degrees, sand nearby moves faster than
+    // wakes when it loses support (three packed rows below it count, so a collapse climbs three rows a tick), a side
+    // opens steeper than 45 degrees, sand nearby moves faster than
     // sand_wake_impact_speed, moving sand presses into it faster than sand_wake_press_speed, or full water nearby flows
     // faster than sand_wake_water_speed (cells/s). Moving sand falling faster than sand_sleep_speed beside a cell counts as
     // an open side. 60 ticks (1 s) spans a period of the pile's slowest (bulk) mode: at 12 (0.2 s) a pile still relaxing
@@ -218,6 +225,8 @@ inline SimulationConfig LoadConfigFromEnvironment() {
     EnvToFloat("POWDER_WATER_DENSITY_RATE", config.water_density_rate);
     EnvToFloat("POWDER_WATER_FLIP_BLEND", config.water_flip_blend);
     EnvToFloat("POWDER_WATER_PRESSURE_RESIDUAL", config.water_pressure_residual_threshold);
+    EnvToFloat("POWDER_WATER_SURFACE_LEVEL", config.water_surface_level);
+    EnvToFloat("POWDER_WATER_GHOST_THETA_MIN", config.water_ghost_theta_min);
     EnvToInt("POWDER_WATER_PRESSURE_ITERATIONS", config.water_pressure_iterations);
     EnvToFloat("POWDER_GAS_CFL", config.gas_cfl_limit);
     EnvToInt("POWDER_GAS_MIN_SUBSTEPS", config.gas_min_substeps);
@@ -312,6 +321,8 @@ inline SimulationConfig LoadConfigFromEnvironment() {
     require(config.sand_wake_impact_speed > 0.0F, "POWDER_SAND_WAKE_IMPACT_SPEED");
     require(config.sand_wake_press_speed > 0.0F, "POWDER_SAND_WAKE_PRESS_SPEED");
     require(config.sand_wake_water_speed > 0.0F, "POWDER_SAND_WAKE_WATER_SPEED");
+    require(config.water_surface_level >= 0.0F && config.water_surface_level <= 1.0F, "POWDER_WATER_SURFACE_LEVEL");
+    require(config.water_ghost_theta_min >= 0.0F && config.water_ghost_theta_min <= 1.0F, "POWDER_WATER_GHOST_THETA_MIN");
     require(config.water_sleep_speed >= 0.0F, "POWDER_WATER_SLEEP_SPEED");
     // The particle still-tick timer saturates at 255 (water_sleep.comp).
     require(config.water_sleep_ticks >= 0 && config.water_sleep_ticks <= 255, "POWDER_WATER_SLEEP_TICKS");

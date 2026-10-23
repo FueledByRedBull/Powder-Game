@@ -18,11 +18,15 @@ layout(std430, binding = 2) buffer Scalars {
     uint running;
     uint invalidInput;
     uint iterations;
-    uint padding;
+    uint legBase;  // iterations before the current (re)start, set by pressure_cg_reduce.comp
     uvec4 liquidBounds;
     // r.z of the two most recent preconditioner applications by sum slot (the first and odd iterations fill index 1), so a
     // phase reads the previous one without a second global sum and without racing the first workgroup's write.
     float rhoBySlot[2];
+    // Phase 10: whether a restart from the true residual is due (stopped without breakdown, having iterated since the
+    // last start), and the indirect dispatch over the cells that does the work or launches nothing.
+    uint restartArmed;
+    uvec4 restartDispatch;
 };
 layout(std430, binding = 3) buffer DebugCounters {
     uint nanInfDetected;
@@ -51,17 +55,30 @@ uniform float liquidPhiThreshold;
 // sand from being a singular system.
 uniform float sandLeak;
 uniform float residualThreshold;
+// Ghost-fluid free surface: above 0, a liquid-air face conducts 1 / theta, theta the interpolated position of the phi
+// threshold between the two cell centres, clamped below by thetaMin, so the pressure is zero at the surface rather than
+// at the air cell. water_project.comp and pressure_residual.comp use the same rule; 0 is the plain Dirichlet cell.
+uniform float thetaMin;
 // 0: initial residual over the solve rectangle (pressure_cg_reduce.comp then forms the initial residual and starts
-// the solve); 8, 9: tile list. pressure_mg.comp then forms z = d = M^-1 r and phase 1 (first iteration) A*d. Each
+// the solve); 8, 9: tile list; 10: arms a restart from the true residual. pressure_mg.comp then forms z = d = M^-1 r and phase 1 (first iteration) A*d. Each
 // iteration runs 2: alpha, the stored d and the p and r update; pressure_mg.comp's z = M^-1 r; 1: the convergence test,
 // beta, the next d = z + beta*d and A*d.
 uniform int phase;
 uniform int parity;          // iteration number & 1, from the host
 uniform int firstIteration;  // 1 on the first iteration, which tests the initial preconditioned residual
+uniform int gated;           // 1 in a restart: it only acts when phase 10 found it due, so the host may queue it blind
 shared float work[768];
 shared uint chunkCounts[256];
 
 bool invalid(float value) { return isnan(value) || isinf(value); }
+
+float airConductance(float phiLiquid, float phiAir) {
+    if (thetaMin <= 0.0) return 1.0;
+    float inside = phiLiquid - liquidPhiThreshold;
+    float outside = phiAir - liquidPhiThreshold;
+    if (!(inside < 0.0 && outside > 0.0)) return 1.0;
+    return 1.0 / clamp(inside / (inside - outside), thetaMin, 1.0);
+}
 
 bool blocked(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
@@ -215,15 +232,28 @@ void initialize() {
             if (sandWall(neighbor)) diagonal += sandLeak;
             continue;
         }
-        diagonal += 1.0;
-        if (imageLoad(liquidPhiTex, neighbor).x < liquidPhiThreshold)
+        float neighbor_phi = imageLoad(liquidPhiTex, neighbor).x;
+        if (neighbor_phi < liquidPhiThreshold) {
+            diagonal += 1.0;
             neighbor_sum += imageLoad(pressureTex, neighbor).x;
+        } else {
+            diagonal += airConductance(phi, neighbor_phi);
+        }
     }
     // Reuse the previous solution, but form b-Ap using today's liquid/solid mask.
     float residual = rhs - (diagonal * pressure - neighbor_sum);
     if (diagonal == 0.0) imageStore(pressureTex, cell, vec4(0.0));
     float scaledResidual = diagonal > 0.0 ? residual / diagonal : 0.0;
     vectors[index] = vec4(residual, scaledResidual, scaledResidual, diagonal);
+}
+
+// A restart from b - Ap is due once the solve has stopped on its recursive residual after iterating (a stop at a start
+// has already formed the true residual). The restart's cell passes dispatch restartDispatch, which is empty otherwise.
+void armRestart() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+    bool due = running == 0u && invalidInput == 0u && iterations != legBase;
+    restartArmed = due ? 1u : 0u;
+    restartDispatch = uvec4(due ? (uint(solveSize.x * solveSize.y) + 255u) / 256u : 0u, 1u, 1u, 0u);
 }
 
 void main() {
@@ -239,8 +269,13 @@ void main() {
         compactTiles();
         return;
     }
+    if (phase == 10) {
+        armRestart();
+        return;
+    }
+    if (gated != 0 && restartArmed == 0u) return;
     if (running == 0u) return;
-    // Sum slots: 0 holds d.Ad, 1 + parity this iteration's r.z, 2 - parity the previous one (the first z fills slot 2).
+    // Sum slots: 0 holds d.Ad, 1 + parity this iteration's r.z, 2 - parity the previous one (the first z fills it).
     uint current = 1u + uint(parity);
     uint previous = 2u - uint(parity);
     uint tile = tiles[gl_WorkGroupID.x];
@@ -253,10 +288,10 @@ void main() {
         // beta of the next direction d = z + beta d; 0 for the first, whose d is z already.
         float ratio = 0.0;
         if (firstIteration != 0) {
-            vec3 initial = globalSum(2u);
+            vec3 initial = globalSum(previous);
             bool nonfinite = initial.z != 0.0 || invalid(initial.x) || invalid(initial.y);
             if (gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x == 0u) {
-                rho = rhoBySlot[1] = initial.x;
+                rho = rhoBySlot[previous - 1u] = initial.x;
                 residualMax = initial.y;
             }
             if (converged(initial)) {

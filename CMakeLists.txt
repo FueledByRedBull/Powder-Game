@@ -123,7 +123,7 @@ if(BUILD_TESTING)
     add_executable(powder_sand_tests tests/SandTests.cpp)
     target_compile_definitions(powder_sand_tests PRIVATE POWDER_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders")
     target_link_libraries(powder_sand_tests PRIVATE powder_gl)
-    foreach(test_case transfer integration support collisions material pile coupling thin-wall occupancy repair impact rheology wall-rounding)
+    foreach(test_case transfer integration support collisions material pile coupling thin-wall occupancy repair impact rheology hardening wall-rounding)
         add_test(NAME sand-${test_case} COMMAND powder_sand_tests ${test_case})
         set_tests_properties(sand-${test_case} PROPERTIES TIMEOUT 30)
     endforeach()
@@ -132,12 +132,18 @@ if(BUILD_TESTING)
 
     add_executable(powder_app_lifecycle_tests tests/AppLifecycleTests.cpp src/PowderApp.cpp)
     target_link_libraries(powder_app_lifecycle_tests PRIVATE powder_gl)
-    foreach(test_case brush-input hud uniform-cache upload-alignment reset erase water-force water-surface water-mass water-pool-full gas-projection gas-quenching readback-invalid render-modes lighting water-pressure water-multigrid replay-metrics boundary sand-substeps sand-water sand-repose sand-silo sand-wet sand-domain-edge sand-sleep-conservation sand-sleep-bias sand-sleep-no-flicker sand-sleep-water sand-sleep-submerged water-pack-conservation water-pack-no-flicker water-pack-wave gas-diffusion-substeps coupling-lifecycle fire-dynamics wood-fire oil-float oil-air water-wall water-calm water-sealed-cell water-sealed-pocket gas-sealed-pocket water-stream oil-burn oil-quench gas-rhs-precision steam sand-smother gas-water water-force-range water-density water-free-slip water-free-fall)
+    foreach(test_case brush-input hud uniform-cache upload-alignment reset erase water-force water-surface water-mass water-pool-full gas-projection gas-quenching readback-invalid render-modes lighting water-pressure water-multigrid replay-metrics boundary sand-substeps sand-water sand-repose sand-silo sand-wet sand-wet-mixed sand-pool-full sand-domain-edge sand-sleep-conservation sand-sleep-bias sand-sleep-no-flicker sand-sleep-water sand-sleep-submerged water-pack-conservation water-pack-no-flicker water-pack-wave gas-diffusion-substeps coupling-lifecycle fire-dynamics wood-fire sparks oil-float oil-air water-wall water-calm water-sealed-cell water-sealed-pocket gas-sealed-pocket water-stream oil-burn oil-quench gas-rhs-precision gas-split-solve steam sand-smother gas-water water-force-range water-density water-free-slip water-free-fall)
         add_test(NAME app-${test_case} COMMAND powder_app_lifecycle_tests ${test_case})
         set_tests_properties(app-${test_case} PROPERTIES TIMEOUT 30)
     endforeach()
-    set_tests_properties(app-sand-silo app-sand-wet app-sand-sleep-conservation app-sand-sleep-bias app-sand-sleep-no-flicker app-sand-sleep-water app-sand-sleep-submerged
-        app-water-pack-conservation app-water-pack-no-flicker app-water-pack-wave
+    add_test(NAME app-water-solve-schedule COMMAND powder_app_lifecycle_tests water-solve-schedule)
+    set_tests_properties(app-water-solve-schedule PROPERTIES TIMEOUT 60)
+    foreach(test_case water-still water-pour-fill water-pack-slosh water-ghost-fluid)
+        add_test(NAME app-${test_case} COMMAND powder_app_lifecycle_tests ${test_case})
+        set_tests_properties(app-${test_case} PROPERTIES TIMEOUT 120)
+    endforeach()
+    set_tests_properties(app-sand-silo app-sand-wet app-sand-wet-mixed app-sand-sleep-conservation app-sand-sleep-bias app-sand-sleep-no-flicker app-sand-sleep-water app-sand-sleep-submerged
+        app-water-pack-conservation app-water-pack-no-flicker app-water-pack-wave app-sparks
         PROPERTIES TIMEOUT 180)
     add_test(NAME app-shader-package COMMAND ${CMAKE_COMMAND}
         "-DEXECUTABLE=$<TARGET_FILE:powder_game>"

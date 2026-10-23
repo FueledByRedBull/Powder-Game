@@ -47,6 +47,22 @@ float pressureAt(ivec2 coord) {
     return imageLoad(pressureTex, coord).x;
 }
 
+// Ghost-fluid free surface (pressure_cg.comp): a face between a liquid and an air cell conducts 1 / theta, the same
+// coefficient the pressure operator used; thetaMin 0 is the plain Dirichlet cell, conductance 1.
+uniform float thetaMin;
+
+float faceConductance(ivec2 a, ivec2 b) {
+    if (thetaMin <= 0.0) return 1.0;
+    float phiA = imageLoad(liquidPhiTex, a).x;
+    float phiB = imageLoad(liquidPhiTex, b).x;
+    bool liquidA = phiA < liquidPhiThreshold, liquidB = phiB < liquidPhiThreshold;
+    if (liquidA == liquidB) return 1.0;
+    float inside = (liquidA ? phiA : phiB) - liquidPhiThreshold;
+    float outside = (liquidA ? phiB : phiA) - liquidPhiThreshold;
+    if (!(inside < 0.0 && outside > 0.0)) return 1.0;
+    return 1.0 / clamp(inside / (inside - outside), thetaMin, 1.0);
+}
+
 float checkedHalf(float value) {
     // Check the result after both forcing and pressure, before binary16 conversion.
     if (isnan(value) || isinf(value) || abs(value) > 65504.0) {
@@ -67,7 +83,7 @@ void main() {
         if (coord.x > 0 && coord.x < gridSize.x && !blocked(left_cell) && !blocked(right_cell)) {
             float p_left = pressureAt(left_cell);
             float p_right = pressureAt(right_cell);
-            face_u = imageLoad(waterUFaceSrc, coord).x - (p_right - p_left);
+            face_u = imageLoad(waterUFaceSrc, coord).x - faceConductance(left_cell, right_cell) * (p_right - p_left);
         } else if (coord.x > 0 && coord.x < gridSize.x && sandFace(left_cell, right_cell)) {
             face_u = imageLoad(waterUFaceSrc, coord).x - sandLeak * (pressureAt(right_cell) - pressureAt(left_cell));
         }
@@ -81,7 +97,7 @@ void main() {
         if (coord.y > 0 && coord.y < gridSize.y && !blocked(down_cell) && !blocked(up_cell)) {
             float p_down = pressureAt(down_cell);
             float p_up = pressureAt(up_cell);
-            face_v = imageLoad(waterVFaceSrc, coord).x + gravityDelta - (p_up - p_down);
+            face_v = imageLoad(waterVFaceSrc, coord).x + gravityDelta - faceConductance(down_cell, up_cell) * (p_up - p_down);
         } else if (coord.y > 0 && coord.y < gridSize.y && sandFace(down_cell, up_cell)) {
             face_v = imageLoad(waterVFaceSrc, coord).x - sandLeak * (pressureAt(up_cell) - pressureAt(down_cell));
         }

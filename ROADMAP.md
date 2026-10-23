@@ -26,7 +26,7 @@ Open items:
 
 1. The preferred 60 FPS combined target (about 55 FPS here) is unmet.
 2. Native interactive checks: live mouse painting and fast strokes, the H key and help
-   timeout, HiDPI and DPI transitions, temporal flicker, the 30 Hz gas look.
+   timeout, HiDPI and DPI transitions, temporal flicker, the gas look (scalars step every tick, the pressure solve spans a tick pair).
 3. Not run here: Linux and MinGW builds, other GPUs, a machine without the VC++
    redistributable, the hosted CI and release workflows. Verify the draft release's
    ZIPs and `SHA256SUMS.txt` before publishing it.

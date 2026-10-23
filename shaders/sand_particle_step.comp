@@ -329,6 +329,27 @@ float hardening(float q) {
 // state1.x is 1 + the still-tick timer (an integer, sand_sleep.comp) plus q / (q + kHardeningScale) in the fraction.
 const float kHardeningScale = 4.0;
 
+// Varies per substep (the host passes a counter), so the same grain rounds differently each time.
+uniform uint roundSeed;
+
+// timer + fraction as a float. Where the float's step is coarse (timer 16 and up: grains that have been still a while,
+// the sleep timer counts to 255, step 1.5e-5), increments below half a step would round away every substep and slow
+// creep would never harden. There the sum is rounded stochastically: the exact error of the nearest float (timer >= 1 >
+// fraction, so the subtraction is exact) as a share of the step is the chance of rounding the other way, so the
+// expectation is exact. Finer steps keep round-to-nearest: counting the increments below 6e-8 toughened the damp column
+// of sand-wet, which shed a median 0.085 of its grains over 12 perturbed runs against 0.2-0.3 the wet-sand fracture was
+// tuned with (sand-hardening covers the coarse steps).
+float roundStochastically(float timer, float fraction, vec2 position, vec2 velocity) {
+    float nearest = timer + fraction;
+    float error = fraction - (nearest - timer);
+    float step = uintBitsToFloat((floatBitsToUint(nearest) & 0x7f800000u) - (23u << 23));
+    if (step < 1e-6) return nearest;
+    uint h = floatBitsToUint(position.x) * 1664525u + floatBitsToUint(position.y) * 22695477u +
+             floatBitsToUint(velocity.x) * 2654435761u + floatBitsToUint(velocity.y) * 3266489917u + roundSeed * 2246822519u;
+    h ^= h >> 16; h *= 2146121005u; h ^= h >> 15; h *= 2221713035u; h ^= h >> 16;
+    return float(h >> 8) * (1.0 / 16777216.0) < abs(error) / step ? nearest + sign(error) * step : nearest;
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= uint(maxParticles)) {
@@ -407,9 +428,8 @@ void main() {
         plasticStrain = 0.0;
     }
     q += plasticStrain;
-    // shortcut: increments below half the fraction's step (1.5e-5 of q / (q + 4)) round away, so very slow creep does not
-    // harden; store q in its own component if the record ever frees one.
-    particle.state1.x = timer + min(q / (q + kHardeningScale), 0.9999);
+    // The fraction shares a float with the sleep timer, so its step grows to 1.5e-5: rounded stochastically (above).
+    particle.state1.x = roundStochastically(timer, min(q / (q + kHardeningScale), 0.9999), position, velocity);
     moveWithCollisions(position, velocity, affine, displacement, restitution);
 
     particle.state0 = vec4(position, velocity);

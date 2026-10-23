@@ -85,6 +85,13 @@ private:
     struct GasState {
         int substeps = 1;
         int pressure_iterations = 0;  // CG iterations of the last solve, which places the next solve's first check
+        // The pressure solve that spans a tick pair (RunGasTick): begun on the first tick, finished on the second.
+        bool solve_pending = false;
+        bool solve_running = false;   // the residual check has not yet stopped it
+        bool solve_started = false;   // a solve was needed when it began (the iteration count is recorded)
+        int solve_iterations = 0;
+        int solve_next_check = 0;
+        GLuint mask_solve = 0;  // R8UI copy of the gas mask the pending solve was built on, so its operator stays fixed
         GLuint mac_u_a = 0;
         GLuint mac_u_b = 0;
         GLuint mac_u_tmp = 0;
@@ -284,7 +291,7 @@ private:
     static constexpr int kSandTileStride = (kGridWidth + 2 + kWorkgroupSize - 1) / kWorkgroupSize;
     static constexpr int kGasWidth = kGridWidth / 2;
     static constexpr int kGasHeight = kGridHeight / 2;
-    static constexpr std::uint32_t kGasTickStride = 2;  // the gas steps once per this many ticks (RunGasTick)
+    static constexpr std::uint32_t kGasTickStride = 2;  // one gas pressure solve spans this many ticks (RunGasTick)
     static constexpr int kHeatWidth = kGasWidth;
     static constexpr int kHeatHeight = kGasHeight;
     static constexpr int kSmokeWidth = kGasWidth;
@@ -295,6 +302,12 @@ private:
     // Cursor lantern reach in cells: a base plus a share of the brush radius.
     static constexpr float kLanternRadius = 130.0F;
     static constexpr float kLanternPerBrushCell = 1.5F;
+    // Spark ring: 128 new records a tick for 128 ticks (2.13 s, over the longest ember life of 2.1 s). A source is a gas
+    // cell index + 1 in 18 bits (spark_pick.comp).
+    static constexpr int kSparkSpawnsPerTick = 128;
+    static constexpr int kSparkRingTicks = 128;
+    static constexpr int kSparkCapacity = kSparkSpawnsPerTick * kSparkRingTicks;
+    static_assert(kGasWidth * kGasHeight < (1 << 18), "spark_pick.comp packs the gas cell index into 18 bits");
     // Preallocated pools (CreateBuffers checks GL_MAX_SHADER_STORAGE_BLOCK_SIZE): 96 MB of water, 64 MB of sand, each
     // twice for compaction. Sleeping sand lives in the packed texture instead, so the sand pool bounds moving grains.
     static constexpr int kMaxWaterParticles = 1 << 21;
@@ -305,6 +318,8 @@ private:
     static constexpr int kWaterParticleComponents = 12;
     static constexpr int kSandParticleComponents = 16;
     static constexpr int kMaxSandParticles = 1 << 20;
+    // Slots the sand brush leaves free for packed sand that wakes (RunSpawnSandParticles).
+    static constexpr int kSandWakeReserve = kMaxSandParticles / 16;
     // Sleeping grains one cell may hold (R8UI); more stay moving. Two fill a cell at rest density, but the bottom of a
     // deep bed is compressed to J ~0.25 (seven or eight per cell; benchmark-fill), so the cap leaves room.
     static constexpr int kMaxPackedGrains = 64;
@@ -321,6 +336,8 @@ private:
         return levels;
     }();
     static_assert(kWaterMultigridLevels < 8, "pressure_mg.comp holds eight level slots");
+    // Byte offset in the CG scalars of the restart's indirect dispatch arguments (pressure_cg.comp).
+    static constexpr GLintptr kWaterRestartDispatchOffset = 64;
     static constexpr int kWaterMultigridCells = [] {
         int cells = 0;
         for (int l = 1, width = kGridWidth, height = kGridHeight; l <= kWaterMultigridLevels; ++l) {
@@ -428,6 +445,14 @@ private:
         GLuint steam_b = 0;
         bool steam_ping = true;
     } phase_state_;
+    // Sparks and embers (spark_pick.comp, spark_step.comp, spark.vert): a ring of kSparkCapacity records advanced once per
+    // tick, kSparkSpawnsPerTick of them replaced each tick, so a slot is reused only after kSparkRingTicks ticks (longer
+    // than any life). Drawn over the lit composite by DrawSparks; both buffers are cleared with the rest of the state.
+    struct SparkState {
+        GLuint particles = 0;  // two vec4 per record: x, y, vx, vy; age, life, drag time, seed * 2 + ember (life 0 = dead)
+        GLuint buckets = 0;    // per-tick spawn contest, one key per spawn slot (spark_pick.comp)
+        GLuint vao = 0;        // the particle buffer as two per-instance attributes
+    } spark_state_;
     // HUD motion, eased toward the state above by DrawHud. Only the interactive loop draws the HUD, so replays and
     // Render() never touch it.
     struct HudMotion {
@@ -501,6 +526,9 @@ private:
     GLuint coupling_heat_program_ = 0;
     GLuint render_extract_program_ = 0;
     GLuint light_build_program_ = 0;
+    GLuint spark_pick_program_ = 0;
+    GLuint spark_step_program_ = 0;
+    GLuint spark_draw_program_ = 0;
     GLuint render_program_ = 0;
     GLuint hud_program_ = 0;
     GLuint hud_font_texture_ = 0;
@@ -567,10 +595,14 @@ private:
     void SetupWaterMultigrid();
     void ApplyWaterMultigrid(int slot, bool initial);
     void RunGasTick(float dt);
-    // Without project_each_substep, transport substeps share the last substep's projection.
-    void RunGasPass(float dt, bool project_each_substep = true);
+    // Transport substeps for dt; without project the caller owns the pressure solve (RunGasTick).
+    void RunGasPass(float dt, bool project = true);
     void RunSmokePass(float dt, bool project = true);
     void RunGasProjection();
+    // The projection in two halves: begin builds the right-hand side, the multigrid footprint and the CG state and runs at
+    // most iteration_budget iterations (negative: no limit); finish runs the rest to the residual stop or the cap, then
+    // checks and projects the velocity.
+    void RunGasProjectionStage(bool begin, bool finish, int iteration_budget);
     void RunFireHeatPass(float dt);
     void RunCouplingPass(float dt);
     void RunWoodPass();
@@ -579,6 +611,8 @@ private:
     std::array<GLuint, 2> ReadPhaseSinks() const;  // evaporated water and burned oil records since the last reset
     void RunRenderFieldExtractionPass();
     void RunLightBuildPass();
+    void RunSparkPass(float dt);
+    void DrawSparks(const SimRect& sim, int fb_width, int fb_height);
     void Render(bool letterbox = false);
     void DrawHud(double now = -1.0);  // now: seconds on the glfwGetTime clock; negative reads it
     int RunReplay();

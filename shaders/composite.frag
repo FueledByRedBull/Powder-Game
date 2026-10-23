@@ -24,7 +24,7 @@ uniform ivec4 simRect;  // x, y, width, height of the simulation in the framebuf
 uniform int renderMode;
 uniform int lighting;   // 1: albedo * (ambient + fire glow + lantern); 0: albedo alone, which tests/AppLifecycleTests.cpp mirrors
 uniform vec3 lantern;   // cursor lantern: centre cell x, y and radius in cells; radius <= 0 switches it off
-uniform float fxTime;   // simulation seconds (tick count times the fixed step): flame tongues, sparks, heat shimmer; lit frames only
+uniform float fxTime;   // simulation seconds (tick count times the fixed step): flame tongues and heat shimmer; lit frames only
 uniform int debugReplayOk;
 uniform int debugPassCount;
 uniform float debugPassTimings[7];
@@ -87,7 +87,7 @@ float waterPresence(vec2 coord) {
 }
 
 // Dark-cave palette. Everything in the scene is an albedo; the light (ambient, the fire's glow and the cursor lantern)
-// multiplies it at the end, and only flames, sparks and the hot-gas halo are emissive. tests/AppLifecycleTests.cpp
+// multiplies it at the end, and only flames, the hot-gas halo and (drawn after it, spark.vert) sparks are emissive. tests/AppLifecycleTests.cpp
 // (render-modes) mirrors the albedo functions below with lighting = 0.
 // The back wall is distant: dark, low in contrast and only coarsely textured, so painted rock (bright, fine-grained,
 // rimmed) reads as the solid foreground even as a thin stroke.
@@ -155,44 +155,6 @@ float valueNoise(vec2 x) {
     float c = unitFloat(pcg2d(uvec2(i + ivec2(0, 1)) + 41u).x);
     float d = unitFloat(pcg2d(uvec2(i + ivec2(1, 1)) + 41u).x);
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-}
-
-// Flame particles and embers, drawn procedurally (no particle buffers). Each layer is a lattice of potential sparks
-// born together at one phase of the layer's cycle; a spark exists when the gas at its birth point is burning now and
-// its hash passes the layer's density for this cycle. Flame sparks rise fast and live a third of a second; embers are
-// thrown up and arc down under gravity for over a second. p is in cells, t in seconds. Lit frames only.
-vec3 sparks(vec2 p, float t) {
-    vec3 sum = vec3(0.0);
-    for (int layer = 0; layer < 6; ++layer) {
-        bool ember = layer >= 4;
-        float life = ember ? 1.3 + 0.2 * float(layer - 4) : 0.30 + 0.06 * float(layer);
-        float cycle = t / life + 0.618 * float(layer);
-        float age = fract(cycle) * life;
-        uint epoch = uint(int(floor(cycle))) * 7919u + uint(layer) * 104729u;
-        float size = ember ? 40.0 : 16.0;  // wider than any spark strays from its layer's mean travel
-        // Mean travel of the layer's sparks so far: the lattice cell a pixel's spark was born in is near p - travel.
-        vec2 mean = ember ? vec2(0.0, 70.0 * age - 0.5 * 160.0 * age * age) : vec2(0.0, 110.0 * age);
-        ivec2 base = ivec2(floor((p - mean) / size));
-        for (int j = 0; j < 9; ++j) {
-            ivec2 lattice = base + ivec2(j % 3 - 1, j / 3 - 1);
-            uvec2 h = pcg2d(uvec2(lattice) + uvec2(epoch, epoch * 3u));
-            uvec2 g = pcg2d(h);
-            if (unitFloat(g.y) > (ember ? 0.8 : 0.5)) continue;
-            vec2 birth = (vec2(lattice) + vec2(unitFloat(h.x), unitFloat(h.y))) * size;
-            float heat = textureLod(temperatureTex, birth / vec2(gridSize), 0.0).r;
-            float burn = textureLod(fireEmissiveTex, birth / vec2(gridSize), 0.0).r;
-            if (max(heat, burn) < 0.45) continue;
-            float vx = (unitFloat(g.x) - 0.5) * (ember ? 32.0 : 24.0);
-            float vy = ember ? 70.0 + 32.0 * (unitFloat(g.x >> 4u) - 0.5) : 110.0 + 50.0 * (unitFloat(g.x >> 4u) - 0.5);
-            vec2 at = birth + vec2(vx, vy) * age - vec2(0.0, ember ? 80.0 * age * age : 0.0);
-            vec2 d = abs(p - at);
-            if (max(d.x, d.y) > 1.1) continue;
-            float fade = smoothstep(0.0, 0.06, age) * (1.0 - smoothstep(0.4 * life, life, age));
-            float flicker = 0.55 + 0.45 * sin(t * 37.0 + 6.2832 * unitFloat(h.x >> 3u));
-            sum += (ember ? vec3(1.0, 0.36, 0.06) : vec3(1.0, 0.62, 0.22)) * (fade * flicker * (ember ? 1.6 : 1.2));
-        }
-    }
-    return sum;
 }
 
 // Rim strength along `dir`: 1 for a cell next to open space, falling to 0 over `reach` cells, 0 deeper in the rock.
@@ -512,8 +474,8 @@ void main() {
 
     // Fire: additive flame, a temperature glow that outlives the flame, soft-saturated instead of hard-clamped. The
     // bloom is eight fixed taps of the same temperature field at two reaches, so flames leave a smooth warm halo on
-    // whatever is around them. Lit frames break the flame into rising tongues and add flame sparks and embers
-    // (sparks()); both move with fxTime only.
+    // whatever is around them. Lit frames break the flame into rising tongues that
+    // move with fxTime only; sparks and embers are particles (spark_step.comp) drawn over the frame by spark.vert.
     float heat = temperature * temperature;
     vec2 near = texel * 8.0, far = texel * 14.0;
     float bloom = 0.0625 * (texture(temperatureTex, uv + near).r + texture(temperatureTex, uv - near).r +
@@ -523,7 +485,6 @@ void main() {
                             texture(temperatureTex, uv + vec2(0.0, far.y)).r + texture(temperatureTex, uv - vec2(0.0, far.y)).r);
     bloom = clamp(bloom, 0.0, 1.0);
     float tongues = 1.0;
-    vec3 spark = vec3(0.0);
     if (lighting != 0) {
         vec2 cellPos = uv * vec2(gridSize);
         if (flame > 0.0 || heat > 0.01) {
@@ -533,12 +494,11 @@ void main() {
                       0.35 * valueNoise(vec2(cellPos.x * 0.27, cellPos.y * 0.11 - fxTime * 5.5));
             tongues = smoothstep(0.62 - 0.55 * max(flame, heat), 0.95, n + 0.25) * 1.5;
         }
-        if (dot(textureLod(lightTex, uv, 3.0).rgb, vec3(1.0)) > 0.02) spark = sparks(cellPos, fxTime);
     }
     // Flame hue follows the gas temperature; its strength follows the burn, plus a dim glow from very hot gas.
     vec3 fire_add = flameColor(max(temperature, flame * 0.8)) * (flame * 1.6 * tongues) +
                     flameColor(temperature * 0.5) * (heat * heat * 1.6 * mix(1.0, tongues, 0.6)) +
-                    vec3(1.0, 0.30, 0.03) * (bloom * 0.2 + bloom * bloom * 0.35) + spark +
+                    vec3(1.0, 0.30, 0.03) * (bloom * 0.2 + bloom * bloom * 0.35) +
                     vec3(1.0, 0.30, 0.04) * (woodEmber * 1.2);
     color = 1.0 - (1.0 - color) * exp(-fire_add);
 

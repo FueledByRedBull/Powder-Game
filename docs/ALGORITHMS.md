@@ -109,13 +109,13 @@ oil field, render fields and the light texture. Rendering reads but never writes
 | 1 | Spawn and erase (`RunSpawnPass` -> `StampStroke` -> `StampBrush`) | `spawn_full`, `spawn_smoke`, `sand_particle_spawn`, `water_particle_spawn`, `*_particle_clear`, `gas_face_to_center` | cursor, masks, last liquid volume and occupancy | material, particles, gas fields |
 | 2 | Boundary (`RunBoundaryPass`) | `boundary_build`, `boundary_seed`, `boundary_jumpflood`, `boundary_distance` (only when geometry changed), `boundary_downsample` | material, last sand occupancy, last liquid volume and oil field | full, static and gas masks, signed distance |
 | 3 | Water (`RunWaterPass`) | `water_sleep`, `water_pack`, `water_particle_compact`, then per substep `water_particle_p2g`, `water_mac_build`, `water_particle_finalize`, `water_divergence`, `pressure_pockets`, `pressure_cg`, `pressure_cg_reduce`, `pressure_mg`, `pressure_residual`, `water_project`, `water_mac_finalize`, `water_particle_step` | masks, last sand grid velocity and occupancy, oil field | water records and fields |
-| 4 | Gas, every second tick (`RunGasTick` -> `RunGasPass`) | per substep `gas_velocity_advect`, `gas_face_to_center`, `smoke_advect`, `smoke_correct`, `gas_velocity_correct`; on the last substep the projection (`smoke_divergence`, `gas_pressure_kind`, `pressure_pockets`, `pressure_residual`, `gas_cg` with `gas_pressure_relax` and `gas_pressure_restrict`, `pressure_residual`, `smoke_project`, `gas_face_to_center`); then `fire_rd` | gas mask | gas fields |
+| 4 | Gas, every tick (`RunGasTick` -> `RunGasPass` and `RunGasProjectionStage`) | one substep: `gas_velocity_advect`, `gas_face_to_center`, `smoke_advect`, `smoke_correct`, `gas_velocity_correct`, then `fire_rd`; the pressure solve spans two ticks: the first begins it after its substep (`smoke_divergence`, `gas_pressure_kind`, `pressure_pockets`, `pressure_residual`, `gas_cg` with `gas_pressure_relax` and `gas_pressure_restrict` for about half of the iterations), the second finishes it before its substep (the remaining `gas_cg`, `pressure_residual`, `smoke_project`, `gas_face_to_center`) | gas mask (a copy, for the solve) | gas fields |
 | 5 | Sand (`RunSandPass`) | `sand_sleep`, `sand_pack`, `sand_particle_compact`, per substep `sand_particle_p2g`, `sand_grid_update`, `sand_particle_step`, then `sand_particle_p2g` (occupancy) and `sand_rasterize` | signed distance, this tick's liquid volume and water velocity | sand records and fields |
 | 6 | Coupling (`RunCouplingPass`) | `coupling_fire`, `coupling_heat`, `wood_burn` (if wood was painted), `phase_particles`, `oil_field`, `steam_update` (if oil or a heat source was painted) | liquid volume, oil field, occupancy, gas fields | gas fields, material, water records, steam |
-| 7 | Render extraction (`RunRenderFieldExtractionPass`) | `render_extract` | gas fields | render fields |
+| 7 | Render extraction and sparks (`RunRenderFieldExtractionPass`, `RunSparkPass`) | `render_extract`, `spark_pick`, `spark_step` | gas fields, boundary mask, water amount | render fields, spark ring (11.4) |
 
 Once per displayed frame `Render()` runs `light_build` (lit composite only), `glGenerateMipmap` and the
-`composite.frag` draw; the interactive loop adds `DrawHud()` (`hud.frag`).
+`composite.frag` draw, then `DrawSparks()` over it (lit frames only, `spark.vert`); the interactive loop adds `DrawHud()` (`hud.frag`).
 
 Passes communicate through the previous pass's output within the tick, or the previous tick's output across the
 order: water sees the sand walls rasterized at the end of the previous tick, the gas mask uses the previous tick's
@@ -161,11 +161,12 @@ frame body (VALIDATION, Current status).
 | `kCatchUpBudget` | 0.75 of a tick | leaves a quarter of the frame for rendering |
 | tick-cost decay | 5% per frame | one slow tick stops catch-up at once; a short lull does not restart it |
 
-### 2.2 Tick order and the 30 Hz gas
+### 2.2 Tick order and the gas tick pair
 
-The order is the table in 1.4. The gas steps on every second tick (`kGasTickStride = 2`, ticks 1, 3, 5, ... after
-`InitializeState`) over two ticks of elapsed time (section 8.2). Brush stamps, coupling and render extraction act on
-every tick, reading gas that is at most one tick old.
+The order is the table in 1.4. The gas advances on every tick by that tick's dt, and its pressure solve spans a pair of
+ticks (`kGasTickStride = 2`; ticks 1, 3, 5, ... after `InitializeState` begin a solve, ticks 2, 4, 6, ... finish it;
+section 8.2). Brush stamps, coupling and render extraction act on every tick and read gas whose velocity is projected
+up to one tick late.
 
 ### 2.3 Readbacks and fences
 
@@ -174,7 +175,7 @@ The GPU is otherwise asynchronous; these are the only blocking points of a tick:
 | Readback | Size | Purpose |
 | --- | --- | --- |
 | Water cursor after compaction (`RunWaterPass`) | 8 bytes | live record count (sizes P2G and the particle step dispatches) and fastest speed (sizes substeps) |
-| Water CG running flag (`RunWaterProjection`) | 12 bytes per confirmation, behind a `glFenceSync` | stop decision; see 4.9 |
+| Water CG running flag (`RunWaterProjection`) | 12 bytes per confirmation, behind a `glFenceSync` | stop decision; one confirmation per solve when the blind batch covers it, see 4.9 |
 | Sand cursor after compaction (`RunSandPass`) | 24 bytes | live count, fastest speed, live cell box |
 | Gas residual partials (`RunGasProjection::needs_iteration`) | about 1000 vec4 per check | stop decision at each check; see 8.5 |
 
@@ -301,9 +302,20 @@ Pool budget: `RunSpawnWaterParticles` skips a whole stamp when
 `kWaterWakeReserve` (a sixteenth, 131,072 slots kept for packed water that wakes). The
 brush therefore stops at a full pool at the same tick every run. Before, the GPU's per-record reservation at the cap
 dropped records in atomic order and counted each as overflow (`app-water-pool-full`). The pool holds about half the
-screen of moving water; a larger pool was rejected because frame cost scales with moving water (a half-screen pour
-near the cap measured 14.4 ms GPU mean, p95 19.5, at 1.84M records), so more records would only buy frames under
-60 FPS.
+screen of moving water. A larger pool ($`2^{22}`$ records), a budget that grows when the last tick took fewer
+substeps, and packing from the velocity relative to the surrounding flow were all measured and rejected. A tick
+costs about
+
+```math
+t \approx N\,(1.7 + 1.8\,s)\ \mathrm{ns} \;+\; \text{pressure solve over the liquid area}
+```
+
+for $`N`$ moving records and $`s`$ substeps (a still pool of 0.25-1 million cells, no packing: 5.6/7.0/12.2/15.4 ms at 1,
+2, 3 and 3.8 million records and one substep, 8.9-28 ms at three), and a churning pour sits at two or three substeps, so
+the frame time of a pour, not the pool, bounds the fill: budgets of 3, 2.5 and 1.97 million records after one, two
+and three substeps took a profile pour from 13.7 to 18.5 ms GPU mean (1.93 to 2.59 million records at the end, 48% to
+65% fill), and a calm-only extension added 2 ms to the mean frame of a 30 s hold (15.7 against 13.6) for 2 points of
+fill (VALIDATION, water surface pass).
 
 ### 4.2 Spawn
 
@@ -396,11 +408,22 @@ Each substep builds this into `mac_u_prev`/`mac_v_prev` (the pre-force field, FL
   4-2-1 tent filter over 3 x 3 cells, times 0.96; liquid volume
   $`V = \mathrm{clamp}\,\big(\max(V_{\text{local}}, \mathrm{mix}(V_{\text{local}}, V_{\text{smooth}}, 0.45)), 0, 1\big)`$.
   A cell at rest reads 0.16.
-- $`\phi = \mathrm{clamp}(0.46 - 1.18\,V, -1, 1)`$; a cell is liquid when $`\phi < 0.42`$
-  (`water_liquid_phi_threshold`), that is above about 0.85 particle-equivalents.
-- amount $`= \mathrm{mix}\,\big(V,\ 1 - \mathrm{smoothstep}(0.06, 0.42, \phi),\ 0.28\big)`$, the render and
-  coupling field.
-- Blocked cells get volume 0, $`\phi = -1`$; empty cells $`\phi = 1`$.
+- The liquid $`\phi`$ of the pressure solve is the particle density blurred over 3 x 3 cells with the weights
+  $`\tfrac{1}{4}(1, 2, 1) \otimes (1, 2, 1)`$ (blocked cells left out of the average and the weights renormalised;
+  cells outside the domain repeat the edge cell), $`\bar\rho = \sum_i w_i\, m_i / (\sum_i w_i\, m_{\text{rest}})`$ with
+  $`m_i`$ the particle-equivalents of cell $`i`$, mapped linearly so the contour $`\bar\rho = \rho_0`$
+  (`water_surface_level`, 0.25) sits at the threshold $`T`$ (`water_liquid_phi_threshold`, 0.42):
+
+  ```math
+  \phi = \mathrm{clamp}\,\big(T + 2T\,(\rho_0 - \bar\rho),\ -1,\ 1\big)
+  ```
+
+  A cell is liquid when $`\phi < T`$, that is when the blurred density passes a quarter of rest, so one particle
+  crossing a cell edge no longer flips a cell of the solve (the first attempt classified by the cell's own fill:
+  $`\phi = 0.46 - 1.18\,V`$, liquid above about 0.85 particle-equivalents).
+- amount $`= \mathrm{mix}\,\big(V,\ 1 - \mathrm{smoothstep}(0.06, 0.42, 0.46 - 1.18\,V),\ 0.28\big)`$, the render and
+  coupling field (unchanged; it does not use the solve's $`\phi`$).
+- Blocked cells get volume 0, $`\phi = -1`$.
 
 `water_mac_finalize.comp` averages faces to the cell-centred velocity (zero in blocked cells).
 
@@ -473,11 +496,50 @@ the scaled pressure $`\Delta t\, p / (\rho h)`$ in $`\mathrm{cells^2/s}`$, so th
 differences. `pressure_cg.comp`, `pressure_mg.comp`, `pressure_residual.comp` and `water_project.comp` use the same
 coefficients, so divergence, operator and projection stay consistent at walls, sand and the free surface.
 
-Rejected: a ghost-fluid free surface (conductance $`1/\theta`$ at liquid-air faces, Gibou et al. 2002, Enright et al.
-2003) with $`\theta`$ from fill fractions, and velocity extrapolation two faces into the air. With $`\theta`$ from the
-particle fill the surface pressure followed the particle noise: settled pools moved 2-3 times faster and CG needed half
-again as many iterations; extrapolation alone changed nothing beyond run-to-run spread for 0.2 ms per substep. A smooth
-particle level set would be needed first.
+**Ghost-fluid free surface** (Gibou et al. 2002; Enright et al. 2003; Losasso et al. 2004). The zero of the pressure
+sits at the surface, not at the centre of the first air cell. For a liquid cell $`c`$ with an air neighbour $`n`$ the
+surface lies at $`\theta`$ of the way from $`c`$ to $`n`$, found by linear interpolation of $`\phi`$ between the two
+centres:
+
+```math
+\theta = \frac{\phi_c - T}{(\phi_c - T) - (\phi_n - T)},\qquad
+\gamma = \frac{1}{\mathrm{clamp}(\theta,\ \theta_{\min},\ 1)}
+```
+
+and the face conducts $`\gamma`$ instead of 1: the diagonal gains $`\gamma`$ for the air neighbour, and the projection
+subtracts $`\gamma\,(p_n - p_c)`$ with $`p_n = 0`$ on that face. $`\theta_{\min}`$ is `water_ghost_theta_min`, 0.25. A
+face whose $`\phi`$ values do not straddle $`T`$ (a liquid cell pinned to air by a sealed pocket, 4.7) keeps $`\gamma = 1`$.
+The matrix stays symmetric (the conductance belongs to the face and the air cell has no row) and positive definite,
+so CG is unchanged; $`\gamma`$ enters only the diagonal and the face update, so the CG tile work and the V-cycle's
+off-diagonal terms are as before. In a hydrostatic column whose top cell reads $`\theta = \tfrac12`$ the pressure is
+$`p_y = 4/\gamma + 4\,(32 - y)`$, top cell 2 instead of 4 (`app-water-ghost-fluid`).
+
+The multigrid preconditioner keeps the unit coarse operators of 4.9 but adds to a coarse liquid cell's diagonal half
+the sum of its children's excess over their unit-conductance diagonal (the Galerkin product with the transfers
+would add about the whole sum). Without it the conductances raised CG iterations by 14% in a pour and 38% in the profile's `user` scene, with it they
+change by -4% and +8% (VALIDATION). Because $`M^{-1}`$ is still a fixed symmetric map with a contracting smoother, it stays
+symmetric positive definite (`app-water-multigrid`).
+
+Why a blurred density and not the fill fractions: with $`\theta`$ from the cell's own fill the surface pressure
+followed the particle noise (settled pools moved 2-3 times faster, CG needed half again as many iterations). The
+three-by-three blur linearises the density across the surface, so interpolating it places the surface to a fraction
+of a cell (a flat surface half way through a cell row reads $`\theta = \tfrac12`$ exactly), and the smooth classification keeps
+the cells of the solve from flickering with single particles. (Zhu and Bridson 2005 build the surface from kernel-averaged
+particle positions and radii, which needs a second particle-to-grid pass of position sums; the cell densities of the
+existing pass blurred on the grid give a linear phi from the data already there.) The contour sits at a quarter of rest density rather
+than a half, which would be the true surface of a flat pool, because cells below half still need their pressure for
+the density correction (4.6) to hold the front of a dam break (at one half the settled dam break kept
+over-dense cells and failed the gate), and because it keeps sparse sheets liquid. Measured against the fill-fraction
+operator on settled pools: mean speed 0.10 -> 0.004 cells/s, level spread 0.24 -> 0.03 cells, 10 -> 3.2 CG iterations;
+the dam break's mean speed halves and its over-dense share stays under the 0.5% gate.
+
+Rejected again: velocity extrapolation one cell into the air (the face beyond a liquid-air face takes that face's
+projected value). With the smooth surface it made settled pools jitter more (mean speed 0.004 -> 0.009 cells/s, calm
+surface std 0.08 -> 0.14) and cost 10% more CG iterations. A 5 x 5 blur, the blur for $`\theta`$ only (the liquid cells
+staying those of the fill-fraction phi) and the union and intersection of the two classifications were also measured
+(VALIDATION): the 5 x 5 kernel costs 0.3 ms per frame more and left the dam break at the density gate, the blur for
+$`\theta`$ alone calmed pools 3.6 times against the original but 7 times less than the kept classification, and the
+union and intersection were no better than either.
 
 ### 4.9 MGPCG solve
 
@@ -508,8 +570,8 @@ last-workgroup-done reduction was tried and raced on this driver.)
 halve the grid until the coarsest fits one 8 x 8 workgroup (1000 -> 500 -> ... -> 8, seven coarse levels).
 
 - Coarsening (once per solve, phases 0, 1, 5): a coarse cell is air if any child is air, else liquid if any child is
-  liquid, else a wall that is sand-porous if a child is sand. Each level uses the unscaled 5-point operator; level
-  boxes cover the liquid bounds plus one cell.
+  liquid, else a wall that is sand-porous if a child is sand. Each level uses the unscaled 5-point operator plus half
+  the sum of its children's ghost-fluid excess diagonal (4.8); level boxes cover the liquid bounds plus one cell.
 - Restriction is the transpose of bilinear prolongation (weights $`\tfrac14, \tfrac34, \tfrac34, \tfrac14`$ per axis,
   summing to 4, which absorbs the factor of four between grid spacings).
 - Prolongation treats walls as Neumann: a wall partner of a fine cell's bilinear stencil
@@ -525,13 +587,20 @@ CG stays valid (`app-water-multigrid` checks $`\langle M\mathbf{a}, \mathbf{b}\r
 to $`2.8 \times 10^{-9}`$ relative and $`\langle M\mathbf{a}, \mathbf{a}\rangle > 0`$).
 
 **Convergence and the host.** The host never waits before the solve. It dispatches the previous solve's iteration
-count blind, then repeatedly copies the running flag to a staging buffer behind a fence, queues 1, then 2, then 4 more
-iterations, waits for the fence and maps the copy, until a fence finds the solve stopped or the 1024 cap is reached
-(speculative iterations launch nothing once stopped). CG stops when the recursive $`\max\lvert r\rvert \le 0.06`$ (half
-the 0.12 threshold). Recursive residuals drift from the true $`\mathbf{b} - A\mathbf{p}`$ as R32F rounds a large
-pressure (a deep packed pool reaches $`\lvert p\rvert`$ about 85,000, one ulp 0.008), so a converged solve restarts from
-$`\mathbf{b} - A\mathbf{p}`$ (phase 0 and the reduce with `restart`, keeping the tile list and iteration count); a
-restart whose true residual already passes the full threshold stops with the pressure unchanged. Finally
+count blind, queues the restart below, and copies the running flag to a staging buffer behind a fence. A solve the blind
+batch covered is confirmed by that one fence and nothing else is read back. While a fence finds the solve running the
+host adds one iteration, then 1, 2 and 4 more per fence, waiting for the fence and mapping the copy each time, until a
+fence finds the solve stopped or the 1024 cap is reached (speculative iterations launch nothing once stopped). CG stops
+when the recursive $`\max\lvert r\rvert \le 0.06`$ (half the 0.12 threshold). Recursive residuals drift from the true
+$`\mathbf{b} - A\mathbf{p}`$ as R32F rounds a large pressure (a deep packed pool reaches $`\lvert p\rvert`$ about
+85,000, one ulp 0.008), so a stopped solve restarts from $`\mathbf{b} - A\mathbf{p}`$ (phase 0 and the reduce with
+`restart`, keeping the tile list and iteration count); a restart whose true residual already passes the full threshold
+stops with the pressure unchanged. The GPU decides whether a restart is due, so the host queues it at every fence
+without waiting: phase 10 of `pressure_cg.comp` sets an armed flag when the solve has stopped without breakdown after
+iterating since the last (re)start (`legBase`) and writes the indirect arguments of the restart's cell passes, which are
+empty otherwise, and the other restart passes return unless the flag is set. The two sum slots alternate with the global
+iteration number, so a restart needs no host knowledge of its position, and the final pressure, iteration count and
+restart point are the same for every host schedule (`app-water-solve-schedule`). Finally
 `pressure_residual.comp` always checks $`\max\lvert \mathbf{b} - A\mathbf{p}\rvert \le 0.12`$ per cell from the stored
 pressure and counts every failing cell in `pressure_nonconverged`.
 
@@ -548,7 +617,8 @@ block-occupancy skipping and fewer command barriers (no change). The restart rep
 ### 4.10 Projection
 
 `water_project.comp` per face: open faces get
-$`u^{\text{prev}} + (g\,\Delta t \text{ on } v) - (p_{\text{right}} - p_{\text{left}})`$; faces between water and sand
+$`u^{\text{prev}} + (g\,\Delta t \text{ on } v) - \gamma\,(p_{\text{right}} - p_{\text{left}})`$ ($`\gamma`$ of 4.8, 1 except
+at a liquid-air face); faces between water and sand
 (no painted solid) get $`u^{\text{prev}} - \kappa\,(p_b - p_a)`$, keeping the sand velocity plus the leak; faces
 against painted solid or the domain edge get 0. Air cells read pressure 0, so air-side faces keep their transferred
 velocity for particles whose kernel crosses the surface. Overflowing faces count and store 0. On the last substep
@@ -660,7 +730,14 @@ within three cells of walls or sand never pack, so waves and wall contact stay p
 
 **Limits.** Still half-screen water was already cheap without packing (the pressure solve and grid passes, not P2G,
 dominate still water); packing pays off in records and pool budget, not much in time. Water does not pack while a pour
-stirs it. Oil never packs (a packed cell wakes as plain water and would erase the oil flag). `water_sleep_ticks = 0`
+stirs it: in the churn after a full-width pour 80-90% of the deep cells hold three to five records and sit inside
+liquid, and under 0.1% have every record still for 30 ticks, since the whole pool swings at 5-15 cells/s. Packing
+from the velocity relative to the 7 x 7 flow (readiness without the swing) gained 2 points of fill on average over
+nine sweep speeds of a 30 s hold (from -5 to +10), and a bulk limit above 2 cells/s froze slow levelling flows: a tilt
+that levels in 10 s unpacked stays 2.5-2.9 cells high with a limit of 4 (`app-water-pack-slosh`). Giving packed cells
+the velocity they had (momentum in the deposit, wake on departure from it) was worse: the packed mass cannot follow its
+own flow, so the interface starved. Accumulating the impulse a packed cell receives (wake once it would have reached the
+wake speed) kept slow tilts alive and also kept 85% of the pool unpacked. None is kept. Oil never packs (a packed cell wakes as plain water and would erase the oil flag). `water_sleep_ticks = 0`
 disables packing.
 
 ### 4.14 Water constants
@@ -679,7 +756,9 @@ disables packing.
 | `water_amount_per_particle` | 0.04 | volume units | a cell at rest reads 0.16 |
 | `water_density_rate` | 20 /s | | closes air pockets in ~0.05-0.1 s without spikes |
 | density error cap / bulk share | 0.5 / 0.75 of rest | | `water_divergence.comp` |
-| `water_liquid_phi_threshold` | 0.42 | | liquid above ~0.85 particle-equivalents |
+| `water_liquid_phi_threshold` | 0.42 | | the blurred density's contour sits here |
+| `water_surface_level` | 0.25 of rest density | | contour of the liquid phi; at 0.5 the dam break fails its density gate, at 0.3 settled pools move 7 times faster and at 0.4 60 times |
+| `water_ghost_theta_min` | 0.25 | | clamp of theta, conductance at most 4; 0.1: pools as calm, pour CG +9%; 0.5: pools 7 times faster |
 | `water_pressure_iterations` | 1024 | | cap; true-residual check catches a capped solve |
 | `water_pressure_residual_threshold` | 0.12 /s (max per cell) | | CG stops at 0.06 |
 | `kSandLeak` | 0.005 of an open face | | keeps water sealed in sand nonsingular |
@@ -693,9 +772,12 @@ disables packing.
 ### 4.15 Water limits and failure modes
 
 - Inviscid; turbulence and boundary layers are represented only by bulk damping of supported water.
-- The free surface is a first-order $`\phi`$ threshold on particle fill (no ghost fluid), so the surface carries
-  particle noise; settled pools show surface std around 0.2-0.4 cells.
-- Records below about 0.85 particle-equivalents per cell are air to the solver (sparse spray is ballistic).
+- The free surface is a ghost-fluid condition on a blurred density (4.8): sub-cell in position along the face axes,
+  first order in the contour's shape, and it follows particle noise only at the blur's scale. Settled pools show
+  surface std 0.1 cells and level spread 0.03 (the first attempt 0.2-0.4 and 0.24).
+- A cell whose blurred density is under a quarter of rest is air to the solver: a single cell of four particles
+  surrounded by air reads 0.14 and falls ballistically, as does any sheet one particle thick (sparse spray is
+  ballistic). A sheet one cell thick on a floor still reads 0.5 and stays liquid.
 - Long sub-moves can still converge records; the clump jitter is a deterministic position-only fix, not a physical
   force.
 - The pool holds about half the screen of moving water; at the budget the brush stops.
@@ -785,7 +867,7 @@ dissipation and sleep-packing. These are simulation units tuned to observed beha
 | Component | Contents |
 | --- | --- |
 | state0 | position (cells), velocity (cells/s) |
-| state1.x | 0 inactive; else 1 + still-tick timer (integer 0-255) + hardening fraction $`q / (q + 4)`$ |
+| state1.x | 0 inactive; else 1 + still-tick timer (integer 0-255) + hardening fraction $`q / (q + 4)`$ (rounded stochastically where the timer makes the step coarse, 6.6) |
 | state1.y | mass (1) |
 | state1.zw, state2.xy | APIC affine matrix (column-major) |
 | state2.z | volume correction (remembered log dilation; rest area is mass / reference density) |
@@ -800,6 +882,11 @@ texture, so the pool bounds moving grains, not the sand on screen.
 `sand_particle_spawn.comp`: 2 grains per cell of the disc (outside the previous stamp's disc, not on painted solid,
 only where occupancy is below 0.225), uniformly random positions in the cell, velocity = brush velocity $`\pm 10`$
 cells/s, $`\mathbf{F} = \mathbf{I}`$, no volume correction, a random friction trait in $`[-31, 31]`$, moisture 0.
+
+Pool budget: `RunSpawnSandParticles` skips a whole stamp when `record_bound` $`+\ \text{region area} \times \text{grains per
+cell}`$ would exceed the pool less `kSandWakeReserve` (a sixteenth, 65,536 slots kept for packed sand that wakes), as for
+water (4.1). The brush stops at a full pool at the same tick every run. Before, the shader reserved each grain by
+compare-and-swap at the cap, which dropped grains in atomic order and counted each as overflow (`app-sand-pool-full`).
 
 ### 6.3 Tick structure (`RunSandPass`)
 
@@ -862,7 +949,9 @@ except on the last substep, which leaves the velocity field whole for other pass
    $`\min(\text{grip}, \lVert\mathbf{v}_t\rVert)`$ with $`\text{grip} = 0.62 \times \text{reaction} + \text{bond}`$,
    where the bond of damp packed cells is
 
-   $`\displaystyle \text{bond} = \sqrt{2}\, \alpha\, (\lambda + \mu) \times \text{cohesion} \times \mathrm{capillary}(\text{moisture}) \times e^{-q / \text{softening}} \times \text{volume} \times \lVert\nabla w\rVert`$
+   $`\displaystyle \text{bond} = \sqrt{2}\, \alpha\, (\lambda + \mu) \times \text{cohesion} \times \mathrm{capillary}(\text{moisture}) \times \overline{e^{-q / \text{softening}}} \times \text{volume} \times \lVert\nabla w\rVert`$
+
+   with the overline the mean over the cell's grains, stored at pack time (6.9), not the exponential of their mean $`q`$.
 
 7. Walls with Coulomb friction (`separate`: remove the inward normal component, scale the tangent by
    $`\max\big(0,\ 1 - 0.62\, \lVert\mathbf{v}_n\rVert / \lVert\mathbf{v}_t\rVert\big)`$): the halo nodes are the
@@ -908,8 +997,17 @@ except on the last substep, which leaves the velocity field whole for other pass
    In 2D the cone is $`\sin\varphi = \sqrt{2}\,\alpha`$. The bond widens the cone by that much compression
    (Mohr-Coulomb shear strength at zero pressure) with tension still separating. A deformation that cannot be projected
    counts, resets $`\mathbf{F}`$ to its rotation and keeps the grain moving.
-7. $`q`$ is stored back as $`q / (q + 4)`$ in state1.x's fraction (increments below half its step round away, so very
-   slow creep does not harden; marked shortcut).
+7. $`q`$ is stored back as $`q / (q + 4)`$ in state1.x's fraction. The fraction shares a float with the sleep timer, so
+   its step grows with the timer, to $`1.5 \times 10^{-5}`$ at 128-255 ticks, and a creep increment below half of it
+   rounded away every substep: a slowly straining grain never hardened (the fraction moves $`dq / 16`$ near $`q = 4`$).
+   Where the step is coarse (timer 16 and up, step $`\ge 1.9 \times 10^{-6}`$) the sum is rounded stochastically: the
+   exact error of the nearest float, as a share of the step, is the chance of rounding the other way, so the
+   expectation is exact. The random number hashes the grain's position and velocity bits and a per-substep counter
+   (`roundSeed`), so a run repeats. Finer steps keep round-to-nearest: counting the increments below $`6 \times 10^{-8}`$
+   there toughened the damp column of `sand-wet` (it shed a median 0.085 of its grains over 12 perturbed runs against
+   0.2-0.3 with nearest rounding, which the wet-sand fracture was tuned with). `sand-hardening`: a grain at timer 255,
+   $`q = 4`$, strained $`1.4 \times 10^{-5}`$ a step for 2000 steps gains $`1.77 \times 10^{-3}`$ of fraction (expected
+   $`1.76 \times 10^{-3}`$); round to nearest gains 0.
 8. Swept move with restitution 0.04 through cells blocked by signed distance $`\le 0`$, packed cells and the domain
    (the domain edge is the outer face of the edge cells), the same exact traversal and last-open-cell clamp as water.
 
@@ -959,23 +1057,28 @@ coupling, the spawn limit and rendering.
 
 1. `sand_sleep.comp` (over `record_bound`): timer = 1 + ticks slower than 4 cells/s (saturating at 255, kept with the
    hardening fraction); tally per cell grains and ready grains (timer $`\ge 60`$, mass 1, $`0 < J < 64`$) and sum the
-   ready grains' $`J`$, hardening fraction and moisture in fixed point ($`\times 4096`$).
+   ready grains' $`J`$, hardening fraction, moisture and bond $`e^{-q / 0.5}`$ in fixed point ($`\times 4096`$).
 2. `sand_pack.comp` phase 0 decides from the previous packed state and this tally, writing only its own tally bits:
    - calm = no open side steeper than 45 degrees and not disturbed. A side is open when the side cell and the cells
      below and above it yield (open, or moving sand falling faster than 4 cells/s). Disturbed: any sand node in the
      3 x 3 faster than 60 cells/s, moving sand driven into the cell faster than 20 cells/s, or half-full water there
      faster than 40 cells/s.
    - arched = packed or solid cells on both lower diagonals.
-   - A packed cell wakes when it loses support (solid, packed or any grains below, or arched) or is not calm; if it
-     stays, all-ready grains in it pack on top (up to 64 per cell).
+   - held up: walk down from the cell through packed cells, at most 3 rows (`kSupportDepth`). The first cell that is
+     not packed decides: solid or grains hold it up (moving sand holds it until it leaves or disturbs the cell); an
+     open cell holds it up only if arched over. Three packed rows in a row count as held.
+   - A packed cell wakes when it is not held up or is not calm; if it stays, all-ready grains in it pack on top (up to
+     64 per cell).
    - An unpacked cell packs when all its grains are ready, it is calm and supported (solid, packed or all-ready below,
      or arched).
 3. Compaction drops exactly the tallied grains of packing cells.
 4. Phase 1 applies: a pack adds the count to the R8UI texture and merges the means into `packedFTex` (RGBA32F: mean
-   $`J`$, hardening fraction, moisture); a wake reserves all the cell's grains or none (compare-and-swap; a full pool
-   keeps it packed and counts the overflow) and recreates them at hashed positions with the cell's sand-node velocity,
-   isotropic $`\mathbf{F} = \sqrt{J}\, \mathbf{I}`$, the mean hardening and moisture and a fresh trait. Packed cells
-   that neither pack nor wake soak up and dry like moving grains. The phase zeroes the tally and sums it consumed.
+   $`J`$, hardening fraction, moisture, bond); a wake reserves all the cell's grains or none (compare-and-swap; a full
+   pool keeps it packed and counts the overflow) and recreates them at hashed positions with the cell's sand-node
+   velocity, isotropic $`\mathbf{F} = \sqrt{J}\, \mathbf{I}`$, the mean moisture, a fresh trait and the hardening split
+   by the mean bond $`\bar b`$: $`\mathrm{round}(\bar b N)`$ of the $`N`$ grains come back intact ($`q = 0`$) and the
+   rest cracked at the fraction that keeps the cell's mean hardening, $`\bar h N / (N - n_{\text{intact}})`$. Packed
+   cells that neither pack nor wake soak up and dry like moving grains. The phase zeroes the tally and sums it consumed.
 
 While packed, cells are walls at their own nodes and push on neighbouring nodes (6.5 step 6), count in occupancy, and
 are cleared by erase and solid brushes.
@@ -994,6 +1097,16 @@ cells against 0.3) and woke quiet ones; slope-gated packing left 6-10% of grains
 only at the free surface stood at 38.5; restoring the mean stretch on wake measured no better than isotropic $`J`$.
 Damp grains pack like dry ones and their packed cells grip by their bonds; before, a damp clump with a packed core shed
 its moving rim layer by layer, and letting bonded grains pack without the grip collapsed a column to 43.6 cells.
+
+Hole collapse. Only the packed cell directly above a hole used to wake: any grain below held a cell up, so each row above
+waited for the one under it to fall away. A packed pile took hundreds of ticks to sink into a hole a moving pile fills in
+20 (erase at the foot of a 48-cell pile: peak 48 to 40 in 10 ticks moving; packed 46 at tick 40, 42 at 80, 39 at 240),
+and its collapse peak stood 2.1 cells higher (40.3 against 38.2 over 16 seeds, 40.7 against 38.3 over 32 more). The cell
+now looks down through up to three packed rows to the first cell that is not packed, so loss of support climbs three rows
+a tick. The pace is measured, not derived (collapse peak over 16 seeds, moving 38.2): 1 row 40.3, 3 rows 39.0, 4 38.7,
+6 37.8, 12 36.8; past that the pile ends lower and denser than the moving one. Over 48 seeds with three rows the packed
+collapse peak is 38.7 against 38.3. Treating grains that fall faster than 4, 10 or 20 cells/s as no support collapsed a
+little better (38.4 with three rows) but kept 270 grains of a settled pile moving (`app-sand-sleep-no-flicker`).
 
 ### 6.10 Cost reductions
 
@@ -1033,6 +1146,8 @@ it worse (3.9 ms); setting uniforms once per tick gained under 0.1 ms; neither k
 | `sand_drag`, `sand_grain_density` | 60 /s, 2.65 | | section 7 |
 | `sand_spawn_occupancy_limit` | 0.225 | | brush stops stacking |
 | `sand_sleep_speed`, `_ticks` | 4 cells/s, 60 ticks | 2 cm/s, 1 s | 6.9 |
+| `kSupportDepth` | 3 packed rows a tick | | measured pace of the collapse front, 6.9 |
+| `kSandWakeReserve` | $`2^{20} / 16`$ = 65,536 slots | | kept for packed sand that wakes, 6.2 |
 | wake speeds impact / press / water | 60 / 20 / 40 cells/s | | 6.9 |
 | `kMaxPackedGrains` | 64 per cell | | deep beds compress to $`J`$ about 0.25 (7-8 per cell) |
 | brush | 2 grains per cell, $`\pm 10`$ cells/s | | |
@@ -1044,11 +1159,16 @@ it worse (3.9 ms); setting uniforms once per tick gained under 0.1 ms; neither k
   implicit elastic solve is out of scope.
 - The repose angle emerges from transfer dissipation, hardening and packing, not from $`\alpha`$ alone.
 - A regular one-grain-per-cell lattice is a degenerate MPM bed that creeps at 1-7 cells/s and never packs (the brush
-  and wakes always jitter positions; the acceptance benchmark keeps such a block on purpose).
-- Packed piles stand within a degree of unpacked ones on average, but individual seeds lean; a collapse bridges
-  slightly more (39.9 against 38.1 cells).
-- Packing is cell-mean: a woken cell restores mean $`J`$, hardening and moisture, not each grain's state.
-- The hardening state loses increments below its storage step.
+  and wakes always jitter positions). The acceptance benchmark's sand block used to be such a lattice; it is now two
+  hashed grains per cell, the brush's bed (VALIDATION, Sand pass 5).
+- Packed piles stand within about 1.5 degrees of unpacked ones on average (flank 33.5 against 32.1 over 48 seeds; the
+  8-seed gate allows 2) and individual seeds lean (the 8-seed mean absolute centroid offset is 0.74 packed against
+  0.29, with the gate 0.5 apart); a collapse peak matches within 0.5 cells (38.7 against 38.3 over 48 seeds).
+- Packing is cell-mean for $`J`$ and moisture; hardening and bond come back as two groups per cell (intact, $`q = 0`$,
+  and cracked) that keep the cell's means, not each grain's own state.
+- The hardening state is rounded stochastically only where the sleep timer makes its step coarse (timer 16 and up):
+  unbiased, with up to a step (1.5e-5) of error per update. Below that, increments under 6e-8 of the fraction still round
+  away (6.6).
 - Only the surface of a dense body sees water drag and buoyancy (section 7).
 
 ---
@@ -1118,24 +1238,51 @@ combustion model with an expansion source (Nguyen et al. 2002), an open top and 
 | reaction | RG16F | x: fuel burned per second (expansion source); y: flame |
 | pressure, divergence | R32F | divergence was R16F; see 8.5 |
 
-### 8.2 Stepping at 30 Hz
+### 8.2 Stepping: one substep per tick, one pressure solve per tick pair
 
-`RunGasTick` runs `RunGasPass(2 dt, project_each_substep = false)` on every second tick. The substep count is
-$`\max(\text{transport}, \text{diffusion})`$:
+`RunGasTick` runs `RunGasPass(dt, project = false)` on every tick. The substep count is
+$`\max(\text{transport}, \text{diffusion})`$, and at the default $`\Delta t = 1/60`$ s
 
 ```math
-\text{transport} = \left\lceil \frac{\sqrt{2} \times 300 \times \tfrac{1}{30}}{8} \right\rceil = 2,
+\text{transport} = \left\lceil \frac{\sqrt{2} \times 300 \times \tfrac{1}{60}}{8} \right\rceil = 1,
 \qquad
-\text{diffusion} = \left\lceil (10 + 2.5) \times \tfrac{1}{30} \right\rceil = 1
+\text{diffusion} = \left\lceil (10 + 2.5) \times \tfrac{1}{60} \right\rceil = 1
 ```
 
-Each of the two 1/60 s substeps transports and forces the gas (`RunSmokePass`) and runs combustion and heat
-(`RunFireHeatPass`); only the last substep projects (substepped advection with one pressure solve per gas step).
-`RunGasPass(dt)` with the flag left on, as fixtures call it, projects every substep.
+so each tick transports and forces the gas (`RunSmokePass`) and runs combustion and heat (`RunFireHeatPass`) once. The
+pressure solve is `RunGasProjectionStage(begin, finish, budget)` over two ticks:
 
-**Why.** It halves the gas pass on average (combined profile 6.3 -> 3.4 ms per tick; 240 projections instead of 480 in
-`benchmark-realtime`), but not the tick that steps it, so frames alternate between a heavy and a light gas tick. Gas
-CG averaged 14.5 iterations, max 18. The 30 Hz look in a live window is not verified.
+1. First tick of a pair (the first tick after `InitializeState`, then every second one), after its substep: copy the gas
+   mask to `mask_solve`; `smoke_divergence.comp` on the velocity just advected; footprint kinds and pocket means; the
+   first residual check, $`\mathbf{s} = \mathbf{b} - L\mathbf{x}`$ and the first V-cycle; then CG iterations up to
+   $`\max(0, (n - 2) / 2)`$ with $`n`$ the previous solve's iteration count. The first half also carries the setup and
+   the preconditioner's first V-cycle, the second ends with the final check and the projection, hence the 2.
+
+2. Second tick, before its substep: the remaining iterations to the stop rule (8.5) or the cap, the final residual
+   diagnostic, `smoke_project.comp` on the faces as they are then, and the centre velocity. Its substep follows from the
+   projected field.
+
+The CG state ($`\mathbf{x}, \mathbf{s}, \mathbf{z}, \mathbf{d}, \mathbf{q}`$, the scalars $`\mathit{rz}, \alpha, \beta`$,
+the multigrid levels), the iteration count and the check schedule persist between the halves, so a split solve is the
+one-call solve: from identical states the pressure and the projected faces are bit identical (`app-gas-split-solve`).
+The operator is one system, too: the kinds, the residual checks and `smoke_project.comp` read `mask_solve`, a copy of
+the gas mask taken when the solve began, because water, sand and rock change the live mask every tick. On the live mask
+the final diagnostic counted 79 failing cells when rock was painted between the halves. `RunGasProjection()`, and
+`RunGasPass(dt)` with its default flag, do a complete solve in one call (fixtures).
+
+**Coupling lag.** The velocity is projected one tick after its divergence was measured. Brush stamps, coupling and the
+water and sand passes act in between, so a stamped velocity (up to 68 /s of divergence at the brush edge in the fire
+scene) is corrected by the next solve instead of this one, and a face beside a cell that became solid keeps its projected
+value until the next substep's advection zeroes it. The 30 Hz step had the same wait for a stamp made on its off ticks.
+Scalars (smoke, temperature, fuel, flame) now step every tick instead of every other one. Substeps alternate between
+advecting with the unprojected velocity (the one after a pair's second substep) and the projected one, the 30 Hz
+step's alternation in the other order.
+
+**Why.** The 30 Hz step put two substeps and the whole solve on one tick (about 5.6 ms) and nothing on the other, so
+frames alternated heavy and light and the p95 and maximum frame barely moved. The solve is about 90% of the gas time
+(transport and combustion about 0.6 ms of 6 per tick), so splitting the transport alone could not balance it; the
+solve itself is split. The pair costs what the 30 Hz step did (240 solves in `benchmark-realtime` either way), but each
+tick carries half of it. Measurements are in VALIDATION.
 
 ### 8.3 Transport
 
@@ -1280,7 +1427,7 @@ idempotent.
 | --- | --- | --- | --- |
 | `gas_max_velocity` | 300 gas cells/s | 3 m/s | buoyant flames and plumes rise at about 2 m/s (McCaffrey 1979) |
 | `gas_cfl_limit`, substeps | 8, 1-2 | | traces stop at walls |
-| `kGasTickStride` | 2 | | 30 Hz gas |
+| `kGasTickStride` | 2 | | ticks per pressure solve |
 | `gas_buoyancy_temperature`, `_smoke` | 1200, 10 $`\mathrm{gas\ cells/s^2}`$ per unit | | $`g\, \Delta T / T`$ about $`3g`$ at $`T = 1`$; flame tips reach 1-2 m/s within 0.2 s |
 | `gas_vorticity` | 40 /s | | Fedkiw et al. 2001; flames puff at a few Hz (Cetegen and Ahmed 1993) |
 | `gas_expansion` | 2 per unit fuel | | burnt gas 5-7x less dense; Nguyen et al. 2002 |
@@ -1300,8 +1447,8 @@ idempotent.
 
 ### 8.10 Gas limits and failure modes
 
-- Half resolution (1 cm) and 30 Hz stepping: flames step every other frame, and the heavy and light gas ticks
-  alternate in frame time.
+- Half resolution (1 cm), and one pressure solve per two ticks: the velocity is projected one tick after its divergence
+  was measured (8.2, coupling lag), and a velocity stamped in between is corrected a solve later.
 - Semi-Lagrangian transport is diffusive even with MacCormack; vorticity confinement restores curls but is not a
   turbulence model.
 - Smoke and temperature are bounded scalars, not mass or energy; the expansion source is the only density effect.
@@ -1510,17 +1657,84 @@ builds an albedo in this order:
     temperature (deep red, orange, yellow, yellow-white core) with strength from the flame field; a glow of hot gas
     ($`T^4`$) that outlives the flame; a bloom of eight fixed temperature taps at 8 and 14 cells; in lit frames rising
     noise tongues (two octaves of value noise stretched upward and scrolled with `fxTime`, cutting thin flame harder)
-    and a procedural spark and ember lattice (six layers; a spark exists when the gas at its birth point is burning
-    now; sparks rise fast and live about 0.3 s, embers arc under gravity for over a second); heat shimmer offsets the
-    whole lookup above and inside hot gas; wood embers.
+    (sparks and embers are particles drawn after the composite, 11.4); heat shimmer offsets the whole lookup above and
+    inside hot gas; wood embers.
 11. Sub-LSB dither against banding.
 
-`lighting_enabled_` (uniform `lighting`) switches the light, lantern, tongues, sparks and shimmer off, leaving plain
+`lighting_enabled_` (uniform `lighting`) switches the light, lantern, tongues and shimmer off (and `Render` skips `DrawSparks`), leaving plain
 albedo: the CPU oracle in `app-render-modes` mirrors the albedo math (including the PCG2D hash, Jarzynski and Olano
 2020) for scenes without water, smoke or fire; `app-lighting` checks the light qualitatively. The composite uses all 16
 fragment texture units GL 4.3 guarantees (units 0-15), so a new sampler must reuse one.
 
-### 11.4 HUD (`hud.frag`, `src/HudFont.hpp`)
+### 11.4 Sparks and embers (`spark_pick.comp`, `spark_step.comp`, `spark.vert`, `spark.frag`)
+
+Sparks and embers are simulation state, not a shader effect: a ring of $`N = 16384`$ records (two `vec4`, 512 KB,
+`SparkState`) advanced once per tick at the end of the render-extraction pass, and only once something that can burn was
+painted (`heat_present_`). The draw reads the ring and nothing else (no clock), so a frame is a function of the
+simulation state; a rerun of the same ticks gives byte-identical records (`app-sparks`). A record is
+$`(x, y, v_x, v_y)`$ in cells and cells/s and (age, life, drag time $`\tau`$, seed $`\times 2`$ + ember); life 0 is dead.
+
+Spawning is a contest, so it needs no counter and does not depend on the order invocations run in. Per gas cell and
+tick `spark_pick.comp` hashes (cell, tick) to a number $`u \in [0, 1)`$; only $`u < 0.02`$ read any texture. With the
+gas temperature $`T`$, the reaction rate $`r`$ and $`h = \max(T, r)`$:
+
+```math
+p_{\mathrm{flame}} = 0.0045\,\mathrm{smoothstep}(0.35, 0.8, h), \qquad
+p_{\mathrm{ember}} = 0.0005\,\mathrm{smoothstep}(0.45, 0.9, h) + 0.002\, w
+```
+
+with $`w`$ the burning share (material 256 to 511) of the 4 x 4 cells around the gas cell, so wood throws embers of its
+own. $`u < p_{\mathrm{flame}}`$ bids a flame spark and $`p_{\mathrm{flame}} \le u < p_{\mathrm{flame}} + p_{\mathrm{ember}}`$ an
+ember. Burning oil needs no case: it feeds the gas above it, which burns (10.3). A bid goes to bucket
+$`H(\text{cell}, \text{tick}) \bmod 128`$ with the key (13-bit hash priority, ember bit, cell index + 1) by `atomicMax`,
+which is order independent, so the winners are a function of the fields and the tick. Then `spark_step.comp` gives
+tick $`t`$ the 128 slots from $`128\,(t \bmod 128)`$: slot $`b`$ of the range takes bucket $`b`$'s winner, born at a hashed
+point of its gas cell, or is retired if the bucket is empty. The ring period is 128 ticks (2.13 s), longer than the
+longest life (2.1 s), so a slot is overwritten only after its spark died. At most 128 spawns a tick (7680 per second);
+a flame of 400 burning gas cells makes about 110 flame sparks and 12 embers a second (0.0045 and 0.0005 per cell
+and tick), so about 50 sparks and 20 embers are alive at once.
+
+| | Flame spark | Ember |
+| --- | --- | --- |
+| life | 0.30-0.65 s | 0.9-2.1 s |
+| drag time $`\tau`$ | 0.04-0.09 s | 0.12-0.26 s |
+| burst on top of the gas velocity | 10-60 cells/s within 1.6 rad of up | 60-180 cells/s within 1 rad of up |
+| thermal lift $`\lambda`$ | 0.9 | 0.5 |
+| restitution | 0.2 | 0.4 |
+| colour at birth | yellow, $`T_0`$ 0.8-1.0 | orange, $`T_0`$ 0.55-0.8 |
+
+Motion, per tick, exactly integrated for a constant acceleration over the tick. The gas velocity $`\mathbf{u}`$ is the
+bilinear value between gas cell centres, doubled to cells/s; $`\theta = 1 - \mathrm{age}/\mathrm{life}`$ is the heat;
+$`g`$ is `|water_gravity|` (1962 cells/s$`^2`$); $`\mathbf{a}_{\mathrm{turb}}`$ is a hashed random acceleration of at most
+900 (sparks) or 300 (embers) cells/s$`^2`$ per axis:
+
+```math
+\mathbf{v}_\infty = \mathbf{u}(\mathbf{x}) + \tau\,\big(\mathbf{a}_{\mathrm{turb}} - g\,(1 - \lambda\,\theta)\,\hat{\mathbf{y}}\big), \qquad
+\mathbf{v}' = \mathbf{v}_\infty + (\mathbf{v} - \mathbf{v}_\infty)\, e^{-\Delta t / \tau}
+```
+
+A hot spark is nearly weightless and follows the plume; as it cools ($`\theta \to 0`$) gravity returns and it falls
+relative to the gas at $`g \tau`$ (120-250 cells/s for an ember). Speed is capped at 700 cells/s. The move is swept in
+$`\lceil \max(|v_x|, |v_y|)\,\Delta t \rceil \le 8`$ sub-steps of at most a cell. Entering rock (boundary mask 1, and the
+domain's sides and floor) reflects the blocked axis (a corner both) by the restitution above, slows the tangential
+speed by 30%, rests a normal speed under 40 cells/s, and cools the spark by $`0.1\,\mathrm{life}\,\min(1, |v|/150)`$ of
+its life. Sand (mask 2 and 3), the top of the domain, water amount above 0.03 at the end of the move, and an age that
+such a hit has carried to the life put it out.
+
+Drawing (`DrawSparks`, lit composite frames only, inside `Render` after the composite): one instanced quad per record,
+dead records collapsed outside the clip volume, from the ring as two per-instance attributes. The streak runs from the
+head at the spark's cell back along its velocity by 0.022 s of travel (at most 7 cells) and is at least 1.8 pixels wide;
+colour is the fire's ramp at $`T = T_0 (1 - \mathrm{age}/\mathrm{life})^{1.4}`$ (yellow through red as it cools),
+intensity 1.3 (spark) or 1.5 (ember) with a fast fade-in, a fade-out over the last 40% of its life and a flicker
+$`0.75 + 0.25 \sin(47\,\mathrm{age} + 2\pi\,\mathrm{seed})`$. Two passes: first a soft quad of radius 6 cells that lights
+the scene around it, blended as $`d(1 + 0.35\,c\,f^2)`$ with $`f = 1 - r^2`$; then the streak, blended as the fire's own
+soft saturation, $`d + (1 - d)(1 - e^{-c w})`$ with $`w`$ across and along the streak (a third at the tail). Unlit
+frames and the debug views skip both passes, so the pixel oracles never see a spark.
+
+Cost on the RX 7800 XT: the two passes together take 0.008 ms per tick (median; 0.02 ms at most) in a large fire
+holding about 4000 sparks, and the two draw passes add 0.03 ms to a 1000 x 1000 lit frame.
+
+### 11.5 HUD (`hud.frag`, `src/HudFont.hpp`)
 
 One fullscreen pass blended with premultiplied alpha over the finished frame, interactive loop only. Layout is in
 units of `uiScale` framebuffer pixels (one step per about 450 framebuffer rows), every plate and tile edge on a unit,
@@ -1620,14 +1834,15 @@ Papers and books cited in the code, PLAN.md and this document.
   Mathematics.
 - Enright, D., Nguyen, D., Gibou, F., and Fedkiw, R. (2003). Using the particle level set method and a second order
   accurate pressure boundary condition for free surface flows. Proc. 4th ASME-JSME Joint Fluids Engineering Conference.
-  (Ghost-fluid surface; measured and not kept.)
+  (Ghost-fluid free surface, 4.8.)
 - Fedkiw, R., Stam, J., and Jensen, H. W. (2001). Visual simulation of smoke. SIGGRAPH.
 - Ferguson, R. I., and Church, M. (2004). A simple universal equation for grain settling velocity. Journal of
   Sedimentary Research.
 - Gao, M., Wang, X., Wu, K., Pradhana, A., Sifakis, E., Yuksel, C., and Jiang, C. (2018). GPU optimization of material
   point methods. ACM Transactions on Graphics.
 - Gibou, F., Fedkiw, R., Cheng, L.-T., and Kang, M. (2002). A second-order-accurate symmetric discretization of the
-  Poisson equation on irregular domains. Journal of Computational Physics. (Ghost-fluid surface; not kept.)
+  Poisson equation on irregular domains. Journal of Computational Physics. (Symmetric ghost-fluid discretisation,
+  conductance $`1/\theta`$, 4.8.)
 - Gunn, R., and Kinzer, G. D. (1949). The terminal velocity of fall for water droplets in stagnant air. Journal of
   Meteorology.
 - Harlow, F. H., and Welch, J. E. (1965). Numerical calculation of time-dependent viscous incompressible flow of fluid
@@ -1648,6 +1863,8 @@ Papers and books cited in the code, PLAN.md and this document.
 - Kugelstadt, T., Longva, A., Thuerey, N., and Bender, J. (2021). Implicit density projection for volume conserving
   liquids. IEEE Transactions on Visualization and Computer Graphics 27(4). (Density correction.)
 - Lekner, J., and Dorf, M. C. (1988). Why some things are darker when wet. Applied Optics.
+- Losasso, F., Gibou, F., and Fedkiw, R. (2004). Simulating water and smoke with an octree data structure. ACM
+  Transactions on Graphics (SIGGRAPH). (Ghost-fluid free surface in a liquid solver, 4.8.)
 - Lu, N., and Likos, W. J. (2004). Unsaturated Soil Mechanics. Wiley.
 - McAdams, A., Sifakis, E., and Teran, J. (2010). A parallel multigrid Poisson solver for fluids simulation on large
   grids. Symposium on Computer Animation. (MGPCG.)

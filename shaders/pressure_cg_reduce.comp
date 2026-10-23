@@ -12,8 +12,10 @@ layout(std430, binding = 2) buffer Scalars {
     uint running;
     uint invalidInput;
     uint iterations;
-    uint finishedGroups;
+    uint legBase;  // iterations before the current (re)start
     uvec4 liquidBounds;
+    float rhoBySlot[2];
+    uint restartArmed;  // pressure_cg.comp phase 10
 };
 layout(std430, binding = 3) buffer DebugCounters {
     uint nanInfDetected;
@@ -46,6 +48,8 @@ shared uvec4 bounds[256];
 bool invalid(float value) { return isnan(value) || isinf(value); }
 
 void main() {
+    // A restart is queued blind; it acts only when pressure_cg.comp phase 10 found one due.
+    if (restart != 0 && restartArmed == 0u) return;
     uint lane = gl_LocalInvocationID.x;
     bool finalReduction = phase != 0;
     vec4 total = vec4(0.0);
@@ -94,13 +98,14 @@ void main() {
     }
     rho = total.x;
     alpha = beta = 0.0;
-    invalidInput = finishedGroups = 0u;
+    invalidInput = 0u;
     liquidBounds = bounds[0];
     if (restart == 0) {
         iterations = 0u;
         tileDispatch = uvec4(0u, 1u, 1u, 0u);
         tileInfo = uvec4(0u);
     }
+    legBase = iterations;
     residualMax = total.y;
     bool nonfinite = total.z != 0.0 || invalid(total.x) || invalid(total.y);
     // A start leaves margin for the independent true-residual check after the solve; a restart is that same check of

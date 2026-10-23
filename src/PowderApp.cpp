@@ -220,6 +220,9 @@ void PowderApp::Shutdown() {
     if (gl_ready_) {
         DeleteTexture(hud_font_texture_);
         DeleteProgram(hud_program_);
+        DeleteProgram(spark_draw_program_);
+        DeleteProgram(spark_step_program_);
+        DeleteProgram(spark_pick_program_);
         DeleteProgram(light_build_program_);
         DeleteProgram(render_extract_program_);
         DeleteProgram(render_program_);
@@ -277,6 +280,12 @@ void PowderApp::Shutdown() {
         DeleteBuffer(phase_state_.cell_counts);
         DeleteBuffer(phase_state_.gas_sources);
         DeleteBuffer(phase_state_.sinks);
+        DeleteBuffer(spark_state_.buckets);
+        DeleteBuffer(spark_state_.particles);
+        if (spark_state_.vao != 0U) {
+            glDeleteVertexArrays(1, &spark_state_.vao);
+            spark_state_.vao = 0;
+        }
         DeleteTexture(phase_state_.oil_field);
         DeleteTexture(phase_state_.steam_a);
         DeleteTexture(phase_state_.steam_b);
@@ -337,6 +346,7 @@ void PowderApp::Shutdown() {
         DeleteBuffer(gas_state_.cg_scalars);
         DeleteTexture(gas_state_.divergence);
         DeleteTexture(gas_state_.pressure_a);
+        DeleteTexture(gas_state_.mask_solve);
         DeleteTexture(gas_state_.velocity_center_tmp);
         DeleteTexture(gas_state_.velocity_center_b);
         DeleteTexture(gas_state_.velocity_center_a);
@@ -428,6 +438,7 @@ void PowderApp::CreateTextures() {
     gas_state_.velocity_center_tmp = CreateTexture(kGasWidth, kGasHeight, GL_RG16F, GL_RG, GL_HALF_FLOAT, GL_LINEAR);
 
     gas_state_.pressure_a = CreateTexture(kGasWidth, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
+    gas_state_.mask_solve = CreateTexture(kGasWidth, kGasHeight, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
     gas_state_.divergence = CreateTexture(kGasWidth, kGasHeight, GL_R32F, GL_RED, GL_FLOAT, GL_NEAREST);
     for (int level = 0, size = kGasWidth; level < kGasLevels; ++level, size = (size + 1) / 2) {
         gas_state_.level_kind[level] = CreateTexture(size, size, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, GL_NEAREST);
@@ -552,7 +563,8 @@ void PowderApp::CreateBuffers() {
                  nullptr, GL_DYNAMIC_DRAW);
     glGenBuffers(1, &water_state_.pressure_scalars);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, water_state_.pressure_scalars);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(sizeof(float) * 6 + sizeof(GLuint) * 8),
+    // The solver's scalars, then the restart's arming flag and indirect arguments (pressure_cg.comp).
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(kWaterRestartDispatchOffset + sizeof(GLuint) * 4),
                  nullptr, GL_DYNAMIC_DRAW);
     const int tile_slots = ((kGridWidth + 15) / 16) * ((kGridHeight + 15) / 16);
     glGenBuffers(1, &water_state_.pressure_tiles);
@@ -672,6 +684,30 @@ void PowderApp::CreateBuffers() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, phase_state_.sinks);
     glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * count_bytes, nullptr, GL_DYNAMIC_DRAW);
 
+    // Sparks start dead (life 0): zeroed here, and again by InitializeState.
+    const std::vector<float> no_sparks(static_cast<std::size_t>(kSparkCapacity) * 8U, 0.0F);
+    const std::vector<GLuint> no_buckets(static_cast<std::size_t>(kSparkSpawnsPerTick), 0U);
+    glGenBuffers(1, &spark_state_.particles);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, spark_state_.particles);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(no_sparks.size() * sizeof(float)), no_sparks.data(),
+                 GL_DYNAMIC_DRAW);
+    glGenBuffers(1, &spark_state_.buckets);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, spark_state_.buckets);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(no_buckets.size() * sizeof(GLuint)), no_buckets.data(),
+                 GL_DYNAMIC_DRAW);
+    // The same buffer, one record per instance: motion at offset 0, life at 16.
+    glGenVertexArrays(1, &spark_state_.vao);
+    glBindVertexArray(spark_state_.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, spark_state_.particles);
+    for (GLuint attribute = 0; attribute < 2U; ++attribute) {
+        glEnableVertexAttribArray(attribute);
+        glVertexAttribPointer(attribute, 4, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(8 * sizeof(float)),
+                              reinterpret_cast<const void*>(static_cast<std::uintptr_t>(attribute * 4U * sizeof(float))));
+        glVertexAttribDivisor(attribute, 1);
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     glGenQueries(static_cast<GLsizei>(timing_queries_.size()), timing_queries_.data());
@@ -756,6 +792,9 @@ void PowderApp::CreatePrograms() {
     coupling_heat_program_ = glutil::CreateComputeProgram("coupling_heat.comp");
     render_extract_program_ = glutil::CreateComputeProgram("render_extract.comp");
     light_build_program_ = glutil::CreateComputeProgram("light_build.comp");
+    spark_pick_program_ = glutil::CreateComputeProgram("spark_pick.comp");
+    spark_step_program_ = glutil::CreateComputeProgram("spark_step.comp");
+    spark_draw_program_ = glutil::CreateProgram("spark.vert", "spark.frag");
 
     render_program_ = glutil::CreateProgram("fullscreen.vert", "composite.frag");
 
@@ -782,6 +821,7 @@ void PowderApp::InitializeState() {
     phase_state_.steam_ping = true;
     // The gas solve's check schedule follows the last solve, so a stale count makes repeated replays diverge.
     gas_state_.pressure_iterations = water_state_.pressure_iterations = 0;
+    gas_state_.solve_pending = gas_state_.solve_running = gas_state_.solve_started = false;
 
     glUseProgram(init_state_program_);
     glUniform2i(CachedUniform(init_state_program_, "gridSize"), kGridWidth, kGridHeight);
@@ -833,7 +873,8 @@ void PowderApp::InitializeState() {
     sand_state_.node_box = {0, 0, kGridWidth + 2, kGridHeight + 2};
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug_state_.counters);
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
-    for (GLuint buffer : {phase_state_.cell_counts, phase_state_.gas_sources, phase_state_.sinks}) {
+    for (GLuint buffer : {phase_state_.cell_counts, phase_state_.gas_sources, phase_state_.sinks, spark_state_.particles,
+                          spark_state_.buckets}) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
         glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero_uint);
     }
@@ -1142,6 +1183,7 @@ void PowderApp::RunFrame(float dt, const BrushConfig* scripted_brush, bool reset
     EndTimedPass(TimedPass::Coupling);
     BeginTimedPass(TimedPass::Extract);
     RunRenderFieldExtractionPass();
+    RunSparkPass(dt);
     EndTimedPass(TimedPass::Extract);
 }
 
@@ -1498,6 +1540,13 @@ void PowderApp::RunSpawnSandParticles(const BrushConfig& config, const DispatchR
     if (region.Empty()) {
         return;
     }
+    // A stamp that might not fit is skipped whole, keeping kSandWakeReserve slots free for packed sand that wakes (as
+    // RunSpawnWaterParticles): the brush stops at a full pool the same way every run, where the GPU's per-grain
+    // reservation at the cap dropped grains in atomic order and counted each as overflow.
+    const std::uint64_t spawned = static_cast<std::uint64_t>(region.width) * region.height * std::max(1, config.sand_particles);
+    if (sand_state_.record_bound + spawned > static_cast<std::uint64_t>(kMaxSandParticles - kSandWakeReserve)) {
+        return;
+    }
 
     glUseProgram(sand_particle_spawn_program_);
     glUniform2i(CachedUniform(sand_particle_spawn_program_, "gridSize"), kGridWidth, kGridHeight);
@@ -1523,7 +1572,6 @@ void PowderApp::RunSpawnSandParticles(const BrushConfig& config, const DispatchR
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, debug_state_.counters);
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-    const std::uint64_t spawned = static_cast<std::uint64_t>(region.width) * region.height * std::max(1, config.sand_particles);
     sand_state_.record_bound = static_cast<GLuint>(
         std::min<std::uint64_t>(sand_state_.record_bound + spawned, static_cast<std::uint64_t>(kMaxSandParticles)));
 }
@@ -1859,6 +1907,7 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1i(CachedUniform(sand_sleep_program_, "maxParticles"), static_cast<GLint>(sand_state_.record_bound));
         glUniform1f(CachedUniform(sand_sleep_program_, "sleepSpeed"), config_.sand_sleep_speed);
         glUniform1i(CachedUniform(sand_sleep_program_, "sleepTicks"), config_.sand_sleep_ticks);
+        glUniform1f(CachedUniform(sand_sleep_program_, "cohesionSoftening"), config_.sand_cohesion_softening);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.cell_tally);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.cell_fsum);
@@ -1945,7 +1994,6 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_grid_update_program_, "referenceDensity"), config_.sand_reference_density);
         glUniform1f(CachedUniform(sand_grid_update_program_, "frictionAlpha"), config_.sand_friction_alpha);
         glUniform1f(CachedUniform(sand_grid_update_program_, "cohesion"), config_.sand_cohesion);
-        glUniform1f(CachedUniform(sand_grid_update_program_, "cohesionSoftening"), config_.sand_cohesion_softening);
         glUniform1i(CachedUniform(sand_grid_update_program_, "skipEmptyTiles"), substep + 1 < sand_state_.substeps ? 1 : 0);
         glBindImageTexture(0, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
@@ -1985,6 +2033,8 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_particle_step_program_, "dryingRate"), config_.sand_drying_rate);
         glUniform1f(CachedUniform(sand_particle_step_program_, "moistureDt"), substep == 0 ? dt : 0.0F);
         glUniform1f(CachedUniform(sand_particle_step_program_, "waterFullVolume"), 4.0F * config_.water_amount_per_particle);
+        glUniform1ui(CachedUniform(sand_particle_step_program_, "roundSeed"),
+                     frame_index_ * 2654435761U + static_cast<GLuint>(substep));
         glBindImageTexture(0, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(1, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F);
         glBindImageTexture(2, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
@@ -2095,6 +2145,9 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform2i(CachedUniform(water_particle_finalize_program_, "gridSize"), kGridWidth, kGridHeight);
         glUniform1f(CachedUniform(water_particle_finalize_program_, "weightScale"), kWeightScale);
         glUniform1f(CachedUniform(water_particle_finalize_program_, "amountPerParticle"), config_.water_amount_per_particle);
+        glUniform1f(CachedUniform(water_particle_finalize_program_, "surfaceLevel"), config_.water_surface_level);
+        glUniform1f(CachedUniform(water_particle_finalize_program_, "restMass"), config_.water_rest_density);
+        glUniform1f(CachedUniform(water_particle_finalize_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
         glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
         glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
         glBindImageTexture(2, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
@@ -2241,6 +2294,7 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_project_program_, "gravityDelta"), config_.water_gravity * sub_dt);
         glUniform1f(CachedUniform(water_project_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
         glUniform1f(CachedUniform(water_project_program_, "sandLeak"), kSandLeak);
+        glUniform1f(CachedUniform(water_project_program_, "thetaMin"), config_.water_ghost_theta_min);
         glBindImageTexture(0, water_state_.mac_u_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(1, water_state_.mac_v_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
         glBindImageTexture(2, CurrentWaterPressure(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
@@ -2406,10 +2460,13 @@ void PowderApp::RunWaterProjection() {
     glUniform2i(CachedUniform(pressure_cg_program_, "solveSize"), kGridWidth, kGridHeight);
     glUniform1f(CachedUniform(pressure_cg_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
     glUniform1f(CachedUniform(pressure_cg_program_, "sandLeak"), kSandLeak);
+    glUniform1f(CachedUniform(pressure_cg_program_, "thetaMin"), config_.water_ghost_theta_min);
     glUniform1f(CachedUniform(pressure_cg_program_, "residualThreshold"), config_.water_pressure_residual_threshold);
     const GLint cg_phase = CachedUniform(pressure_cg_program_, "phase");
     const GLint cg_parity = CachedUniform(pressure_cg_program_, "parity");
     const GLint cg_first = CachedUniform(pressure_cg_program_, "firstIteration");
+    const GLint cg_gated = CachedUniform(pressure_cg_program_, "gated");
+    const GLint mg_gated = CachedUniform(pressure_mg_program_, "gated");
     glUseProgram(pressure_cg_reduce_program_);
     glUniform2i(CachedUniform(pressure_cg_reduce_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform2i(CachedUniform(pressure_cg_reduce_program_, "solveOrigin"), 0, 0);
@@ -2432,11 +2489,11 @@ void PowderApp::RunWaterProjection() {
                         (phase == 2 ? GL_SHADER_IMAGE_ACCESS_BARRIER_BIT : 0U));
     };
     int dispatched = 0;
-    int leg_start = 0;  // the first iteration of the current (re)start, where the sum-slot parity begins again
-    // Each iteration ends with phase 1, which tests it and already forms the next direction and A*direction.
+    // Each iteration ends with phase 1, which tests it and already forms the next direction and A*direction. The sum
+    // slots alternate with the global iteration number, so a restart the GPU decides on needs no host knowledge.
     const auto iterate = [&](int count) {
         for (int end = dispatched + count; dispatched < end; ++dispatched) {
-            const int parity = (dispatched - leg_start) & 1;
+            const int parity = dispatched & 1;
             glUseProgram(pressure_cg_program_);
             glUniform1i(cg_parity, parity);
             tile_step(2);
@@ -2446,25 +2503,47 @@ void PowderApp::RunWaterProjection() {
             tile_step(1);
         }
     };
-    // Forms b - Ap from the stored pressure and starts CG on it; a restart keeps the tile list and iteration count.
+    const auto step_indirect = [&](GLuint program, GLint location, int phase, GLintptr offset) {
+        glUseProgram(program);
+        glUniform1i(location, phase);
+        glDispatchComputeIndirect(offset);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+    };
+    // Forms b - Ap from the stored pressure and starts CG on it. A restart keeps the tile list and iteration count and
+    // is queued blind: phase 10 arms it only for a solve that has stopped after iterating, and every pass of it
+    // launches nothing (or returns) otherwise, so the host never waits to learn whether it is due.
     const auto start = [&](bool restart) {
-        leg_start = dispatched;
+        const int parity = dispatched & 1;  // of the iteration that follows, whose previous sum slot z fills
         glUseProgram(pressure_cg_reduce_program_);
         glUniform1i(CachedUniform(pressure_cg_reduce_program_, "restart"), restart ? 1 : 0);
-        step(pressure_cg_program_, cg_phase, 0, cell_groups);
-        step(pressure_cg_reduce_program_, reduce_phase, 0, cell_groups);
+        if (restart) {
+            step(pressure_cg_program_, cg_phase, 10, 1);
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, water_state_.pressure_scalars);
+            step_indirect(pressure_cg_program_, cg_phase, 0, kWaterRestartDispatchOffset);
+            step_indirect(pressure_cg_reduce_program_, reduce_phase, 0, kWaterRestartDispatchOffset);
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, water_state_.pressure_tiles);
+        } else {
+            step(pressure_cg_program_, cg_phase, 0, cell_groups);
+            step(pressure_cg_reduce_program_, reduce_phase, 0, cell_groups);
+        }
         step(pressure_cg_reduce_program_, reduce_phase, 1, 1);
         if (!restart) {
             step(pressure_cg_program_, cg_phase, 8, tile_slots);
             step(pressure_cg_program_, cg_phase, 9, 1);
         }
+        glUseProgram(pressure_mg_program_);
+        glUniform1i(mg_gated, restart ? 1 : 0);
         SetupWaterMultigrid();
-        ApplyWaterMultigrid(2, true);
+        ApplyWaterMultigrid(2 - parity, true);
+        glUseProgram(pressure_mg_program_);
+        glUniform1i(mg_gated, 0);
         glUseProgram(pressure_cg_program_);
-        glUniform1i(cg_parity, 0);
+        glUniform1i(cg_parity, parity);
         glUniform1i(cg_first, 1);
+        glUniform1i(cg_gated, restart ? 1 : 0);
         tile_step(1);
         glUniform1i(cg_first, 0);
+        glUniform1i(cg_gated, 0);
     };
     start(false);
 
@@ -2477,37 +2556,30 @@ void PowderApp::RunWaterProjection() {
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 4 * sizeof(float), sizeof(state), state.data());
         return state[0] != 0;
     };
-    GLuint leg_base = 0;  // iterations before the current (re)start
-    for (;;) {
-        // Confirm with a copy of the state and a fence, keeping the GPU busy with more iterations while the CPU waits
-        // for the fence (they launch nothing once the solve has stopped): one, then twice as many per confirmation
-        // still running, up to 4.
-        int ahead = 1;
-        while (dispatched < cap) {
-            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-            glBindBuffer(GL_COPY_READ_BUFFER, water_state_.pressure_scalars);
-            glBindBuffer(GL_COPY_WRITE_BUFFER, water_state_.pressure_state);
-            glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 4 * sizeof(float), 0, sizeof(state));
-            GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-            iterate(std::min(ahead, cap - dispatched));
-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
-            glDeleteSync(fence);
-            // The copy finished before the fence, so mapping it does not wait for the speculative iterations.
-            const void* copied = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, sizeof(state), GL_MAP_READ_BIT);
-            std::memcpy(state.data(), copied, sizeof(state));
-            glUnmapBuffer(GL_COPY_WRITE_BUFFER);
-            if (state[0] == 0) break;
-            ahead = std::min(4, ahead * 2);
-        }
-        if (dispatched == cap) read_state();
-        // CG stops on its recursive residual, which drifts from the true b - Ap as float rounds a large pressure
-        // (deep packed pools). Restart from the true residual until that passes the test itself, a failure or the cap.
-        // A leg that iterated nothing has its start's true residual passing already.
-        if (state[0] != 0 || state[1] != 0 || dispatched == cap || state[2] == leg_base) break;
-        leg_base = state[2];
-        start(true);
-        if (!read_state()) break;  // the true residual passed (or the restart failed): nothing more is dispatched
+    // CG stops on its recursive residual, which drifts from the true b - Ap as float rounds a large pressure (deep packed
+    // pools), so a stopped solve restarts from the true residual until that passes the test itself, fails or reaches the
+    // cap. Each pass queues that restart (a no-op unless the solve has just stopped), copies the state behind a fence and,
+    // once a pass has found the solve running, keeps the GPU busy with 1, then 2, then up to 4 more iterations while the
+    // CPU waits for the fence (they launch nothing once the solve has stopped).
+    for (int ahead = 0; dispatched < cap;) {
+        if (dispatched > 0) start(true);  // a solve that never iterated has formed its true residual already
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+        glBindBuffer(GL_COPY_READ_BUFFER, water_state_.pressure_scalars);
+        glBindBuffer(GL_COPY_WRITE_BUFFER, water_state_.pressure_state);
+        glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 4 * sizeof(float), 0, sizeof(state));
+        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        iterate(std::min(ahead, cap - dispatched));
+        glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
+        glDeleteSync(fence);
+        // The copy finished before the fence, so mapping it does not wait for the speculative iterations.
+        const void* copied = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, sizeof(state), GL_MAP_READ_BIT);
+        std::memcpy(state.data(), copied, sizeof(state));
+        glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+        if (state[0] == 0 || dispatched >= cap) break;
+        if (ahead == 0) iterate(std::min(1, cap - dispatched));  // else the next fence would sit where this one did
+        ahead = std::min(4, std::max(1, ahead * 2));
     }
+    if (dispatched == cap) read_state();
     water_state_.pressure_iterations = static_cast<int>(state[2]);
     water_state_.pressure_dispatched = dispatched;
     glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
@@ -2520,6 +2592,7 @@ void PowderApp::RunWaterProjection() {
     glUniform1f(CachedUniform(pressure_residual_program_, "residualThreshold"), config_.water_pressure_residual_threshold);
     glUniform1i(CachedUniform(pressure_residual_program_, "collectStats"), 0);
     glUniform1i(CachedUniform(pressure_residual_program_, "useLiquidMask"), 1);
+    glUniform1f(CachedUniform(pressure_residual_program_, "thetaMin"), config_.water_ghost_theta_min);
     glUniform1f(CachedUniform(pressure_residual_program_, "sandLeak"), kSandLeak);
     glUniform1f(CachedUniform(pressure_residual_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
     glUniform1i(CachedUniform(pressure_residual_program_, "pressureTex"), 0);
@@ -2530,14 +2603,23 @@ void PowderApp::RunWaterProjection() {
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
-// The gas runs every kGasTickStride-th tick (the first tick after InitializeState included) over the elapsed time of
-// that many ticks, with transport substeps but one projection. Brush stamps and coupling still act every tick, so the
-// other passes see gas that is up to a tick old.
+// Every tick advances the gas by its own dt (transport, forces, combustion, heat); the pressure solve spans a pair of
+// ticks. The first tick of a pair (the first one after InitializeState) builds the solve from the velocity it just
+// advected and runs about half of the previous solve's CG iterations; the second finishes it, projects that velocity,
+// then advects the projected field. Brush stamps, coupling and the water and sand passes act between the halves, so
+// the correction lands on a field that has been stamped once since its divergence was measured (a stamped velocity is
+// corrected a pair later), while the solve keeps the gas mask it was built on and stays one consistent operator.
 void PowderApp::RunGasTick(float dt) {
-    if ((frame_index_ - 1U) % kGasTickStride == 0U) RunGasPass(dt * static_cast<float>(kGasTickStride), false);
+    const bool begins = (frame_index_ - 1U) % kGasTickStride == 0U;
+    if (!begins) RunGasProjectionStage(false, true, -1);
+    RunGasPass(dt, false);
+    // Half of the last solve's iterations, less one pair: the first half also builds the right-hand side and the
+    // preconditioner's first V-cycle, the second ends with the final check and the projection (measured: 2.94 and 2.98 ms).
+    if (begins) RunGasProjectionStage(true, false, std::max(0, (gas_state_.pressure_iterations - 2) / 2));
 }
 
-void PowderApp::RunGasPass(float dt, bool project_each_substep) {
+// project: every substep ends with a complete projection (fixtures); otherwise the caller owns the pressure solve.
+void PowderApp::RunGasPass(float dt, bool project) {
     const float gas_speed_bound = std::sqrt(2.0F) * config_.gas_max_velocity;
     const int transport_substeps = powder_config::SubstepCount(gas_speed_bound, dt, config_.gas_cfl_limit,
                                                     config_.gas_min_substeps, config_.gas_max_substeps,
@@ -2551,7 +2633,7 @@ void PowderApp::RunGasPass(float dt, bool project_each_substep) {
     gas_state_.substeps = substeps;
     const float sub_dt = dt / static_cast<float>(substeps);
     for (int step = 0; step < substeps; ++step) {
-        RunSmokePass(sub_dt, project_each_substep || step == substeps - 1);
+        RunSmokePass(sub_dt, project);
         RunFireHeatPass(sub_dt);
     }
 }
@@ -2658,17 +2740,31 @@ void PowderApp::RunSmokePass(float dt, bool project) {
     if (project) RunGasProjection();
 }
 
-void PowderApp::RunGasProjection() {
-    glUseProgram(smoke_divergence_program_);
-    glUniform2i(CachedUniform(smoke_divergence_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, gas_state_.divergence, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(4, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glUniform1f(CachedUniform(smoke_divergence_program_, "expansion"), config_.gas_expansion);
-    glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    DispatchGrid(kGasWidth, kGasHeight);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+void PowderApp::RunGasProjection() { RunGasProjectionStage(true, true, -1); }
+
+void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_budget) {
+    if (!begin && !gas_state_.solve_pending) return;  // the solve was reset between its halves
+    if (begin) {
+        // The operator, residual checks and projection all use this copy: water, sand and rock keep moving the live mask
+        // between the halves of a tick pair.
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glCopyImageSubData(boundary_state_.mask_gas, GL_TEXTURE_2D, 0, 0, 0, 0, gas_state_.mask_solve, GL_TEXTURE_2D, 0, 0,
+                           0, 0, kGasWidth, kGasHeight, 1);
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    }
+    const GLuint solve_mask = gas_state_.mask_solve;
+    if (begin) {
+        glUseProgram(smoke_divergence_program_);
+        glUniform2i(CachedUniform(smoke_divergence_program_, "gasSize"), kGasWidth, kGasHeight);
+        glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+        glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+        glBindImageTexture(2, gas_state_.divergence, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+        glBindImageTexture(4, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+        glUniform1f(CachedUniform(smoke_divergence_program_, "expansion"), config_.gas_expansion);
+        glBindImageTexture(3, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        DispatchGrid(kGasWidth, kGasHeight);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
 
     // Level sizes and V-cycle textures; on level 0 the V-cycle maps the CG residual s to z.
     std::array<int, kGasLevels> sizes{};
@@ -2679,24 +2775,26 @@ void PowderApp::RunGasProjection() {
     const auto level_rhs = [this](int level) { return level == 0 ? gas_state_.cg_s : gas_state_.level_rhs[level - 1]; };
     const int open_top = config_.gas_open_top ? 1 : 0;
 
-    // Footprint kinds per level, so no pass scans a coarse cell's whole fine footprint.
-    glUseProgram(gas_pressure_kind_program_);
-    for (int level = 0; level < kGasLevels; ++level) {
-        glUniform2i(CachedUniform(gas_pressure_kind_program_, "fineSize"), sizes[std::max(level - 1, 0)],
-                    sizes[std::max(level - 1, 0)]);
-        glUniform2i(CachedUniform(gas_pressure_kind_program_, "coarseSize"), sizes[level], sizes[level]);
-        glUniform1i(CachedUniform(gas_pressure_kind_program_, "fromMask"), level == 0 ? 1 : 0);
-        glBindImageTexture(0, level == 0 ? boundary_state_.mask_gas : gas_state_.level_kind[level - 1], 0, GL_FALSE, 0,
-                           GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(1, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
-        DispatchGrid(sizes[level], sizes[level]);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    if (begin) {
+        // Footprint kinds per level, so no pass scans a coarse cell's whole fine footprint.
+        glUseProgram(gas_pressure_kind_program_);
+        for (int level = 0; level < kGasLevels; ++level) {
+            glUniform2i(CachedUniform(gas_pressure_kind_program_, "fineSize"), sizes[std::max(level - 1, 0)],
+                        sizes[std::max(level - 1, 0)]);
+            glUniform2i(CachedUniform(gas_pressure_kind_program_, "coarseSize"), sizes[level], sizes[level]);
+            glUniform1i(CachedUniform(gas_pressure_kind_program_, "fromMask"), level == 0 ? 1 : 0);
+            glBindImageTexture(0, level == 0 ? solve_mask : gas_state_.level_kind[level - 1], 0, GL_FALSE, 0,
+                               GL_READ_ONLY, GL_R8UI);
+            glBindImageTexture(1, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+            DispatchGrid(sizes[level], sizes[level]);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
+        // Only burning (fire, wood, lit oil) adds a source; wall faces carry no flux, so without one a sealed pocket's
+        // divergence already sums to zero.
+        if (oil_present_ || heat_present_) RemovePocketMeans(true);
     }
-    // Only burning (fire, wood, lit oil) adds a source; wall faces carry no flux, so without one a sealed pocket's
-    // divergence already sums to zero.
-    if (oil_present_ || heat_present_) RemovePocketMeans(true);
 
-    const auto check_residual = [this, open_top](bool collect_stats) {
+    const auto check_residual = [this, open_top, solve_mask](bool collect_stats) {
         glUseProgram(pressure_residual_program_);
         glUniform2i(CachedUniform(pressure_residual_program_, "gridSize"), kGasWidth, kGasHeight);
         glUniform1i(CachedUniform(pressure_residual_program_, "boundaryScale"), 1);
@@ -2712,7 +2810,7 @@ void PowderApp::RunGasProjection() {
         glUniform1i(CachedUniform(pressure_residual_program_, "pressureTex"), 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gas_state_.pressure_a);
-        glBindImageTexture(2, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        glBindImageTexture(2, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, debug_state_.counters);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gas_state_.pressure_check);
         DispatchGrid(kGasWidth, kGasHeight);
@@ -2838,31 +2936,39 @@ void PowderApp::RunGasProjection() {
         cg_phase(6);
     };
 
-    // Flexible preconditioned CG (the V-cycle varies slightly from a fixed linear map); the stored-operator
-    // residual check below decides convergence, independent of the CG recurrences.
-    bool running = needs_iteration();
-    if (running) {
-        cg_phase(0);
-        precondition(true);
+    if (begin) {
+        // Flexible preconditioned CG (the V-cycle varies slightly from a fixed linear map); the stored-operator
+        // residual check decides convergence, independent of the CG recurrences. Each check stalls the CPU on the
+        // GPU, so the first comes just before the previous solve stopped, then every two iterations. A stopped or
+        // capped solve skips the next V-cycle: n iterations run n V-cycles.
+        gas_state_.solve_pending = true;
+        gas_state_.solve_running = needs_iteration();
+        gas_state_.solve_started = gas_state_.solve_running;
+        gas_state_.solve_iterations = 0;
+        gas_state_.solve_next_check = std::max(3, gas_state_.pressure_iterations - 1);
+        if (gas_state_.solve_running) {
+            cg_phase(0);
+            precondition(true);
+        }
     }
-    // Each check stalls the CPU on the GPU, so the first comes just before the previous solve stopped, then every
-    // two iterations. A stopped or capped solve skips the next V-cycle: n iterations run n V-cycles.
-    const bool solving = running;
-    int next_check = std::max(3, gas_state_.pressure_iterations - 1);
-    int iterations = 0;
-    for (int iteration = 0; iteration < config_.gas_pressure_iterations && running; ++iteration) {
+
+    for (int ran = 0; gas_state_.solve_running && gas_state_.solve_iterations < config_.gas_pressure_iterations &&
+                      (iteration_budget < 0 || ran < iteration_budget);
+         ++ran) {
         cg_phase(1);
         cg_phase(2);
         cg_phase(3);
-        iterations = iteration + 1;
+        const int iterations = ++gas_state_.solve_iterations;
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
-        if (iterations == next_check && iterations < config_.gas_pressure_iterations) {
-            running = needs_iteration();
-            next_check += 2;
+        if (iterations == gas_state_.solve_next_check && iterations < config_.gas_pressure_iterations) {
+            gas_state_.solve_running = needs_iteration();
+            gas_state_.solve_next_check += 2;
         }
-        if (running && iterations < config_.gas_pressure_iterations) precondition(false);
+        if (gas_state_.solve_running && iterations < config_.gas_pressure_iterations) precondition(false);
     }
-    if (solving) gas_state_.pressure_iterations = iterations;
+    if (!finish) return;
+    gas_state_.solve_pending = false;
+    if (gas_state_.solve_started) gas_state_.pressure_iterations = gas_state_.solve_iterations;
 
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
     check_residual(false);
@@ -2876,7 +2982,7 @@ void PowderApp::RunGasProjection() {
     glBindImageTexture(2, gas_state_.pressure_a, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
     glBindImageTexture(3, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
     glBindImageTexture(4, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(5, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    glBindImageTexture(5, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -3089,6 +3195,59 @@ void PowderApp::RunLightBuildPass() {
     glGenerateMipmap(GL_TEXTURE_2D);
 }
 
+// Sparks and embers are simulation state: one tick of the ring (spark_pick.comp bids, spark_step.comp spawns and
+// advances). Nothing burns, and none are alive, until something was painted that can burn.
+void PowderApp::RunSparkPass(float dt) {
+    if (!heat_present_) return;
+    glUseProgram(spark_pick_program_);
+    glUniform2i(CachedUniform(spark_pick_program_, "gasSize"), kGasWidth, kGasHeight);
+    glUniform1ui(CachedUniform(spark_pick_program_, "tick"), frame_index_);
+    glUniform1ui(CachedUniform(spark_pick_program_, "bucketCount"), static_cast<GLuint>(kSparkSpawnsPerTick));
+    glUniform1i(CachedUniform(spark_pick_program_, "woodPresent"), wood_present_ ? 1 : 0);
+    glBindImageTexture(0, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindImageTexture(1, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(2, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    glBindImageTexture(3, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, spark_state_.buckets);
+    DispatchGrid(kGasWidth, kGasHeight);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glUseProgram(spark_step_program_);
+    glUniform2i(CachedUniform(spark_step_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform2i(CachedUniform(spark_step_program_, "gasSize"), kGasWidth, kGasHeight);
+    glUniform1ui(CachedUniform(spark_step_program_, "tick"), frame_index_);
+    glUniform1f(CachedUniform(spark_step_program_, "dt"), dt);
+    glUniform1ui(CachedUniform(spark_step_program_, "capacity"), static_cast<GLuint>(kSparkCapacity));
+    glUniform1ui(CachedUniform(spark_step_program_, "perTick"), static_cast<GLuint>(kSparkSpawnsPerTick));
+    glUniform1f(CachedUniform(spark_step_program_, "gravity"), std::abs(config_.water_gravity));
+    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    glBindImageTexture(1, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    glBindImageTexture(2, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, spark_state_.particles);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, spark_state_.buckets);
+    glDispatchCompute((kSparkCapacity + 63U) / 64U, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+}
+
+// Lit frames only, over the composite: a wide soft quad that brightens the scene around each spark, then its streak.
+void PowderApp::DrawSparks(const SimRect& sim, int fb_width, int fb_height) {
+    glUseProgram(spark_draw_program_);
+    glUniform2i(CachedUniform(spark_draw_program_, "gridSize"), kGridWidth, kGridHeight);
+    glUniform4i(CachedUniform(spark_draw_program_, "simRect"), sim.x, sim.y, sim.width, sim.height);
+    glUniform2i(CachedUniform(spark_draw_program_, "fbSize"), fb_width, fb_height);
+    glBindVertexArray(spark_state_.vao);
+    glEnable(GL_BLEND);
+    // Pass 1 multiplies: dst * (1 + src). Pass 0 screens: dst + (1 - dst) src, the fire's own soft saturation.
+    const std::array<GLenum, 2> source_factor{GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR};
+    for (int pass = 1; pass >= 0; --pass) {
+        glBlendFunc(source_factor[static_cast<std::size_t>(pass)], GL_ONE);
+        glUniform1i(CachedUniform(spark_draw_program_, "pass"), pass);
+        glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, kSparkCapacity);
+    }
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
 // Only the interactive loop letterboxes; tests and replays keep the simulation filling the framebuffer.
 void PowderApp::Render(bool letterbox) {
     // Lighting only dresses the composite view; the debug views read the fields directly.
@@ -3200,6 +3359,7 @@ void PowderApp::Render(bool letterbox) {
     glBindVertexArray(fullscreen_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
+    if (lit && heat_present_) DrawSparks(sim, fb_width, fb_height);
 }
 
 // Interactive-only overlay; Render() stays HUD-free so replays and pixel tests are unaffected.
