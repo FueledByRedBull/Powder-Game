@@ -1,7 +1,8 @@
 # Powder Game
 
 [![CI](https://github.com/FueledByRedBull/Powder-Game/actions/workflows/ci.yml/badge.svg)](https://github.com/FueledByRedBull/Powder-Game/actions/workflows/ci.yml)
-[![Release](https://github.com/FueledByRedBull/Powder-Game/actions/workflows/release.yml/badge.svg)](https://github.com/FueledByRedBull/Powder-Game/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/FueledByRedBull/Powder-Game)](https://github.com/FueledByRedBull/Powder-Game/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/FueledByRedBull/Powder-Game)](LICENSE)
 
 A falling-sand sandbox that runs entirely on the GPU. Paint sand, water, rock, smoke, fire, wood and oil onto a 1000 x 1000 grid: sand piles up, water pours and pools, oil floats and burns, and fire spreads through wood until something puts it out.
 
@@ -13,9 +14,15 @@ Sand is an MPM-style particle solid, water and oil are an APIC/FLIP liquid, and 
 
 ## Quick start
 
+### Download
+
+Windows 11 x64: download `PowderGame-<version>-win11-x64.zip` from the [latest release](https://github.com/FueledByRedBull/Powder-Game/releases/latest), unzip it and run `powder_game.exe`. It needs a GPU and driver that meet the requirements below. To check the download, compare its SHA-256 with `SHA256SUMS.txt` from the same release.
+
+### Requirements
+
 You need a GPU and driver with OpenGL 4.3 core and enough shader resources: at least 18 image units and compute image uniforms, 19 combined shader output resources and 8 SSBO binding points. The app checks these at startup. The scene shader also uses 16 fragment texture units, the OpenGL 4.3 minimum. Building needs CMake 3.24 or newer, a C++20 compiler and Python (for the GLAD generator). CMake fetches pinned copies of GLFW and GLAD when no system copies are found.
 
-### Windows 11
+### Build from source on Windows 11
 
 From a Visual Studio 2022 Developer PowerShell with CMake and Python on the path:
 
@@ -28,7 +35,7 @@ cmake --build build-msvc --config Release --parallel
 
 `powder_game.exe` is self-contained: the shaders are compiled into it and the C/C++ runtime is linked statically (`/MT`), so the executable alone runs from any folder without the VC++ redistributable. To try shader edits without rebuilding, set `POWDER_SHADER_DIR` to a folder holding every shader (for example the repository's `shaders`); the app then loads all of them from there and fails, naming the file, if one is missing. A `shaders` folder beside the executable is ignored. `PYTHONUTF8` stops the pinned GLAD generator misreading its bundled OpenGL specification under non-UTF-8 Windows locales.
 
-### Linux
+### Build from source on Linux
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -79,7 +86,7 @@ Experimental. It has been built and checked on one machine (Windows 11, Radeon R
 - Live mouse painting, the `H` key in a real window, HiDPI displays and temporal flicker have not been checked by hand.
 - Linux and MinGW builds have not been run in the validation environment, and no other GPU has been tried.
 
-[ROADMAP.md](ROADMAP.md) has the current handoff, open items and history.
+[ROADMAP.md](ROADMAP.md) has the current handoff, the open items and the project history.
 
 ## Tests
 
@@ -100,7 +107,7 @@ The second command runs the scripted replay scenes (`water`, `gas`, `sand`, `bou
 - `docs/`: the screenshot above and [ALGORITHMS.md](docs/ALGORITHMS.md), a per-pass reference of the numerical methods, constants and their sources
 - [PLAN.md](PLAN.md): architecture as implemented
 - [VALIDATION.md](VALIDATION.md): commands, tests and measured results
-- [ROADMAP.md](ROADMAP.md): handoff and evidence history
+- [ROADMAP.md](ROADMAP.md): handoff and history
 - `build-win11.sh`: MinGW cross-build and ZIP packaging
 - `.github/workflows/`: CI builds, and a draft release on `v*` tags
 
