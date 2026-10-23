@@ -3678,7 +3678,7 @@ GLuint PowderApp::CreateTexture(int width,
 
 GLint PowderApp::CachedUniform(GLuint program, const char* name) {
     auto& entry = uniform_locations_[program];
-    const auto it = entry.find(name);
+    const auto it = entry.find(std::string_view(name));
     if (it != entry.end()) return it->second;
     const GLint location = glGetUniformLocation(program, name);
     entry.emplace(name, location);
