@@ -40,6 +40,9 @@ jobs:
       - name: Build
         run: cmake --build build -j
 
+      - name: Config tests
+        run: ctest --test-dir build -R '^config-parsing$' --output-on-failure
+
   windows-build:
     name: Windows Build
     runs-on: windows-latest
@@ -55,6 +58,9 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release --parallel
+
+      - name: Config tests
+        run: ctest --test-dir build -C Release -R '^config-parsing$' --output-on-failure
 
       - name: Package Win11 artifact
         shell: pwsh
