@@ -2281,6 +2281,27 @@ struct AppLifecycleTests {
         const std::array<GLuint, 5> clamped_counters{8, 16, 4, 4, 8};
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(clamped_counters), clamped_counters.data());
         check_mode(PowderApp::RenderMode::DebugCounters, {0.25F, 0.5F, 0.5F});
+
+        // F10 also draws the pass timings: the interactive loop reads them a frame late, only in that view.
+        app.InitializeState();
+        const auto timed_frames = [&app](PowderApp::RenderMode mode, int frames) {
+            app.ResetReplayMetrics();  // every bar starts at -1, "never read"
+            app.render_mode_ = mode;
+            FixedStepClock clock;
+            for (int frame = 0; frame < frames; ++frame) {
+                Require(app.RunInteractiveFrame(clock, app.config_.fixed_dt) == 1, "each frame must run one tick");
+                if (app.pass_timings_ms_[0] >= 0.0F) break;  // a frame whose queries were not ready keeps the old values
+            }
+        };
+        timed_frames(PowderApp::RenderMode::Composite, 4);
+        for (const float ms : app.pass_timings_ms_) Require(ms == -1.0F, "pass timings must not be read outside the F10 view");
+        timed_frames(PowderApp::RenderMode::DebugCounters, 30);
+        float total_ms = 0.0F;
+        for (const float ms : app.pass_timings_ms_) {
+            Require(std::isfinite(ms) && ms >= 0.0F, "the F10 view must read every pass timing");
+            total_ms += ms;
+        }
+        Require(total_ms > 0.0F, "the F10 pass timings must be non-zero after a few ticks");
         app.render_mode_ = PowderApp::RenderMode::Composite;
         app.InitializeState();
         std::cout << "render extraction corners/constants and all ten render modes passed\n";
