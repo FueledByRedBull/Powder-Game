@@ -1,0 +1,72 @@
+#version 430
+
+// Spark and ember sources, one gas cell per invocation. A cell that burns (reaction rate or temperature), or sits by
+// burning wood, may bid for a spark this tick; each bid lands in one of `bucketCount` buckets and the highest priority
+// wins by atomicMax, so the winners do not depend on the order invocations run in. spark_step.comp spawns one spark
+// per bucket into the ring slot range of this tick. Lit oil burns as gas flame here, like the fire brush.
+// Key: priority (13 bits) | ember (1 bit) | gas cell index + 1 (18 bits); 0 is an empty bucket.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r16f, binding = 0) uniform readonly image2D temperatureTex;
+layout(rg16f, binding = 1) uniform readonly image2D reactionTex;
+layout(r8ui, binding = 2) uniform readonly uimage2D gasMaskTex;
+layout(r16ui, binding = 3) uniform readonly uimage2D materialTex;
+
+layout(std430, binding = 0) buffer Buckets {
+    uint buckets[];
+};
+
+uniform ivec2 gasSize;
+uniform uint tick;
+uniform uint bucketCount;
+uniform int woodPresent;
+
+// Per gas cell and tick: chance of a flame spark and of an ember at full burn, and of an ember beside a fully burning
+// wood neighbourhood. A cell draws one number below kGate or does nothing, so the rest of the cells never read a texture.
+const float kGate = 0.02;
+const float kFlameChance = 0.0045;
+const float kEmberChance = 0.0005;
+const float kWoodChance = 0.0020;
+
+uint hash(uvec2 p, uint salt) {
+    uint h = p.x * 0x8da6b343u ^ p.y * 0xd8163841u ^ salt * 0xcb1ab31fu;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+void main() {
+    ivec2 gas = ivec2(gl_GlobalInvocationID.xy);
+    if (gas.x >= gasSize.x || gas.y >= gasSize.y) {
+        return;
+    }
+    uint h = hash(uvec2(gas), tick);
+    float draw = float(h & 0xFFFFu) * (1.0 / 65536.0);
+    if (draw >= kGate || imageLoad(gasMaskTex, gas).r != 0u) {
+        return;
+    }
+    float heat = max(imageLoad(temperatureTex, gas).x, imageLoad(reactionTex, gas).y);
+    float burn = smoothstep(0.35, 0.8, heat);
+    float flame = kFlameChance * burn;
+    float ember = kEmberChance * smoothstep(0.45, 0.9, heat);
+    if (woodPresent != 0 && draw >= flame + ember) {
+        // Burning wood (material 256 + fuel) in the 4x4 simulation cells around the gas cell.
+        float wood = 0.0;
+        for (int y = -1; y < 3; ++y) {
+            for (int x = -1; x < 3; ++x) {
+                uint material = imageLoad(materialTex, clamp(gas * 2 + ivec2(x, y), ivec2(0), gasSize * 2 - 1)).r;
+                if (material >= 256u && material < 512u) wood += 1.0 / 16.0;
+            }
+        }
+        ember += kWoodChance * wood;
+    }
+    if (draw >= flame + ember) {
+        return;
+    }
+    uint kind = draw < flame ? 0u : 1u;
+    uint key = (((h >> 16) & 0x1FFFu) << 19) | (kind << 18) | uint(gas.y * gasSize.x + gas.x + 1);
+    atomicMax(buckets[hash(uvec2(gas.yx), tick ^ 0x9e3779b9u) % bucketCount], key);
+}

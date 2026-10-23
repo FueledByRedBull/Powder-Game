@@ -14,6 +14,13 @@ layout(std430, binding = 0) readonly buffer WaterCellCounts {
 uniform ivec2 gridSize;
 uniform float weightScale;
 uniform float amountPerParticle;
+// The liquid phi of the pressure solve is the particle density blurred over 3x3 cells (blocked cells left out of the
+// average) and mapped linearly so that surfaceLevel of the rest density restMass sits at liquidPhiThreshold. Cells
+// count as liquid by this smooth field, not by the particles they hold, so one particle crossing a cell edge does not
+// flip a cell of the solve, and the ghost-fluid fraction of a liquid-air face (pressure_cg.comp) interpolates it.
+uniform float surfaceLevel;
+uniform float restMass;
+uniform float liquidPhiThreshold;
 
 int linearIndex(ivec2 coord) {
     return coord.y * gridSize.x + coord.x;
@@ -26,6 +33,22 @@ ivec2 clampCell(ivec2 coord) {
 float particleEquivalentAt(ivec2 coord) {
     ivec2 clamped = clampCell(coord);
     return float(counts[linearIndex(clamped)]) / weightScale;
+}
+
+float surfacePhi(ivec2 coord) {
+    float total = 0.0;
+    float weights = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 sample_coord = clampCell(coord + ivec2(x, y));
+            if (imageLoad(boundaryTex, sample_coord).r != 0u) continue;
+            float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
+            total += w * particleEquivalentAt(sample_coord);
+            weights += w;
+        }
+    }
+    float density = total / max(weights, 1e-6) / restMass;
+    return clamp(liquidPhiThreshold + 2.0 * liquidPhiThreshold * (surfaceLevel - density), -1.0, 1.0);
 }
 
 void main() {
@@ -43,9 +66,9 @@ void main() {
 
     int cell_index = linearIndex(coord);
     uint weight_sum = counts[cell_index];
+    imageStore(liquidPhiTex, coord, vec4(surfacePhi(coord), 0.0, 0.0, 0.0));
     if (weight_sum == 0u) {
         imageStore(liquidVolumeTex, coord, vec4(0.0));
-        imageStore(liquidPhiTex, coord, vec4(1.0, 0.0, 0.0, 0.0));
         imageStore(waterAmountTex, coord, vec4(0.0));
         return;
     }
@@ -70,6 +93,5 @@ void main() {
     float water_amount = clamp(mix(liquid_volume, 1.0 - smoothstep(0.06, 0.42, liquid_phi), 0.28), 0.0, 1.0);
 
     imageStore(liquidVolumeTex, coord, vec4(liquid_volume, 0.0, 0.0, 0.0));
-    imageStore(liquidPhiTex, coord, vec4(liquid_phi, 0.0, 0.0, 0.0));
     imageStore(waterAmountTex, coord, vec4(water_amount, 0.0, 0.0, 0.0));
 }

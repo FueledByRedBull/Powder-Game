@@ -62,7 +62,6 @@ uniform float referenceDensity;
 // sand_particle_step.comp's friction alpha and wet-sand cohesion, for damp packed cells' bonds.
 uniform float frictionAlpha;
 uniform float cohesion;
-uniform float cohesionSoftening;
 
 int linearIndex(ivec2 coord) {
     return coord.y * (gridSize.x + 2) + coord.x;
@@ -91,7 +90,7 @@ float momentum(ivec2 value) {
 // gradients -1/2, 0, 1/2 per axis) and the isotropic Kirchhoff stress (lambda + mu) ln J, compression only. contact
 // receives the same sum without the stress (the direction away from the packed sand), bond the shear impulse damp packed
 // grains hold at zero pressure: the cohesion-widened cone's sqrt(2) alpha (lambda + mu) times the bond
-// (sand_particle_step.comp's cohesion times capillary(moisture) exp(-q / softening), from the cell's means).
+// (sand_particle_step.comp's cohesion times capillary(moisture) times the cell's mean exp(-q / softening)).
 vec2 packedImpulse(ivec2 node, out vec2 contact, out float bond) {
     const float kWeight[3] = float[3](1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0);
     const float kGradient[3] = float[3](-0.5, 0.0, 0.5);
@@ -111,10 +110,9 @@ vec2 packedImpulse(ivec2 node, out vec2 contact, out float bond) {
             float volume = dt * float(count) / referenceDensity;
             impulse -= volume * stress * gradient;
             contact += float(count) * gradient;
-            float q = 4.0 * mean.y / max(1.0 - mean.y, 1e-4);  // sand_particle_step.comp's hardening fraction
             float capillary = clamp(10.0 * mean.z, 0.0, 1.0) * clamp(10.0 * (1.0 - mean.z), 0.0, 1.0);
             bond += volume * 1.41421356 * frictionAlpha * (lameLambda + shearModulus) * cohesion * capillary *
-                    exp(-q / cohesionSoftening) * length(gradient);
+                    mean.w * length(gradient);
         }
     }
     return impulse;

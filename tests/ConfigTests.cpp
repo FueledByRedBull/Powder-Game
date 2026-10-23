@@ -66,6 +66,8 @@ constexpr FloatSetting kFloatSettings[] = {
     {"POWDER_WATER_GRAVITY", &SimulationConfig::water_gravity, -1962.0F, FloatDomain::Signed},
     {"POWDER_WATER_MAX_VELOCITY", &SimulationConfig::water_max_velocity, 2400.0F, FloatDomain::Positive},
     {"POWDER_WATER_DENSITY_RATE", &SimulationConfig::water_density_rate, 20.0F, FloatDomain::Nonnegative},
+    {"POWDER_WATER_SURFACE_LEVEL", &SimulationConfig::water_surface_level, 0.25F, FloatDomain::UnitInterval},
+    {"POWDER_WATER_GHOST_THETA_MIN", &SimulationConfig::water_ghost_theta_min, 0.25F, FloatDomain::UnitInterval},
     {"POWDER_WATER_FLIP_BLEND", &SimulationConfig::water_flip_blend, 0.97F, FloatDomain::UnitInterval},
     {"POWDER_WATER_PRESSURE_RESIDUAL", &SimulationConfig::water_pressure_residual_threshold, 0.12F, FloatDomain::Nonnegative},
     {"POWDER_GAS_CFL", &SimulationConfig::gas_cfl_limit, 8.0F, FloatDomain::Positive},

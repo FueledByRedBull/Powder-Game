@@ -6,8 +6,8 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r8ui, binding = 0) uniform uimage2D packedTex;
-// Mean volume ratio J (.x), hardening fraction (.y) and moisture (.z) of a cell's sleeping grains, restored when they wake.
-// 32-bit: a tick's drying is below the half-float step of the moisture.
+// Mean volume ratio J (.x), hardening fraction (.y), moisture (.z) and bond (.w, the mean of exp(-q / softening)) of a
+// cell's sleeping grains, restored when they wake. 32-bit: a tick's drying is below the half-float step of the moisture.
 layout(rgba32f, binding = 1) uniform image2D packedFTex;
 layout(r16f, binding = 2) uniform readonly image2D boundarySdfTex;
 layout(r16f, binding = 3) uniform readonly image2D waterAmountTex;
@@ -149,6 +149,32 @@ vec2 uniform2(uvec3 v) {
     return vec2(float(h & 65535u), float(h >> 16)) / 65536.0;
 }
 
+// Packed or solid cells on both lower diagonals of c arch over an empty cell below it (packed cells push on the grains
+// above them, sand_grid_update.comp): a grain held there stayed moving and blocked the cells above it from packing.
+bool archedOver(ivec2 below) {
+    return (solidAt(below + ivec2(-1, 0)) || packedAt(below + ivec2(-1, 0))) &&
+           (solidAt(below + ivec2(1, 0)) || packedAt(below + ivec2(1, 0)));
+}
+
+// A packed cell is held up when the column under it, through at most kSupportDepth packed rows, ends on solid ground,
+// on grains (moving sand holds it up until it leaves or disturbs it) or on an arch. Before, only the cell directly above
+// a hole woke and each row above waited for the one below to fall away: a packed pile took hundreds of ticks to sink into
+// a hole a moving pile fills in 20, and its collapse peak stood 2 cells higher (40.3 against 38.2 over 16 seeds). The
+// front now climbs kSupportDepth rows a tick. The pace is measured, not derived. Collapse peak, 16 seeds, moving 38.2:
+// 1 row 40.3, 3 rows 39.0, 4 38.7, 6 37.8, 12 36.8 (past that the pile ends lower and denser than the moving one).
+// Treating grains that fall faster than 4, 10 or 20 cells/s as no support collapsed a little better but kept 270 grains of
+// a settled pile moving (sand-sleep-no-flicker); from 30 cells/s up it measured the same as this rule.
+const int kSupportDepth = 3;
+bool heldUp(ivec2 c) {
+    for (int k = 1; k <= kSupportDepth; ++k) {
+        ivec2 below = c - ivec2(0, k);
+        if (solidAt(below)) return true;
+        if (packedAt(below)) continue;
+        return grainsAt(below) > 0u || archedOver(below);
+    }
+    return true;
+}
+
 void decide(ivec2 c) {
     uint t = tally[cellIndex(c)];
     uint total = t & 4095u;
@@ -156,18 +182,13 @@ void decide(ivec2 c) {
     if (packed == 0u && total == 0u) return;  // nothing to pack or wake
     ivec2 below = c + ivec2(0, -1);
     bool calm = !sideOpen(c) && !disturbed(c);
-    // Packed or solid cells on both lower diagonals arch over an empty cell below (packed cells push on the grains
-    // above them, sand_grid_update.comp): a grain held there stayed moving and blocked the cells above it from packing.
-    bool arched = (solidAt(below + ivec2(-1, 0)) || packedAt(below + ivec2(-1, 0))) &&
-                  (solidAt(below + ivec2(1, 0)) || packedAt(below + ivec2(1, 0)));
     uint flags = 0u;
     if (packed > 0u) {
         // Grains still moving below hold the cell up until they leave (or move fast enough to disturb it).
-        bool supported = solidAt(below) || packedAt(below) || grainsAt(below) > 0u || arched;
-        if (!supported || !calm) flags = kWake;
+        if (!heldUp(c) || !calm) flags = kWake;
         else if (allReady(c) && packed + total <= uint(maxPacked)) flags = kPack;
     } else if (allReady(c) && total <= uint(maxPacked) && calm &&
-               (solidAt(below) || packedAt(below) || allReady(below) || arched)) {
+               (solidAt(below) || packedAt(below) || allReady(below) || archedOver(below))) {
         flags = kPack;
     }
     if (flags != 0u) atomicOr(tally[cellIndex(c)], flags);
@@ -214,11 +235,16 @@ void apply(ivec2 c) {
         float moisture = clamp(meanF.z, 0.0, 0.999);
         float stretch = sqrt(clamp(volume, 0.05, 4.0));
         vec4 deformation = vec4(stretch, 0.0, 0.0, stretch);
+        // The cell's grains were bonded (q about 0) or cracked (q large): the mean bond is the intact share, and the
+        // cracked ones carry the rest of the mean hardening, so a mixed clump wakes with the split it packed with
+        // instead of every grain at the mean q (whose bond is the exponential of the mean, far below the mean bond).
+        uint intact = min(packed, uint(clamp(meanF.w, 0.0, 1.0) * float(packed) + 0.5));
+        float cracked = intact == packed ? 0.0 : clamp(hardened * float(packed) / float(packed - intact), 0.0, 0.9999);
         for (uint i = 0u; i < packed; ++i) {
             uvec3 key = uvec3(uvec2(c), 3u * i);
             uint index = slot + i;
             particles[index].state0 = vec4(vec2(c) + uniform2(key), velocity);
-            particles[index].state1 = vec4(1.0 + hardened, 1.0, 0.0, 0.0);
+            particles[index].state1 = vec4(1.0 + (i < intact ? 0.0 : cracked), 1.0, 0.0, 0.0);
             // sand_particle_spawn.comp's trait and moisture packing; no volume correction.
             float trait = floor(uniform2(key + uvec3(0u, 0u, 1u)).x * 63.0) - 31.0;
             particles[index].state2 = vec4(0.0, 0.0, 0.0, trait + moisture);

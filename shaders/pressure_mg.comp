@@ -8,7 +8,9 @@
 // Coarse cells are rediscretised: air (Dirichlet) if any child is air, else liquid if any child is liquid, else a wall,
 // sand-porous when a child is sand. Coarse liquid cells couple to liquid neighbours by -1 and carry 1 per open
 // neighbour (sandLeak per sand wall) on the diagonal, the fine operator's form; restricting with weights summing to 4
-// absorbs the factor of four between grid spacings. Prolongation treats walls as Neumann: a wall partner of the
+// absorbs the factor of four between grid spacings. The fine diagonal of a cell next to air carries the ghost-fluid
+// conductance 1 / theta (pressure_cg.comp); the coarse diagonals keep a share of that excess (excessAt, excessGain).
+// Prolongation treats walls as Neumann: a wall partner of the
 // bilinear stencil takes the fine cell's own coarse value (pulling it toward zero instead multiplied the iterations).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
@@ -25,6 +27,8 @@ layout(std430, binding = 2) readonly buffer Scalars {
     uint iterations;
     uint padding;
     uvec4 liquidBounds;  // first and last cell of the solve, from pressure_cg_reduce.comp
+    float rhoBySlot[2];
+    uint restartArmed;  // pressure_cg.comp phase 10
 };
 layout(std430, binding = 4) readonly buffer Tiles {
     uvec4 tileDispatch;
@@ -52,6 +56,7 @@ uniform int phase;
 uniform int level;
 uniform int slot;     // tile sum slot of z = M^-1 r (pressure_cg.comp)
 uniform int initial;  // 1: also start the search direction, d = z
+uniform int gated;    // 1 in a restart of the CG, which only acts when pressure_cg.comp phase 10 found it due
 
 const float omega = 2.0 / 3.0;
 const int coarsestSweeps = 16;
@@ -115,6 +120,32 @@ float levelDiagonal(int l, int offset, ivec2 size, ivec2 c) {
     return diagonal;
 }
 
+// The ghost-fluid operator (pressure_cg.comp) puts more than 1 on the diagonal of a cell next to air. The coarse operators
+// keep that excess as a Galerkin product with the transfers would: the children's excess summed, scaled by excessGain.
+const float excessGain = 0.5;
+
+float excessAt(int l, ivec2 c) {
+    if (l == 0) {
+        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) return 0.0;
+        float w = vectors[c.y * gridSize.x + c.x].w;
+        if (w <= 0.0) return 0.0;
+        float base = 0.0;
+        for (int i = 0; i < 4; ++i) base += conductance(baseType(c + offsets[i]));
+        return max(w - base, 0.0);
+    }
+    ivec2 size = levelSize(l);
+    if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, size))) return 0.0;
+    int offset = levelOffset(l);
+    float stored = levelCell(l, offset, size, c).z;
+    return stored > 0.0 ? max(stored - levelDiagonal(l, offset, size, c), 0.0) : 0.0;
+}
+
+float childExcess(int l, ivec2 c) {
+    float sum = 0.0;
+    for (int i = 0; i < 4; ++i) sum += excessAt(l - 1, c * 2 + ivec2(i & 1, i >> 1));
+    return excessGain * sum;
+}
+
 void setup() {
     if (gl_GlobalInvocationID.xy != uvec2(0u)) return;
     ivec2 first = ivec2(liquidBounds.xy), last = ivec2(liquidBounds.zw);
@@ -151,7 +182,9 @@ void classify() {
         anySand = anySand || type == sandWall;
         // The children's types are complete, so their diagonals can be formed here.
         if (level > 1 && all(lessThan(child, childSize)))
-            cells[childOffset + child.y * childSize.x + child.x].z = levelDiagonal(level - 1, childOffset, childSize, child);
+            cells[childOffset + child.y * childSize.x + child.x].z =
+                levelDiagonal(level - 1, childOffset, childSize, child) +
+                (levelCell(level - 1, childOffset, childSize, child).w == liquid ? childExcess(level - 1, child) : 0.0);
     }
     cells[offset + cell.y * size.x + cell.x].w = anyAir ? air : anyLiquid ? liquid : anySand ? sandWall : wall;
 }
@@ -160,7 +193,9 @@ void coarsestDiagonal() {
     ivec2 cell = ivec2(gl_LocalInvocationID.xy);
     ivec2 size = levelSize(levels);
     int offset = levelOffset(levels);
-    if (all(lessThan(cell, size))) cells[offset + cell.y * size.x + cell.x].z = levelDiagonal(levels, offset, size, cell);
+    if (all(lessThan(cell, size)))
+        cells[offset + cell.y * size.x + cell.x].z = levelDiagonal(levels, offset, size, cell) +
+            (levelCell(levels, offset, size, cell).w == liquid ? childExcess(levels, cell) : 0.0);
 }
 
 shared float sweep[2][64];
@@ -359,6 +394,7 @@ void prolongate() {
 }
 
 void main() {
+    if (gated != 0 && restartArmed == 0u) return;
     if (phase == 0) {
         setup();
         return;
