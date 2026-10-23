@@ -1,6 +1,6 @@
 # Powder Game Architecture and Plan
 
-The work and evidence ledger is `ROADMAP.md`; commands and measured results
+The current handoff and project history are in `ROADMAP.md`; commands and measured results
 are in `VALIDATION.md`. This file describes the current architecture;
 [docs/ALGORITHMS.md](docs/ALGORITHMS.md) is the pass-by-pass algorithm reference with constants and citations. Historical
 cellular sand milestones have been superseded by the particle implementation.
@@ -17,10 +17,8 @@ cellular sand milestones have been superseded by the particle implementation.
   two ticks, one after an overrun, and drops the backlog (see Scheduling).
 - Reference acceptance: 60 FPS idle; 30 FPS with 100,000 water and 50,000 sand
   particles plus smoke/fire, GPU frame p95 at most 50 ms. The preferred goal is
-  60 FPS combined. The v0.5.0 tree meets the combined timing budgets (about 21-23 ms GPU
-  mean, p95 about 27-28 ms) but the benchmark still fails on two non-converged pressure
-  solves (see VALIDATION, Current status). Two ticks run per rendered frame; display
-  latency is excluded.
+  60 FPS combined. Current timings and gate results are in VALIDATION, Current status.
+  Two ticks run per rendered frame; display latency is excluded.
 
 ## Scale and constants
 
@@ -777,9 +775,9 @@ matter, conserved particle mass, ignition before extinction, obstacle contact an
 zero crossing. Count/mass repeat checks are separate from visual-field tolerance.
 GPU timestamps measure complete frames, including all simulation and rendering.
 
-The 96-case CTest suite (including the shader-package check and the boundary and
-leakage replays), all six repeated replay scenes and the real-time benchmark (combined
-about 18 ms GPU mean when the GPU is not shared, counters clean) pass on the current tree (VALIDATION). The
+The CTest suite (including the shader-package check and the boundary and leakage
+replays), the repeated replay scenes and the real-time benchmark are the acceptance
+checks; case counts, timings and the latest results are in VALIDATION, Current status. The
 `benchmark-profile` scenes are reproducible run to run: the harness detaches the window's
 input callbacks, since a real cursor over its shown window fed the scripted stroke, and
 the sand beds of the benchmark's combined and user scenes are two hashed grains per cell like the brush's
@@ -788,9 +786,9 @@ benchmark's block settles the same either way, so the combined cost did not chan
 HUD, letterbox and
 cursor mapping, stroke interpolation, water density gate and composite look are
 covered by the `app-hud`, `app-brush-input`, `app-erase` and `app-render-modes`
-fixtures and offscreen frames. An earlier Computer Use pass exercised brief input,
+fixtures and offscreen frames. An earlier desktop-automation pass exercised brief input,
 brushes, erasing, diagnostic shortcuts, width resizing, close and relaunch. Live
 mouse painting, the H key in a live window, held-key timing, DPI transitions and
 sustained native stress remain unverified.
 Linux and MinGW packaging are build targets but have not been executed in
-this Windows validation environment. No release is published by this goal.
+this Windows validation environment.
