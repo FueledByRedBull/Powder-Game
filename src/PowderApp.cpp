@@ -83,6 +83,17 @@ std::string WithGlfwError(std::string message) {
     return message;
 }
 
+#ifdef _WIN32
+// The executable has a console, but a double-clicked build closes it with the process, so a failed start also says why
+// in a dialog.
+void ShowErrorDialog(const std::string& message) {
+    const int size = MultiByteToWideChar(CP_UTF8, 0, message.c_str(), -1, nullptr, 0);
+    std::wstring text(static_cast<std::size_t>(std::max(size, 1)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, message.c_str(), -1, text.data(), size);
+    MessageBoxW(nullptr, text.c_str(), L"Powder Game", MB_OK | MB_ICONERROR);
+}
+#endif
+
 }  // namespace
 
 int PowderApp::Run() {
@@ -142,6 +153,9 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
     const double tick_start = glfwGetTime();
     const bool show_timings = render_mode_ == RenderMode::DebugCounters;
     if (show_timings && steps > 0) timing_set_ ^= 1U;
+#ifdef _WIN32
+        if (!replay_mode_) ShowErrorDialog(error.what());  // replays stay headless and scriptable
+#endif
     for (int step = 0; step < steps; ++step) RunFrame(config_.fixed_dt, nullptr, step == 0);
     clock.MeasureTicks(glfwGetTime() - tick_start, steps);
     if (show_timings) ReadBackInteractiveTimings();
@@ -162,7 +176,7 @@ void PowderApp::Initialize() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    replay_mode_ = std::getenv("POWDER_REPLAY") != nullptr;
+    replay_mode_ = std::getenv("POWDER_REPLAY") != nullptr;  // before anything that can throw, so Run() knows
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     // Replays keep the reference 1280x900. Interactive windows take 85% of the work area's height and just enough
