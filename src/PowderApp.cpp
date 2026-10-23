@@ -71,6 +71,18 @@ constexpr std::array<const char*, 5> kDebugCounterNames{
 };
 constexpr std::size_t kDebugFailureCounters = 4;  // the counters before water_velocity_clamped
 
+// The last description GLFW reported, so a failed startup says why and not only that it failed.
+std::string g_last_glfw_error;
+
+void GlfwErrorCallback(int, const char* description) {
+    g_last_glfw_error = description != nullptr ? description : "";
+}
+
+std::string WithGlfwError(std::string message) {
+    if (!g_last_glfw_error.empty()) message += " GLFW: " + g_last_glfw_error;
+    return message;
+}
+
 }  // namespace
 
 int PowderApp::Run() {
@@ -139,10 +151,11 @@ int PowderApp::RunInteractiveFrame(FixedStepClock& clock, double elapsed) {
 }
 
 bool PowderApp::Initialize() {
+    glfwSetErrorCallback(GlfwErrorCallback);
     config_ = powder_config::LoadConfigFromEnvironment();
 
     if (glfwInit() == GLFW_FALSE) {
-        throw std::runtime_error("Failed to initialize GLFW.");
+        throw std::runtime_error(WithGlfwError("Failed to initialize GLFW."));
     }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -165,7 +178,7 @@ bool PowderApp::Initialize() {
     }
     window_ = glfwCreateWindow(width, height, "Powder Game", nullptr, nullptr);
     if (window_ == nullptr) {
-        throw std::runtime_error("Failed to create GLFW window.");
+        throw std::runtime_error(WithGlfwError("Failed to create GLFW window."));
     }
     if (work_width > 0 && work_height > 0) {
         glfwSetWindowPos(window_, work_x + (work_width - width) / 2, work_y + (work_height - height) / 2);
@@ -184,7 +197,7 @@ bool PowderApp::Initialize() {
     }
 
     if (GLAD_GL_VERSION_4_3 == 0) {
-        throw std::runtime_error("OpenGL 4.3 is required.");
+        throw std::runtime_error(WithGlfwError("OpenGL 4.3 is required."));
     }
 
     gl_ready_ = true;
@@ -206,8 +219,22 @@ bool PowderApp::Initialize() {
 
     glDisable(GL_DEPTH_TEST);
 
+    while (glGetError() != GL_NO_ERROR) {
+    }  // drop stale errors so only the allocations below can raise one
     glGenVertexArrays(1, &fullscreen_vao_);
 
+    bool out_of_memory = false;
+    for (GLenum error = glGetError(); error != GL_NO_ERROR; error = glGetError()) {
+        out_of_memory = out_of_memory || error == GL_OUT_OF_MEMORY;
+    }
+    if (out_of_memory) {
+        constexpr long long kMiB = 1 << 20;
+        throw std::runtime_error("The GPU ran out of memory allocating textures and buffers (water pool " +
+                                 std::to_string(kMaxWaterParticles) + " particles, " +
+                                 std::to_string(kMaxWaterParticles * 4LL * kWaterParticleComponents / kMiB) +
+                                 " MiB; sand pool " + std::to_string(kMaxSandParticles) + " grains, " +
+                                 std::to_string(kMaxSandParticles * 4LL * kSandParticleComponents / kMiB) + " MiB).");
+    }
     CreateTextures();
     CreateBuffers();
     CreatePrograms();
