@@ -144,6 +144,9 @@ This is the current result. The five pass sections that follow it are the work m
 tree on a GPU shared with the other passes (their timings are noisy; their correctness numbers stand). Everything after
 them is a historical record; where an older section contradicts this one, this section wins.
 
+Line endings: the repository stores LF only (`.gitattributes`, then a renormalization commit). Shader byte hashes recorded
+before it differ from the current ones for `shaders/fullscreen.vert` only by line endings.
+
 Tree: the integration is committed as `12c1343`. The evidence below was measured on the tree before that commit, which
 was `61e2965` plus the gas scheduling pass (one gas pressure solve split across a tick pair), the water host
 synchronisation pass (restart from the true residual armed on the GPU), sand pass 5 (hole collapse, per-grain damp
