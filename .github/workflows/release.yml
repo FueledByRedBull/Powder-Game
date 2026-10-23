@@ -45,27 +45,9 @@ jobs:
           Copy-Item build/_deps/glad_src-src/LICENSE (Join-Path $licenseDir "GLAD-LICENSE") -Recurse
           Copy-Item build/_deps/glad_src-src/glad/files/khrplatform.h $licenseDir
 
-          $readme = @(
-            "Powder Game $env:GITHUB_REF_NAME (Windows 11 x64)",
-            "",
-            "Run:",
-            "- Double-click powder_game.exe",
-            "",
-            "Controls:",
-            "- 1: Sand, 2: Water, 3: Solid, 4: Erase",
-            "- 5: Smoke, 6: Fire, 7: Wood, 8: Oil",
-            "- [ / ]: Decrease / increase brush radius (1 to 96)",
-            "- Left mouse: paint",
-            "- H: show / hide the on-screen help",
-            "- F1: normal view; F2-F10: debug views",
-            "- Esc: quit",
-            "",
-            "Notes:",
-            "- powder_game.exe is self-contained (shaders built in, static runtime); run it from any folder.",
-            "- Requires OpenGL 4.3 and the resource limits listed in the source README.",
-            "- See the release notes and source VALIDATION.md for measured limitations."
-          )
-          $readme | Set-Content -Path (Join-Path $outDir "README.txt")
+          $readmePath = Join-Path $outDir "README.txt"
+          Copy-Item packaging/README.txt $readmePath
+          Add-Content -Path $readmePath -Value "", "Version: $env:GITHUB_REF_NAME"
 
           New-Item -ItemType Directory -Force -Path "dist/win11" | Out-Null
           $binaryZip = "dist/win11/PowderGame-$env:GITHUB_REF_NAME-win11-x64.zip"
