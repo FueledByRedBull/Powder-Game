@@ -328,6 +328,8 @@ void PowderApp::Shutdown() {
         DeleteProgram(init_state_program_);
         DeleteBuffer(gas_state_.pressure_check);
         DeleteBuffer(debug_state_.counters);
+        DiscardWoodTally();
+        DeleteBuffer(wood_tally_.buffer);
         DeleteBuffer(phase_state_.cell_counts);
         DeleteBuffer(phase_state_.gas_sources);
         DeleteBuffer(phase_state_.sinks);
@@ -724,6 +726,10 @@ void PowderApp::CreateBuffers() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, debug_state_.counters);
     glBufferData(GL_SHADER_STORAGE_BUFFER, debug_counter_bytes, nullptr, GL_DYNAMIC_DRAW);
 
+    glGenBuffers(1, &wood_tally_.buffer);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, wood_tally_.buffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+
     glGenBuffers(1, &phase_state_.cell_counts);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, phase_state_.cell_counts);
     glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * water_count_bytes, nullptr, GL_DYNAMIC_DRAW);
@@ -868,6 +874,7 @@ void PowderApp::InitializeState() {
     frame_index_ = 0U;
     boundary_state_.static_dirty = true;
     wood_present_ = false;
+    DiscardWoodTally();
     oil_present_ = heat_present_ = false;
     phase_state_.steam_ping = true;
     // The gas solve's check schedule follows the last solve, so a stale count makes repeated replays diverge.
@@ -1506,7 +1513,10 @@ void PowderApp::RunSpawnFullRes(const BrushConfig& config, const DispatchRegion&
         return;
     }
     if (config.replace_material) boundary_state_.static_dirty = true;
-    if (config.replace_material && config.material_value == kWoodMaterial) wood_present_ = heat_present_ = true;
+    if (config.replace_material && config.material_value == kWoodMaterial) {
+        wood_present_ = heat_present_ = true;
+        DiscardWoodTally();  // a count taken before this stroke would not include it
+    }
 
     glUseProgram(spawn_full_program_);
     glUniform2i(CachedUniform(spawn_full_program_, "gridSize"), kGridWidth, kGridHeight);
@@ -3185,9 +3195,41 @@ std::array<GLuint, 2> PowderApp::ReadPhaseSinks() const {
     return sinks;
 }
 
+void PowderApp::DiscardWoodTally() {
+    if (wood_tally_.fence != nullptr) glDeleteSync(wood_tally_.fence);
+    wood_tally_.fence = nullptr;
+}
+
 // Wood catches from hot gas, burns down feeding the gas fire, and goes out in water (shaders/wood_burn.comp).
+// Burning wood changes the static geometry with no readback, so every 15th tick (a quarter second) the distance field is
+// rebuilt and the wood cells are counted. That count is read at the next sample, when its copy finished long ago and
+// the read does not stall the GPU; when no wood is left the pass stops running, and the rebuild at the sample that
+// counted zero was the last one that was needed.
 void PowderApp::RunWoodPass() {
+    const bool sample = frame_index_ % 15U == 0U;
+    if (sample && wood_tally_.fence != nullptr) {
+        const GLenum waited = glClientWaitSync(wood_tally_.fence, GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
+        if (waited == GL_WAIT_FAILED) throw std::runtime_error("Waiting for the wood count failed.");
+        GLuint remaining = 0U;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, wood_tally_.buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), sizeof(GLuint), &remaining);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        DiscardWoodTally();
+        if (remaining == 0U) {
+            wood_present_ = false;
+            return;
+        }
+    }
+    if (sample) {
+        const GLuint zero = 0U;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, wood_tally_.buffer);
+        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    }
     glUseProgram(wood_burn_program_);
+    glUniform1i(CachedUniform(wood_burn_program_, "tally"), sample ? 1 : 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, wood_tally_.buffer);
     glUniform2i(CachedUniform(wood_burn_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1ui(CachedUniform(wood_burn_program_, "seed"), frame_index_ * 2654435761U);
     glUniform1f(CachedUniform(wood_burn_program_, "ignitionTemperature"), 0.35F);
@@ -3204,9 +3246,15 @@ void PowderApp::RunWoodPass() {
         DispatchGrid(kGasWidth, kGasHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     }
-    // shortcut: burning wood changes the static geometry with no readback, so the distance field is rebuilt
-    // every quarter second while wood exists; track burnt-out cells if this shows in profiles.
-    if (frame_index_ % 15U == 0U) boundary_state_.static_dirty = true;
+    if (!sample) return;
+    boundary_state_.static_dirty = true;
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    glBindBuffer(GL_COPY_READ_BUFFER, wood_tally_.buffer);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, wood_tally_.buffer);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, sizeof(GLuint), sizeof(GLuint));
+    glBindBuffer(GL_COPY_READ_BUFFER, 0);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+    wood_tally_.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
 
 void PowderApp::RunRenderFieldExtractionPass() {
