@@ -433,8 +433,14 @@ private:
     // Lighting is presentation only. Off, composite.frag draws the plain albedo and no lantern, which is what the
     // render-modes oracle and the HUD pixel tests compare against.
     bool lighting_enabled_ = true;
-    // Wood was painted since the last reset: burning wood changes the static geometry (RunCouplingPass).
+    // Wood was painted since the last reset and some may remain: burning wood changes the static geometry
+    // (RunCouplingPass). RunWoodPass counts the wood cells (intact, burning or charred) into word 0 of the tally buffer
+    // every 15th tick and copies that to word 1 behind a fence; the next sample reads it, and a zero clears the flag.
     bool wood_present_ = false;
+    struct WoodTally {
+        GLuint buffer = 0;
+        GLsync fence = nullptr;
+    } wood_tally_;
     // Oil, or a heat source (fire or wood), was painted since the last reset: only then do the oil drift and the
     // phase passes (RunPhasePass) run.
     bool oil_present_ = false;
@@ -615,6 +621,7 @@ private:
     void RunFireHeatPass(float dt);
     void RunCouplingPass(float dt);
     void RunWoodPass();
+    void DiscardWoodTally();
     void RunPhasePass(float dt);
     GLuint CurrentSteam() const;
     std::array<GLuint, 2> ReadPhaseSinks() const;  // evaporated water and burned oil records since the last reset

@@ -269,7 +269,8 @@ cells elsewhere (that once deleted water under sand across the map).
 - The distance field is approximate (jump flooding can pick a non-nearest seed in rare configurations); sweeps use only
   its sign and normals use its local gradient.
 - Wood burning away changes the geometry without a readback, so the distance field is refreshed every quarter second
-  once wood has been painted since the last reset, even after it has all burnt (a marked shortcut in `RunWoodPass`).
+  while any wood is left. The wood pass counts its cells on the same tick, reads the count at the next refresh through
+  a fence, and stops once a count comes back zero.
 
 ---
 
@@ -1488,7 +1489,7 @@ invocation owns the four material cells it writes:
   $`T = \max(T, 0.6\, \text{feed})`$, $`\text{flame} = \max(\text{flame}, 0.3\, \text{feed})`$. The gas burns that
   vapour into flame, heat and smoke, and that heat lights the next wood.
 
-The static distance field is rebuilt every 15 ticks once wood has been painted since the last reset, since burnt cells vanish without a readback.
+The static distance field is rebuilt every 15 ticks while wood remains, since burnt cells vanish without a readback; the same tick counts the wood cells, and a zero count ends the rebuilds.
 The composite draws wood as planks that char to grey ash as fuel goes and glow while burning (11.3).
 
 ### 9.2 Why

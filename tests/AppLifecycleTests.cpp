@@ -7569,6 +7569,20 @@ struct AppLifecycleTests {
         Require(far_lit_at > lit_at && far_lit_at < 60 * 20, "fire must spread 260 cells along the beam within 20 s");
         Require(beam[3] > 400, "burnt wood must crumble away");
         Require(CleanCounters(totals), "burning wood must keep clean counters");
+
+        // Once nothing is left to burn the wood pass stops and the distance field stops rebuilding.
+        int cleared_at = -1;
+        for (int t = 0; t < 60 * 30 && cleared_at < 0; ++t) {
+            tick(false);
+            if (!app.wood_present_) cleared_at = t;
+        }
+        const auto rest = WoodCensus(app, 300, 200, 700, 210);
+        std::cout << "wood: pass stopped " << cleared_at / 60.0 << " s later; beam intact/burning/charred=" << rest[0] << '/'
+                  << rest[1] << '/' << rest[2] << '\n';
+        Require(cleared_at >= 0, "the wood pass must stop once the beam has burnt away");
+        Require(rest[0] + rest[1] + rest[2] == 0, "the wood pass must not stop while wood remains");
+        for (int t = 0; t < 30; ++t) tick(false);
+        Require(!app.boundary_state_.static_dirty, "a burnt-out beam must stop rebuilding the distance field");
     }
 
     // Sparks and embers are particles (spark_step.comp): live records have life > 0.
