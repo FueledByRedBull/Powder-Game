@@ -1,4 +1,4 @@
-# Powder Game v0.6.0 algorithm reference
+# Powder Game algorithm reference
 
 This document explains how every simulated element and every supporting system works, why it works that way, which
 constants drive it and where it breaks. It describes the source in this tree (`src/`, `shaders/`); when in doubt the
