@@ -233,8 +233,6 @@ private:
         float reaction_add = 0.0F;
         bool blocked_by_solid = true;
         bool blocked_by_water = false;
-        bool clear_water = false;
-        bool clear_gas = false;
         // Smoothed cursor velocity (cells/s) of an interactive stroke, already added to the water and sand spawn
         // velocities; kept for every material so gas brushes can use it too. Zero for scripted brushes.
         std::array<float, 2> brush_velocity{0.0F, 0.0F};
@@ -555,7 +553,7 @@ private:
     bool replay_failed_ = false;
     std::string replay_scene_name_;
 
-    bool Initialize();
+    void Initialize();
     void Shutdown();
 
     void CreateTextures();

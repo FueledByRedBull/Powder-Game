@@ -21,7 +21,6 @@ uniform uint materialValue;
 uniform int blockedBySolid;
 uniform int blockedByWater;
 uniform int clearWater;
-uniform int clearGas;
 uniform int clearMode;
 
 bool insideBrush(ivec2 coord) {
@@ -79,11 +78,5 @@ void main() {
     }
     if (replaceMaterial == 1 && materialValue != 0u) {
         imageStore(sandPackedTex, coord, uvec4(0u));
-    }
-
-    if (clearGas == 1) {
-        ivec2 gas_coord = ivec2(coord / 2);
-        imageStore(gasTemperatureTex, gas_coord, vec4(0.0));
-        imageStore(gasReactionTex, gas_coord, vec4(0.0));
     }
 }
