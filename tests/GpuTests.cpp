@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2832,6 +2834,43 @@ void RequireGl43Minimums(GLuint program) {
     CheckGl("query program resources");
 }
 
+// GLSL words reserved for future use. AMD's compiler and glslang accept some as names, but NVIDIA's rejects them
+// ("packed", reserved since GLSL 1.10, stopped v0.7.2 from starting there).
+void RequireNoReservedWords(const std::filesystem::path& path) {
+    static constexpr std::array<std::string_view, 39> kReserved{
+        "common", "partition", "active", "asm", "class", "union", "enum", "typedef", "template", "this",
+        "resource", "goto", "inline", "noinline", "public", "static", "extern", "external", "interface", "long",
+        "short", "half", "fixed", "unsigned", "superp", "input", "output", "hvec2", "hvec3", "hvec4", "fvec2",
+        "fvec3", "fvec4", "sampler3DRect", "filter", "sizeof", "cast", "namespace", "using"};
+    const std::string source = glutil::ReadTextFile(path);
+    std::string code;
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (source.compare(i, 2, "//") == 0) {
+            i = source.find('\n', i);
+            if (i == std::string::npos) break;
+        } else if (source.compare(i, 2, "/*") == 0) {
+            i = source.find("*/", i + 2);
+            if (i == std::string::npos) break;
+            ++i;
+            continue;
+        }
+        code += source[i];
+    }
+    const auto is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
+    for (std::size_t i = 0; i < code.size();) {
+        if (!is_word(code[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t end = i;
+        while (end < code.size() && is_word(code[end])) ++end;
+        const std::string_view word(code.data() + i, end - i);
+        Require(word != "packed" && std::find(kReserved.begin(), kReserved.end(), word) == kReserved.end(),
+                "uses the reserved word '" + std::string(word) + "'");
+        i = end;
+    }
+}
+
 void CompileShaders() {
     std::vector<std::filesystem::path> paths;
     for (const auto& entry : std::filesystem::directory_iterator(kShaderRoot)) {
@@ -2842,6 +2881,14 @@ void CompileShaders() {
     Require(!paths.empty(), "no compute shaders found in " + kShaderRoot.string());
     std::sort(paths.begin(), paths.end());
     int failures = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(kShaderRoot)) {
+        try {
+            RequireNoReservedWords(entry.path());
+        } catch (const std::exception& error) {
+            ++failures;
+            std::cerr << "  FAIL " << entry.path().filename().string() << ": " << error.what() << '\n';
+        }
+    }
     for (const auto& path : paths) {
         try {
             Resources resources;

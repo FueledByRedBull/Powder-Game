@@ -138,6 +138,18 @@ Replay fails if:
 - combined scene has missing water/sand or inactive gas, violates source-free mass
   conservation, or exceeds the configured GPU-time budget
 
+## Reserved words on NVIDIA - 2026-11-10 (on `c06b1fc`, v0.7.2)
+
+v0.7.2 got past the image-unit limits on an NVIDIA GPU and then failed to compile `sand_pack.comp`:
+NVIDIA's compiler rejects `packed`, a GLSL reserved word, as a variable name. AMD's compiler and
+glslang 16.6.0 both accept it, so neither the AMD runs nor a glslang pass over every shader caught
+it. `sand_pack.comp` and `water_pack.comp` now say `packedCount`, and `gpu-compile` fails any shader
+file that uses a word GLSL reserves for future use (checked by adding a probe shader with
+`uint packed`). A scan of all shaders found no other reserved word in use.
+
+Machine: Windows 11, AMD Radeon RX 7800 XT, driver 26.6.2. `ctest -C Release -j 1`: 103/103 pass;
+`POWDER_REPLAY=all`: exit 0 with every signature identical to v0.7.2. Not yet run on NVIDIA.
+
 ## OpenGL 4.3 minimum resources - 2026-11-10 (on `b09f29f`)
 
 v0.7.1 refused to start on GPUs that offer only the OpenGL 4.3 minimum of 8 image units (the usual
