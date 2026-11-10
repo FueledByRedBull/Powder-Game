@@ -183,15 +183,15 @@ bool heldUp(ivec2 c) {
 void decide(ivec2 c) {
     uint t = tally[cellIndex(c)];
     uint total = t & 4095u;
-    uint packed = imageLoad(packedTex, c).r;
-    if (packed == 0u && total == 0u) return;  // nothing to pack or wake
+    uint packedCount = imageLoad(packedTex, c).r;
+    if (packedCount == 0u && total == 0u) return;  // nothing to pack or wake
     ivec2 below = c + ivec2(0, -1);
     bool calm = !sideOpen(c) && !disturbed(c);
     uint flags = 0u;
-    if (packed > 0u) {
+    if (packedCount > 0u) {
         // Grains still moving below hold the cell up until they leave (or move fast enough to disturb it).
         if (!heldUp(c) || !calm) flags = kWake;
-        else if (allReady(c) && packed + total <= uint(maxPacked)) flags = kPack;
+        else if (allReady(c) && packedCount + total <= uint(maxPacked)) flags = kPack;
     } else if (allReady(c) && total <= uint(maxPacked) && calm &&
                (solidAt(below) || packedAt(below) || allReady(below) || archedOver(below))) {
         flags = kPack;
@@ -209,21 +209,21 @@ void apply(ivec2 c) {
         sum = vec4(fsum[i], fsum[i + 1], fsum[i + 2], fsum[i + 3]) / 4096.0;
         for (int k = 0; k < 4; ++k) fsum[i + k] = 0;
     }
-    uint packed = imageLoad(packedTex, c).r;
+    uint packedCount = imageLoad(packedTex, c).r;
     vec4 meanF = imageLoad(packedFTex, c);
     if ((t & kPack) != 0u) {
         uint total = t & 4095u;
-        imageStore(packedTex, c, uvec4(packed + total));
-        imageStore(packedFTex, c, (meanF * float(packed) + sum) / float(packed + total));
+        imageStore(packedTex, c, uvec4(packedCount + total));
+        imageStore(packedFTex, c, (meanF * float(packedCount) + sum) / float(packedCount + total));
     } else if ((t & kWake) != 0u) {
         // All of the cell's grains or none: a full pool leaves it packed (no loss) and counts the overflow.
         uint slot = atomicAdd(spawnCursor, 0u);
-        while (slot + packed <= uint(maxParticles)) {
-            uint observed = atomicCompSwap(spawnCursor, slot, slot + packed);
+        while (slot + packedCount <= uint(maxParticles)) {
+            uint observed = atomicCompSwap(spawnCursor, slot, slot + packedCount);
             if (observed == slot) break;
             slot = observed;
         }
-        if (slot + packed > uint(maxParticles)) {
+        if (slot + packedCount > uint(maxParticles)) {
             atomicAdd(particleOverflowBlocked, 1u);
             return;
         }
@@ -243,9 +243,10 @@ void apply(ivec2 c) {
         // The cell's grains were bonded (q about 0) or cracked (q large): the mean bond is the intact share, and the
         // cracked ones carry the rest of the mean hardening, so a mixed clump wakes with the split it packed with
         // instead of every grain at the mean q (whose bond is the exponential of the mean, far below the mean bond).
-        uint intact = min(packed, uint(clamp(meanF.w, 0.0, 1.0) * float(packed) + 0.5));
-        float cracked = intact == packed ? 0.0 : clamp(hardened * float(packed) / float(packed - intact), 0.0, 0.9999);
-        for (uint i = 0u; i < packed; ++i) {
+        uint intact = min(packedCount, uint(clamp(meanF.w, 0.0, 1.0) * float(packedCount) + 0.5));
+        float cracked =
+            intact == packedCount ? 0.0 : clamp(hardened * float(packedCount) / float(packedCount - intact), 0.0, 0.9999);
+        for (uint i = 0u; i < packedCount; ++i) {
             uvec3 key = uvec3(uvec2(c), 3u * i);
             uint index = slot + i;
             particles[index].state0 = vec4(vec2(c) + uniform2(key), velocity);
@@ -257,7 +258,7 @@ void apply(ivec2 c) {
         }
         imageStore(packedTex, c, uvec4(0u));
         imageStore(packedFTex, c, vec4(0.0));
-    } else if (packed > 0u) {
+    } else if (packedCount > 0u) {
         // Sleeping sand soaks up water around it and dries like moving grains (sand_particle_step.comp's moisture).
         float fill = 0.0;
         for (int j = -1; j <= 1; ++j) {

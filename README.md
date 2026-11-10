@@ -20,7 +20,7 @@ Windows 11 x64: download `PowderGame-<version>-win11-x64.zip` from the [latest r
 
 ### Requirements
 
-You need a GPU and driver with OpenGL 4.3 core. Every shader stays within the limits OpenGL 4.3 guarantees (8 image units, 8 SSBO bindings, 16 texture units per stage), so it does not need the extra image units that AMD drivers offer and NVIDIA and Intel drivers usually do not. `gpu-compile` checks every shader against those limits. Building needs CMake 3.24 or newer, a C++20 compiler and Python (for the GLAD generator). CMake fetches pinned copies of GLFW and GLAD when no system copies are found.
+You need a GPU and driver with OpenGL 4.3 core. Every shader stays within the limits OpenGL 4.3 guarantees (8 image units, 8 SSBO bindings, 16 texture units per stage), so it does not need the extra image units that AMD drivers offer and NVIDIA and Intel drivers usually do not. `gpu-compile` checks every shader against those limits and rejects GLSL reserved words such as `packed`, which NVIDIA's compiler refuses as names. Building needs CMake 3.24 or newer, a C++20 compiler and Python (for the GLAD generator). CMake fetches pinned copies of GLFW and GLAD when no system copies are found.
 
 ### Build from source on Windows 11
 

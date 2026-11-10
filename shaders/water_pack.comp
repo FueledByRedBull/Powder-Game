@@ -116,18 +116,18 @@ void apply(ivec2 c) {
         return;
     }
     if ((value & kWake) == 0u) return;
-    uint packed = value & 127u;
+    uint packedCount = value & 127u;
     // All of the cell's particles or none: a full pool leaves it packed (no loss), counts the overflow and retries. One
     // atomicAdd per cell (a compare-swap loop serialised mass wakes); slots a failed reservation leaves below the cap
     // keep the inactive records compaction left there, and the host clamps the cursor to the pool.
-    uint slot = atomicAdd(spawnCursor, packed);
-    if (slot + packed > uint(maxParticles)) {
+    uint slot = atomicAdd(spawnCursor, packedCount);
+    if (slot + packedCount > uint(maxParticles)) {
         atomicAdd(particleOverflowBlocked, 1u);
         return;
     }
     vec2 velocity = imageLoad(wakeVelocityTex, c).xy;
     atomicMax(fastestSpeedBits, floatBitsToUint(length(velocity)));
-    for (uint i = 0u; i < packed; ++i) {
+    for (uint i = 0u; i < packedCount; ++i) {
         // One particle per quarter of the cell in turn, jittered within it: uniform positions would wake as the
         // seeding noise the density correction then has to remove.
         vec2 quarter = vec2(float(i & 1u), float((i >> 1) & 1u));
