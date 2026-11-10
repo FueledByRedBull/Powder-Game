@@ -963,12 +963,13 @@ struct AppLifecycleTests {
                 glUniform1i(glGetUniformLocation(program, "useLiquidMask"), 0);
                 glUniform1i(glGetUniformLocation(program, "collectStats"), 0);
                 glUniform1f(glGetUniformLocation(program, "residualThreshold"), threshold);
-                glUniform1i(glGetUniformLocation(program, "pressureTex"), 0);
-                glActiveTexture(GL_TEXTURE0);
+                glActiveTexture(GL_TEXTURE0 + 1);
                 glBindTexture(GL_TEXTURE_2D, app.gas_state_.pressure_a);
                 glUniform1i(glGetUniformLocation(program, "wideRhs"), 1);
-                glBindImageTexture(4, app.gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-                glBindImageTexture(2, app.boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+                glActiveTexture(GL_TEXTURE0 + 4);
+                glBindTexture(GL_TEXTURE_2D, app.gas_state_.divergence);
+                glActiveTexture(GL_TEXTURE0 + 2);
+                glBindTexture(GL_TEXTURE_2D, app.boundary_state_.mask_gas);
                 const GLuint zero = 0;
                 glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, app.gas_state_.pressure_check);

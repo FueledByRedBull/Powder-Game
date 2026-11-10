@@ -2,33 +2,41 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D gasUTex;
-layout(r32f, binding = 1) uniform readonly image2D gasVTex;
+layout(binding = 0) uniform sampler2D gasUTex;
+layout(binding = 1) uniform sampler2D gasVTex;
 // R32F like the faces: stored as half floats, the right-hand side of a fire scene was rounded by up to 0.5 /s, twice the
 // residual gate, and the projected field kept that error (app-gas-rhs-precision).
 layout(r32f, binding = 2) uniform writeonly image2D divergenceTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
+layout(binding = 3) uniform usampler2D boundaryTex;
 // x: fuel burned per second (fire_rd.comp).
-layout(rg16f, binding = 4) uniform readonly image2D reactionTex;
+layout(binding = 4) uniform sampler2D reactionTex;
 
 uniform ivec2 gasSize;
 // Gas volume released per unit of fuel burned (Nguyen et al. 2002): burning cells are asked to expand.
 uniform float expansion;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (coord.x >= gasSize.x || coord.y >= gasSize.y) {
         return;
     }
-    if (imageLoad(boundaryTex, coord).r != 0u) {
+    if (loadTexel(boundaryTex, coord).r != 0u) {
         imageStore(divergenceTex, coord, vec4(0.0));
         return;
     }
 
-    float uL = imageLoad(gasUTex, ivec2(coord.x, coord.y)).x;
-    float uR = imageLoad(gasUTex, ivec2(coord.x + 1, coord.y)).x;
-    float vB = imageLoad(gasVTex, ivec2(coord.x, coord.y)).x;
-    float vT = imageLoad(gasVTex, ivec2(coord.x, coord.y + 1)).x;
-    float source = expansion * max(imageLoad(reactionTex, coord).x, 0.0);
+    float uL = loadTexel(gasUTex, ivec2(coord.x, coord.y)).x;
+    float uR = loadTexel(gasUTex, ivec2(coord.x + 1, coord.y)).x;
+    float vB = loadTexel(gasVTex, ivec2(coord.x, coord.y)).x;
+    float vT = loadTexel(gasVTex, ivec2(coord.x, coord.y + 1)).x;
+    float source = expansion * max(loadTexel(reactionTex, coord).x, 0.0);
     imageStore(divergenceTex, coord, vec4((uR - uL) + (vT - vB) - source, 0.0, 0.0, 0.0));
 }

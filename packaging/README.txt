@@ -28,9 +28,7 @@ light over the simulation.
 Notes:
 - powder_game.exe is self-contained (shaders built in, C/C++ runtime linked
   statically); run it from any folder.
-- Requires OpenGL 4.3 core with at least 18 image units, 18 compute image
-  uniforms, 19 combined shader output resources, 8 SSBO bindings and 16
-  fragment texture units. The game checks the first four at startup and names
-  a missing one in a dialog.
+- Requires an OpenGL 4.3 core GPU and driver; the
+  shaders stay within the limits OpenGL 4.3 guarantees.
 - Source, documentation and measured limitations (VALIDATION.md):
   https://github.com/FueledByRedBull/Powder-Game

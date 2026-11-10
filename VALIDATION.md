@@ -138,6 +138,34 @@ Replay fails if:
 - combined scene has missing water/sand or inactive gas, violates source-free mass
   conservation, or exceeds the configured GPU-time budget
 
+## OpenGL 4.3 minimum resources - 2026-11-10 (on `b09f29f`)
+
+v0.7.1 refused to start on GPUs that offer only the OpenGL 4.3 minimum of 8 image units (the usual
+NVIDIA and Intel value): it required 18. Every shader now samples the fields it only reads
+(`loadTexel`, `texelFetch` that returns zero outside the texture as `imageLoad` does) and keeps
+image units for writes, numbered 0..7. The host's `BindImage` binds a read-only field to a texture
+unit, a write-only one to an image unit and a read-write one to both, and every image barrier
+also carries `GL_TEXTURE_FETCH_BARRIER_BIT`. The startup limit check is gone; `gpu-compile` now
+fails any program over the 4.3 minimums (image uniforms on units 0..7, at most 8 images plus
+storage blocks, storage bindings 0..7, at most 16 samplers).
+
+Machine: Windows 11, AMD Radeon RX 7800 XT, `4.3.0 Core Profile Context 26.6.2.260602` (48 image
+units, so the 8-unit limit itself was checked by `gpu-compile`, not by an NVIDIA or Intel run).
+Binaries: `powder_game.exe` `f76bc22e5305`, `powder_gpu_tests.exe` `4ad2c9f0ff02`,
+`powder_app_lifecycle_tests.exe` `042ad5d050a6`.
+
+- `ctest -C Release -j 1`: 103/103 pass. `POWDER_REPLAY=all`: exit 0, all 12 scene runs pass.
+- `benchmark-realtime`: PASS; idle GPU mean 1.70 ms, combined GPU mean/p95/max 18.52/25.21/30.19 ms.
+- Replay signatures against `b09f29f` built from the same dependencies: water, sand, boundary
+  and leakage are bit-identical. Gas and combined differ (gas smoke 2803.48 to 3080.86) and both
+  pass. Bisected with every other shader restored: the difference comes from `smoke_correct` and
+  `gas_velocity_correct` alone, and no read there leaves its texture (an out-of-range sentinel
+  leaves the result unchanged) while a variant without the range check reproduces the old
+  signature exactly. The values read are the same; the fire scenes amplify the compiler's
+  different rounding.
+- Replay frame avg ms, old/new: combined 12.34/12.79, gas 6.19/6.41, water 8.11/8.21 (single
+  runs each, other programs open).
+
 ## Current status - v0.7.0 integration, 2026-10-23 (committed as `12c1343`; measured on the pre-commit tree on `61e2965`)
 
 This is the current result. The five pass sections that follow it are the work merged here, each measured in its own

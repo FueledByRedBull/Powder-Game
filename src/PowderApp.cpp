@@ -94,6 +94,19 @@ void ShowErrorDialog(const std::string& message) {
 }
 #endif
 
+// Shaders sample what they only read (texelFetch) and keep image units for writes, so no shader needs more than the
+// 8 image units OpenGL 4.3 guarantees. A read-write binding serves both kinds of shader. Unit 47, which every
+// OpenGL 4.3 context has and no shader samples, is left active so a later glBindTexture for an upload or readback
+// cannot replace a bound input.
+void BindImage(GLuint unit, GLuint texture, GLenum access, GLenum format) {
+    if (access != GL_WRITE_ONLY) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glActiveTexture(GL_TEXTURE0 + 47);
+    }
+    if (access != GL_READ_ONLY) glBindImageTexture(unit, texture, 0, GL_FALSE, 0, access, format);
+}
+
 }  // namespace
 
 int PowderApp::Run() {
@@ -227,21 +240,6 @@ void PowderApp::Initialize() {
     }
 
     gl_ready_ = true;
-
-    struct GpuLimit { GLenum parameter; GLint minimum; const char* name; };
-    const std::array<GpuLimit, 4> limits{{
-        {GL_MAX_IMAGE_UNITS, 18, "image units"},
-        {GL_MAX_COMPUTE_IMAGE_UNIFORMS, 18, "compute image uniforms"},
-        {GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES, 19, "combined shader output resources"},
-        {GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, 8, "shader storage buffer bindings"}}};
-    for (const auto& limit : limits) {
-        GLint available = 0;
-        glGetIntegerv(limit.parameter, &available);
-        if (available < limit.minimum) {
-            throw std::runtime_error(std::string("GPU supports ") + std::to_string(available) + " " + limit.name +
-                                     "; Powder Game requires " + std::to_string(limit.minimum));
-        }
-    }
 
     glDisable(GL_DEPTH_TEST);
 
@@ -869,7 +867,8 @@ void PowderApp::CreatePrograms() {
 }
 
 void PowderApp::InitializeState() {
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT |
+                    GL_BUFFER_UPDATE_BARRIER_BIT);
     gas_mac_ping_ = smoke_ping_ = true;
     frame_index_ = 0U;
     boundary_state_.static_dirty = true;
@@ -884,11 +883,11 @@ void PowderApp::InitializeState() {
     glUseProgram(init_state_program_);
     glUniform2i(CachedUniform(init_state_program_, "gridSize"), kGridWidth, kGridHeight);
 
-    glBindImageTexture(0, material_a_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16UI);
-    glBindImageTexture(3, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(4, water_state_.render_velocity, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    BindImage(0, material_a_, GL_WRITE_ONLY, GL_R16UI);
+    BindImage(3, water_state_.liquid_volume, GL_WRITE_ONLY, GL_R16F);
+    BindImage(4, water_state_.render_velocity, GL_WRITE_ONLY, GL_RG16F);
     DispatchGrid(kGridWidth, kGridHeight);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     const GLuint zero_uint = 0U;
     const GLint zero_int = 0;
@@ -1530,13 +1529,13 @@ void PowderApp::RunSpawnFullRes(const BrushConfig& config, const DispatchRegion&
     glUniform1i(CachedUniform(spawn_full_program_, "clearWater"), 0);
     glUniform1i(CachedUniform(spawn_full_program_, "clearMode"), 0);
 
-    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
-    glBindImageTexture(3, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(5, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(6, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(7, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-    glBindImageTexture(1, water_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
+    BindImage(0, CurrentMaterial(), GL_READ_WRITE, GL_R16UI);
+    BindImage(3, CurrentWaterAmount(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentWaterVelocity(), GL_READ_WRITE, GL_RG16F);
+    BindImage(5, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(6, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(7, sand_state_.packed, GL_READ_WRITE, GL_R8UI);
+    BindImage(1, water_state_.packed, GL_READ_WRITE, GL_R8UI);
 
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -1569,26 +1568,26 @@ void PowderApp::RunSpawnGas(const BrushConfig& config, const DispatchRegion& reg
     glUniform1f(CachedUniform(spawn_gas_program_, "velocitySpread"), config.velocity_spread);
     glUniform1ui(CachedUniform(spawn_gas_program_, "spawnSeed"), frame_index_ * 977U + static_cast<GLuint>(brush_x_ * 131 + brush_y_));
 
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(5, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(6, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(7, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(9, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(10, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_WRITE, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_WRITE, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_READ_WRITE, GL_RG16F);
+    BindImage(3, CurrentSmokeDen(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(5, CurrentFuel(), GL_READ_WRITE, GL_R16F);
+    BindImage(6, CurrentOxidizer(), GL_READ_WRITE, GL_R16F);
+    BindImage(7, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(9, CurrentWaterAmount(), GL_READ_ONLY, GL_R16F);
+    BindImage(10, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
 
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_WRITE_ONLY, GL_RG16F);
+    BindImage(3, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -1622,8 +1621,8 @@ void PowderApp::RunSpawnSandParticles(const BrushConfig& config, const DispatchR
     glUniform2i(CachedUniform(sand_particle_spawn_program_, "skipCenter"), config.previous_stamp[0], config.previous_stamp[1]);
     glUniform1ui(CachedUniform(sand_particle_spawn_program_, "spawnSeed"), frame_index_ * 977U + static_cast<GLuint>(brush_x_ * 131 + brush_y_));
     glUniform1f(CachedUniform(sand_particle_spawn_program_, "velocitySpread"), config.velocity_spread);
-    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
-    glBindImageTexture(1, sand_state_.occupancy, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, CurrentMaterial(), GL_READ_ONLY, GL_R16UI);
+    BindImage(1, sand_state_.occupancy, GL_READ_ONLY, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.spawn_cursor);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, debug_state_.counters);
@@ -1666,8 +1665,8 @@ void PowderApp::RunSpawnWaterParticles(const BrushConfig& config, const Dispatch
     glUniform1f(CachedUniform(water_particle_spawn_program_, "tickDt"), config_.fixed_dt);
     glUniform2f(CachedUniform(water_particle_spawn_program_, "gravity"), 0.0F, config_.water_gravity);
     if (config.oil) oil_present_ = true;
-    glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(1, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, water_state_.spawn_cursor);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, debug_state_.counters);
@@ -1723,13 +1722,13 @@ void PowderApp::RunClearFullRes(const DispatchRegion& region) {
     glUniform1i(CachedUniform(spawn_full_program_, "clearWater"), 1);
     glUniform1i(CachedUniform(spawn_full_program_, "clearMode"), 1);
 
-    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
-    glBindImageTexture(3, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(5, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(6, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(7, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-    glBindImageTexture(1, water_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
+    BindImage(0, CurrentMaterial(), GL_READ_WRITE, GL_R16UI);
+    BindImage(3, CurrentWaterAmount(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentWaterVelocity(), GL_READ_WRITE, GL_RG16F);
+    BindImage(5, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(6, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(7, sand_state_.packed, GL_READ_WRITE, GL_R8UI);
+    BindImage(1, water_state_.packed, GL_READ_WRITE, GL_R8UI);
 
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -1756,24 +1755,24 @@ void PowderApp::RunClearGas(const DispatchRegion& region) {
     glUniform1i(CachedUniform(spawn_gas_program_, "blockedByWater"), 0);
     glUniform1i(CachedUniform(spawn_gas_program_, "clearMode"), 1);
 
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(5, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(6, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(7, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
+    BindImage(0, CurrentGasU(), GL_READ_WRITE, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_WRITE, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_READ_WRITE, GL_RG16F);
+    BindImage(3, CurrentSmokeDen(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(5, CurrentFuel(), GL_READ_WRITE, GL_R16F);
+    BindImage(6, CurrentOxidizer(), GL_READ_WRITE, GL_R16F);
+    BindImage(7, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
 
     DispatchRegionGrid(region);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_WRITE_ONLY, GL_RG16F);
+    BindImage(3, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -1781,10 +1780,10 @@ void PowderApp::RunClearGas(const DispatchRegion& region) {
 void PowderApp::RunBoundaryPass() {
     glUseProgram(boundary_build_program_);
     glUniform2i(CachedUniform(boundary_build_program_, "gridSize"), kGridWidth, kGridHeight);
-    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
-    glBindImageTexture(1, sand_state_.occupancy, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
-    glBindImageTexture(3, boundary_state_.mask_static, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+    BindImage(0, CurrentMaterial(), GL_READ_ONLY, GL_R16UI);
+    BindImage(1, sand_state_.occupancy, GL_READ_ONLY, GL_R16F);
+    BindImage(2, boundary_state_.mask_full, GL_WRITE_ONLY, GL_R8UI);
+    BindImage(3, boundary_state_.mask_static, GL_WRITE_ONLY, GL_R8UI);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -1792,8 +1791,8 @@ void PowderApp::RunBoundaryPass() {
     if (boundary_state_.static_dirty) {
         glUseProgram(boundary_seed_program_);
         glUniform2i(CachedUniform(boundary_seed_program_, "gridSize"), kGridWidth, kGridHeight);
-        glBindImageTexture(0, boundary_state_.mask_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(1, boundary_state_.seed_full_a, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
+        BindImage(0, boundary_state_.mask_static, GL_READ_ONLY, GL_R8UI);
+        BindImage(1, boundary_state_.seed_full_a, GL_WRITE_ONLY, GL_RG32I);
         DispatchGrid(kGridWidth, kGridHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -1806,8 +1805,8 @@ void PowderApp::RunBoundaryPass() {
             glUseProgram(boundary_jumpflood_program_);
             glUniform2i(CachedUniform(boundary_jumpflood_program_, "gridSize"), kGridWidth, kGridHeight);
             glUniform1i(CachedUniform(boundary_jumpflood_program_, "stepSize"), step);
-            glBindImageTexture(0, current_seed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32I);
-            glBindImageTexture(1, next_seed, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
+            BindImage(0, current_seed, GL_READ_ONLY, GL_RG32I);
+            BindImage(1, next_seed, GL_WRITE_ONLY, GL_RG32I);
             DispatchGrid(kGridWidth, kGridHeight);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
             std::swap(current_seed, next_seed);
@@ -1818,9 +1817,9 @@ void PowderApp::RunBoundaryPass() {
         glUniform2i(CachedUniform(boundary_distance_program_, "gridSize"), kGridWidth, kGridHeight);
         glUniform1f(CachedUniform(boundary_distance_program_, "maxDistance"),
                     std::sqrt(static_cast<float>(kGridWidth * kGridWidth + kGridHeight * kGridHeight)));
-        glBindImageTexture(0, boundary_state_.mask_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(1, current_seed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32I);
-        glBindImageTexture(2, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+        BindImage(0, boundary_state_.mask_static, GL_READ_ONLY, GL_R8UI);
+        BindImage(1, current_seed, GL_READ_ONLY, GL_RG32I);
+        BindImage(2, boundary_state_.sdf_static, GL_WRITE_ONLY, GL_R16F);
         DispatchGrid(kGridWidth, kGridHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
         boundary_state_.static_dirty = false;
@@ -1833,10 +1832,10 @@ void PowderApp::RunBoundaryPass() {
     // Half the rest volume: a settled body, not spray or a thin film. The liquid volume is the previous tick's.
     glUniform1f(CachedUniform(boundary_downsample_program_, "waterBlockVolume"),
                 0.5F * config_.water_rest_density * config_.water_amount_per_particle);
-    glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(1, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
-    glBindImageTexture(2, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(1, boundary_state_.mask_gas, GL_WRITE_ONLY, GL_R8UI);
+    BindImage(2, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+    BindImage(3, phase_state_.oil_field, GL_READ_ONLY, GL_RG16F);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -1919,7 +1918,8 @@ void PowderApp::RunSandPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, sand_state_.tile_flags);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (particle_groups() > 0U) glDispatchCompute(particle_groups(), 1, 1);  // zero groups is an error on some drivers
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     };
 
     // Sleep-packing: tally still grains per cell and decide pack/wake per cell before compaction, which drops exactly
@@ -1942,19 +1942,20 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_pack_program_, "dt"), dt);
         glUniform1i(CachedUniform(sand_pack_program_, "maxParticles"), kMaxSandParticles);
         glUniform1ui(CachedUniform(sand_pack_program_, "seed"), frame_index_ * 2654435761U + 12345U);
-        glBindImageTexture(0, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-        glBindImageTexture(1, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
-        glBindImageTexture(2, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(3, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(4, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-        glBindImageTexture(5, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F);
+        BindImage(0, sand_state_.packed, GL_READ_WRITE, GL_R8UI);
+        BindImage(1, sand_state_.packed_f, GL_READ_WRITE, GL_RGBA32F);
+        BindImage(2, boundary_state_.sdf_static, GL_READ_ONLY, GL_R16F);
+        BindImage(3, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+        BindImage(4, CurrentWaterVelocity(), GL_READ_ONLY, GL_RG16F);
+        BindImage(5, sand_state_.grid_velocity, GL_READ_ONLY, GL_RG32F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.cell_tally);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.cell_fsum);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, sand_state_.spawn_cursor);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth, kGridHeight);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     };
     if (sleeping) {
         glUseProgram(sand_sleep_program_);
@@ -2050,12 +2051,12 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_grid_update_program_, "frictionAlpha"), config_.sand_friction_alpha);
         glUniform1f(CachedUniform(sand_grid_update_program_, "cohesion"), config_.sand_cohesion);
         glUniform1i(CachedUniform(sand_grid_update_program_, "skipEmptyTiles"), substep + 1 < sand_state_.substeps ? 1 : 0);
-        glBindImageTexture(0, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(2, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-        glBindImageTexture(3, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32F);
-        glBindImageTexture(4, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(5, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+        BindImage(0, boundary_state_.sdf_static, GL_READ_ONLY, GL_R16F);
+        BindImage(1, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+        BindImage(2, CurrentWaterVelocity(), GL_READ_ONLY, GL_RG16F);
+        BindImage(3, sand_state_.grid_velocity, GL_WRITE_ONLY, GL_RG32F);
+        BindImage(4, sand_state_.packed, GL_READ_ONLY, GL_R8UI);
+        BindImage(5, sand_state_.packed_f, GL_READ_ONLY, GL_RGBA32F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.grid_mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_momentum_x);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sand_state_.grid_momentum_y);
@@ -2064,7 +2065,8 @@ void PowderApp::RunSandPass(float dt) {
         if (grid_box[2] > grid_box[0] && grid_box[3] > grid_box[1]) {
             DispatchGrid(grid_box[2] - tile_x0, grid_box[3] - tile_y0);
         }
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT);
 
         glUseProgram(sand_particle_step_program_);
         glUniform2i(CachedUniform(sand_particle_step_program_, "gridSize"), kGridWidth, kGridHeight);
@@ -2090,15 +2092,16 @@ void PowderApp::RunSandPass(float dt) {
         glUniform1f(CachedUniform(sand_particle_step_program_, "waterFullVolume"), 4.0F * config_.water_amount_per_particle);
         glUniform1ui(CachedUniform(sand_particle_step_program_, "roundSeed"),
                      frame_index_ * 2654435761U + static_cast<GLuint>(substep));
-        glBindImageTexture(0, boundary_state_.sdf_static, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(1, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F);
-        glBindImageTexture(2, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(3, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+        BindImage(0, boundary_state_.sdf_static, GL_READ_ONLY, GL_R16F);
+        BindImage(1, sand_state_.grid_velocity, GL_READ_ONLY, GL_RG32F);
+        BindImage(2, sand_state_.packed, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_mass);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (particle_groups() > 0U) glDispatchCompute(particle_groups(), 1, 1);  // zero groups is an error on some drivers
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     }
 
     // Moisture is gathered only here, so like the mass it is zero outside the rows this clear covers.
@@ -2115,10 +2118,10 @@ void PowderApp::RunSandPass(float dt) {
     glUniform2i(CachedUniform(sand_rasterize_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1f(CachedUniform(sand_rasterize_program_, "massScale"), 4096.0F);
     glUniform1f(CachedUniform(sand_rasterize_program_, "referenceDensity"), config_.sand_reference_density);
-    glBindImageTexture(0, sand_state_.occupancy, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(1, sand_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(2, sand_state_.moisture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
-    glBindImageTexture(3, sand_state_.packed_f, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    BindImage(0, sand_state_.occupancy, GL_WRITE_ONLY, GL_R16F);
+    BindImage(1, sand_state_.packed, GL_READ_ONLY, GL_R8UI);
+    BindImage(2, sand_state_.moisture, GL_WRITE_ONLY, GL_R8);
+    BindImage(3, sand_state_.packed_f, GL_READ_ONLY, GL_RGBA32F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sand_state_.grid_mass);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sand_state_.grid_moisture);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
@@ -2159,7 +2162,7 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1i(CachedUniform(water_particle_p2g_program_, "maxParticles"), static_cast<GLint>(water_state_.live_count));
         glUniform1f(CachedUniform(water_particle_p2g_program_, "velocityScale"), 4096.0F);
         glUniform1f(CachedUniform(water_particle_p2g_program_, "weightScale"), 4096.0F);
-        glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, water_state_.u_face_weights);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, water_state_.v_face_weights);
@@ -2168,7 +2171,8 @@ void PowderApp::RunWaterPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, water_state_.cell_counts);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         if (water_state_.live_count > 0U) glDispatchCompute((water_state_.live_count + 255U) / 256U, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     };
 
     const auto build_mac_faces = [this](bool previous_grid) {
@@ -2176,14 +2180,12 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform2i(CachedUniform(water_mac_build_program_, "gridSize"), kGridWidth, kGridHeight);
         glUniform1f(CachedUniform(water_mac_build_program_, "velocityScale"), 4096.0F);
         glUniform1f(CachedUniform(water_mac_build_program_, "weightScale"), 4096.0F);
-        glBindImageTexture(0, previous_grid ? water_state_.mac_u_prev : water_state_.mac_u,
-                           0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(1, previous_grid ? water_state_.mac_v_prev : water_state_.mac_v,
-                           0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(2, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(3, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F);
+        BindImage(0, previous_grid ? water_state_.mac_u_prev : water_state_.mac_u, GL_WRITE_ONLY, GL_R16F);
+        BindImage(1, previous_grid ? water_state_.mac_v_prev : water_state_.mac_v, GL_WRITE_ONLY, GL_R16F);
+        BindImage(2, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, sand_state_.grid_velocity, GL_READ_ONLY, GL_RG32F);
         glUniform1f(CachedUniform(water_mac_build_program_, "restMass"), config_.water_rest_density);
-        glBindImageTexture(4, water_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(4, water_state_.packed, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, water_state_.cell_counts);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.u_face_weights);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, water_state_.v_face_weights);
@@ -2191,7 +2193,8 @@ void PowderApp::RunWaterPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, water_state_.v_face_velocity_sums);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth + 1, kGridHeight + 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT);
     };
 
     const auto finalize_particle_fields = [this]() {
@@ -2203,10 +2206,10 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_particle_finalize_program_, "surfaceLevel"), config_.water_surface_level);
         glUniform1f(CachedUniform(water_particle_finalize_program_, "restMass"), config_.water_rest_density);
         glUniform1f(CachedUniform(water_particle_finalize_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
-        glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(2, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(3, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+        BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(1, water_state_.liquid_volume, GL_WRITE_ONLY, GL_R16F);
+        BindImage(2, water_state_.liquid_phi, GL_WRITE_ONLY, GL_R16F);
+        BindImage(3, CurrentWaterAmount(), GL_WRITE_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.cell_counts);
         DispatchGrid(kGridWidth, kGridHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -2215,10 +2218,10 @@ void PowderApp::RunWaterPass(float dt) {
     const auto finalize_mac_faces = [this]() {
         glUseProgram(water_mac_finalize_program_);
         glUniform2i(CachedUniform(water_mac_finalize_program_, "gridSize"), kGridWidth, kGridHeight);
-        glBindImageTexture(0, water_state_.mac_u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(1, water_state_.mac_v, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(2, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(3, CurrentWaterVelocity(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+        BindImage(0, water_state_.mac_u, GL_READ_ONLY, GL_R16F);
+        BindImage(1, water_state_.mac_v, GL_READ_ONLY, GL_R16F);
+        BindImage(2, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, CurrentWaterVelocity(), GL_WRITE_ONLY, GL_RG16F);
         DispatchGrid(kGridWidth, kGridHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     };
@@ -2239,18 +2242,19 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_pack_program_, "particleMass"), config_.water_particle_mass);
         glUniform1i(CachedUniform(water_pack_program_, "maxParticles"), kMaxWaterParticles);
         glUniform1ui(CachedUniform(water_pack_program_, "seed"), frame_index_ * 2654435761U + 777U);
-        glBindImageTexture(0, water_state_.packed, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-        glBindImageTexture(1, water_state_.wake_velocity, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-        glBindImageTexture(2, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(3, water_state_.mac_u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(4, water_state_.mac_v, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+        BindImage(0, water_state_.packed, GL_READ_WRITE, GL_R8UI);
+        BindImage(1, water_state_.wake_velocity, GL_READ_WRITE, GL_RG16F);
+        BindImage(2, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, water_state_.mac_u, GL_READ_ONLY, GL_R16F);
+        BindImage(4, water_state_.mac_v, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, water_state_.cell_tally);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, water_state_.cell_counts);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, water_state_.spawn_cursor);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth, kGridHeight);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     };
     if (packing) {
         glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -2330,16 +2334,17 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_divergence_program_, "weightScale"), 4096.0F);
         glUniform1f(CachedUniform(water_divergence_program_, "restDensity"), config_.water_rest_density);
         glUniform1f(CachedUniform(water_divergence_program_, "densityRate"), config_.water_density_rate);
-        glBindImageTexture(0, water_state_.mac_u_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(1, water_state_.mac_v_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(2, CurrentWaterDivergence(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(3, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(4, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(5, water_state_.packed, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(0, water_state_.mac_u_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(1, water_state_.mac_v_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(2, CurrentWaterDivergence(), GL_WRITE_ONLY, GL_R16F);
+        BindImage(3, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(4, water_state_.liquid_phi, GL_READ_ONLY, GL_R16F);
+        BindImage(5, water_state_.packed, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.cell_counts);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth, kGridHeight);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT);
         RemovePocketMeans(false);
 
         RunWaterProjection();
@@ -2350,16 +2355,17 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1f(CachedUniform(water_project_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
         glUniform1f(CachedUniform(water_project_program_, "sandLeak"), kSandLeak);
         glUniform1f(CachedUniform(water_project_program_, "thetaMin"), config_.water_ghost_theta_min);
-        glBindImageTexture(0, water_state_.mac_u_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(1, water_state_.mac_v_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(2, CurrentWaterPressure(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(3, water_state_.mac_u, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(4, water_state_.mac_v, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-        glBindImageTexture(5, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(6, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+        BindImage(0, water_state_.mac_u_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(1, water_state_.mac_v_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(2, CurrentWaterPressure(), GL_READ_ONLY, GL_R32F);
+        BindImage(3, water_state_.mac_u, GL_WRITE_ONLY, GL_R16F);
+        BindImage(4, water_state_.mac_v, GL_WRITE_ONLY, GL_R16F);
+        BindImage(5, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(6, water_state_.liquid_phi, GL_READ_ONLY, GL_R16F);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
         DispatchGrid(kGridWidth + 1, kGridHeight + 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT);
         // Wake decisions read the tick's final projected faces; the next tick's phase 1 applies them.
         if (packing && step == substeps - 1) pack_phase(2);
 
@@ -2376,15 +2382,15 @@ void PowderApp::RunWaterPass(float dt) {
         glUniform1i(CachedUniform(water_particle_step_program_, "maxParticles"), static_cast<GLint>(water_state_.live_count));
         glUniform1f(CachedUniform(water_particle_step_program_, "sandDrag"),
                     config_.sand_drag * config_.sand_reference_density);
-        glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-        glBindImageTexture(1, water_state_.mac_u_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(2, water_state_.mac_v_prev, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(3, water_state_.mac_u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(4, water_state_.mac_v, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(5, sand_state_.grid_velocity, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F);
-        glBindImageTexture(6, sand_state_.occupancy, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(7, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-        glBindImageTexture(8, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+        BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+        BindImage(1, water_state_.mac_u_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(2, water_state_.mac_v_prev, GL_READ_ONLY, GL_R16F);
+        BindImage(3, water_state_.mac_u, GL_READ_ONLY, GL_R16F);
+        BindImage(4, water_state_.mac_v, GL_READ_ONLY, GL_R16F);
+        BindImage(5, sand_state_.grid_velocity, GL_READ_ONLY, GL_RG32F);
+        BindImage(6, sand_state_.occupancy, GL_READ_ONLY, GL_R16F);
+        BindImage(7, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+        BindImage(8, phase_state_.oil_field, GL_READ_ONLY, GL_RG16F);
         glUniform1f(CachedUniform(water_particle_step_program_, "oilDrift"), oil_present_ ? kOilDrift : 0.0F);
         glUniform1f(CachedUniform(water_particle_step_program_, "restVolume"),
                     config_.water_rest_density * config_.water_amount_per_particle);
@@ -2397,7 +2403,8 @@ void PowderApp::RunWaterPass(float dt) {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, debug_state_.counters);
         if (water_state_.live_count > 0U) glDispatchCompute((water_state_.live_count + 255U) / 256U, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     }
 
     build_particle_fields();
@@ -2420,10 +2427,10 @@ void PowderApp::BindWaterSolver() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, water_state_.pressure_sums);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, water_state_.pressure_levels);
     glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, water_state_.pressure_tiles);
-    glBindImageTexture(0, CurrentWaterDivergence(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentWaterPressure(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(2, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(3, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, CurrentWaterDivergence(), GL_READ_ONLY, GL_R16F);
+    BindImage(1, CurrentWaterPressure(), GL_READ_WRITE, GL_R32F);
+    BindImage(2, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(3, water_state_.liquid_phi, GL_READ_ONLY, GL_R16F);
     glUseProgram(pressure_mg_program_);
     glUniform2i(CachedUniform(pressure_mg_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1i(CachedUniform(pressure_mg_program_, "levels"), kWaterMultigridLevels);
@@ -2493,8 +2500,8 @@ void PowderApp::RemovePocketMeans(bool gas) {
     glUniform1f(CachedUniform(pressure_pockets_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
     glBindImageTexture(wide ? 1 : 0, rhs, 0, GL_FALSE, 0, GL_READ_WRITE, rhs_format);
     glBindImageTexture(wide ? 0 : 1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, wide ? GL_R16F : GL_R32F);
-    glBindImageTexture(2, gas ? gas_state_.level_kind[0] : boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(3, water_state_.liquid_phi, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
+    BindImage(2, gas ? gas_state_.level_kind[0] : boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(3, water_state_.liquid_phi, GL_READ_WRITE, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.pockets);
     const GLint phase = CachedUniform(pressure_pockets_program_, "phase");
     for (int p = 0; p < 5; ++p) {
@@ -2534,14 +2541,15 @@ void PowderApp::RunWaterProjection() {
         glUseProgram(program);
         glUniform1i(location, phase);
         glDispatchCompute(groups, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
     };
     const auto tile_step = [&](int phase) {
         glUniform1i(cg_phase, phase);
         glDispatchComputeIndirect(0);
         // A stopped solve zeroes the group counts; the command barrier lets the next dispatches launch no workgroups.
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT |
-                        (phase == 2 ? GL_SHADER_IMAGE_ACCESS_BARRIER_BIT : 0U));
+                        (phase == 2 ? GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT : 0U));
     };
     int dispatched = 0;
     // Each iteration ends with phase 1, which tests it and already forms the next direction and A*direction. The sum
@@ -2562,7 +2570,8 @@ void PowderApp::RunWaterProjection() {
         glUseProgram(program);
         glUniform1i(location, phase);
         glDispatchComputeIndirect(offset);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
     };
     // Forms b - Ap from the stored pressure and starts CG on it. A restart keeps the tile list and iteration count and
     // is queued blind: phase 10 arms it only for a solve that has stopped after iterating, and every pass of it
@@ -2652,9 +2661,7 @@ void PowderApp::RunWaterProjection() {
     glUniform1f(CachedUniform(pressure_residual_program_, "thetaMin"), config_.water_ghost_theta_min);
     glUniform1f(CachedUniform(pressure_residual_program_, "sandLeak"), kSandLeak);
     glUniform1f(CachedUniform(pressure_residual_program_, "liquidPhiThreshold"), config_.water_liquid_phi_threshold);
-    glUniform1i(CachedUniform(pressure_residual_program_, "pressureTex"), 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, CurrentWaterPressure());
+    BindImage(1, CurrentWaterPressure(), GL_READ_ONLY, GL_R32F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, debug_state_.counters);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -2700,21 +2707,21 @@ void PowderApp::RunSmokePass(float dt, bool project) {
     glUniform2i(CachedUniform(gas_velocity_advect_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1f(CachedUniform(gas_velocity_advect_program_, "dt"), dt);
     glUniform1f(CachedUniform(gas_velocity_advect_program_, "maxVelocity"), config_.gas_max_velocity);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(5, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(3, gas_state_.mac_u_tmp, GL_WRITE_ONLY, GL_R32F);
+    BindImage(4, gas_state_.mac_v_tmp, GL_WRITE_ONLY, GL_R32F);
+    BindImage(5, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, gas_state_.velocity_center_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, gas_state_.mac_u_tmp, GL_READ_ONLY, GL_R32F);
+    BindImage(1, gas_state_.mac_v_tmp, GL_READ_ONLY, GL_R32F);
+    BindImage(2, gas_state_.velocity_center_tmp, GL_WRITE_ONLY, GL_RG16F);
+    BindImage(3, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -2722,18 +2729,18 @@ void PowderApp::RunSmokePass(float dt, bool project) {
     glUniform2i(CachedUniform(smoke_advect_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1f(CachedUniform(smoke_advect_program_, "dt"), dt);
     glUniform1f(CachedUniform(smoke_advect_program_, "maxVelocity"), config_.gas_max_velocity);
-    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(4, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(5, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(6, gas_state_.smoke_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(7, gas_state_.temperature_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(8, gas_state_.fuel_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(9, gas_state_.oxidizer_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(10, gas_state_.reaction_tmp, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(11, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(1, CurrentSmokeDen(), GL_READ_ONLY, GL_R16F);
+    BindImage(2, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentFuel(), GL_READ_ONLY, GL_R16F);
+    BindImage(4, CurrentOxidizer(), GL_READ_ONLY, GL_R16F);
+    BindImage(5, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(0, gas_state_.smoke_tmp, GL_WRITE_ONLY, GL_R16F);
+    BindImage(1, gas_state_.temperature_tmp, GL_WRITE_ONLY, GL_R16F);
+    BindImage(2, gas_state_.fuel_tmp, GL_WRITE_ONLY, GL_R16F);
+    BindImage(3, gas_state_.oxidizer_tmp, GL_WRITE_ONLY, GL_R16F);
+    BindImage(4, gas_state_.reaction_tmp, GL_WRITE_ONLY, GL_RG16F);
+    BindImage(11, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -2745,24 +2752,24 @@ void PowderApp::RunSmokePass(float dt, bool project) {
                 std::pow(config_.gas_density_dissipation, dt * 60.0F));
     glUniform1f(CachedUniform(smoke_correct_program_, "scalarDissipation"),
                 std::pow(config_.gas_scalar_dissipation, dt * 60.0F));
-    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, gas_state_.velocity_center_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(2, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(4, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(5, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(6, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(7, gas_state_.smoke_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(8, gas_state_.temperature_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(9, gas_state_.fuel_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(10, gas_state_.oxidizer_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(11, gas_state_.reaction_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(12, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(13, NextTemperature(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(14, NextFuel(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(15, NextOxidizer(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(16, NextReactionRate(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(17, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(1, gas_state_.velocity_center_tmp, GL_READ_ONLY, GL_RG16F);
+    BindImage(2, CurrentSmokeDen(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(4, CurrentFuel(), GL_READ_ONLY, GL_R16F);
+    BindImage(5, CurrentOxidizer(), GL_READ_ONLY, GL_R16F);
+    BindImage(6, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(7, gas_state_.smoke_tmp, GL_READ_ONLY, GL_R16F);
+    BindImage(8, gas_state_.temperature_tmp, GL_READ_ONLY, GL_R16F);
+    BindImage(9, gas_state_.fuel_tmp, GL_READ_ONLY, GL_R16F);
+    BindImage(10, gas_state_.oxidizer_tmp, GL_READ_ONLY, GL_R16F);
+    BindImage(11, gas_state_.reaction_tmp, GL_READ_ONLY, GL_RG16F);
+    BindImage(0, NextSmokeDen(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(1, NextTemperature(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(2, NextFuel(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(3, NextOxidizer(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(4, NextReactionRate(), GL_WRITE_ONLY, GL_RG16F);
+    BindImage(17, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -2776,17 +2783,17 @@ void PowderApp::RunSmokePass(float dt, bool project) {
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "buoyancySmoke"), config_.gas_buoyancy_smoke);
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "maxVelocity"), config_.gas_max_velocity);
     glUniform1f(CachedUniform(gas_velocity_correct_program_, "vorticity"), config_.gas_vorticity);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(3, gas_state_.mac_u_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(4, gas_state_.mac_v_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(5, gas_state_.velocity_center_tmp, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(6, NextSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(7, NextTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(8, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(9, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(10, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(3, gas_state_.mac_u_tmp, GL_READ_ONLY, GL_R32F);
+    BindImage(4, gas_state_.mac_v_tmp, GL_READ_ONLY, GL_R32F);
+    BindImage(5, gas_state_.velocity_center_tmp, GL_READ_ONLY, GL_RG16F);
+    BindImage(6, NextSmokeDen(), GL_READ_ONLY, GL_R16F);
+    BindImage(7, NextTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(0, NextGasU(), GL_WRITE_ONLY, GL_R32F);
+    BindImage(1, NextGasV(), GL_WRITE_ONLY, GL_R32F);
+    BindImage(10, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -2804,21 +2811,23 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
     if (begin) {
         // The operator, residual checks and projection all use this copy: water, sand and rock keep moving the live mask
         // between the halves of a tick pair.
-        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
         glCopyImageSubData(boundary_state_.mask_gas, GL_TEXTURE_2D, 0, 0, 0, 0, gas_state_.mask_solve, GL_TEXTURE_2D, 0, 0,
                            0, 0, kGasWidth, kGasHeight, 1);
-        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_TEXTURE_FETCH_BARRIER_BIT);
     }
     const GLuint solve_mask = gas_state_.mask_solve;
     if (begin) {
         glUseProgram(smoke_divergence_program_);
         glUniform2i(CachedUniform(smoke_divergence_program_, "gasSize"), kGasWidth, kGasHeight);
-        glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(2, gas_state_.divergence, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-        glBindImageTexture(4, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+        BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+        BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+        BindImage(2, gas_state_.divergence, GL_WRITE_ONLY, GL_R32F);
+        BindImage(4, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
         glUniform1f(CachedUniform(smoke_divergence_program_, "expansion"), config_.gas_expansion);
-        glBindImageTexture(3, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(3, solve_mask, GL_READ_ONLY, GL_R8UI);
         DispatchGrid(kGasWidth, kGasHeight);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     }
@@ -2840,11 +2849,10 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
                         sizes[std::max(level - 1, 0)]);
             glUniform2i(CachedUniform(gas_pressure_kind_program_, "coarseSize"), sizes[level], sizes[level]);
             glUniform1i(CachedUniform(gas_pressure_kind_program_, "fromMask"), level == 0 ? 1 : 0);
-            glBindImageTexture(0, level == 0 ? solve_mask : gas_state_.level_kind[level - 1], 0, GL_FALSE, 0,
-                               GL_READ_ONLY, GL_R8UI);
-            glBindImageTexture(1, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+            BindImage(0, level == 0 ? solve_mask : gas_state_.level_kind[level - 1], GL_READ_ONLY, GL_R8UI);
+            BindImage(1, gas_state_.level_kind[level], GL_WRITE_ONLY, GL_R8UI);
             DispatchGrid(sizes[level], sizes[level]);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
         }
         // Only burning (fire, wood, lit oil) adds a source; wall faces carry no flux, so without one a sealed pocket's
         // divergence already sums to zero.
@@ -2863,11 +2871,9 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
         glUniform1f(CachedUniform(pressure_residual_program_, "sandLeak"), kSandLeak);
         glUniform1f(CachedUniform(pressure_residual_program_, "liquidPhiThreshold"), 0.0F);
         glUniform1i(CachedUniform(pressure_residual_program_, "wideRhs"), 1);
-        glBindImageTexture(4, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glUniform1i(CachedUniform(pressure_residual_program_, "pressureTex"), 0);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gas_state_.pressure_a);
-        glBindImageTexture(2, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(4, gas_state_.divergence, GL_READ_ONLY, GL_R32F);
+        BindImage(1, gas_state_.pressure_a, GL_READ_ONLY, GL_R32F);
+        BindImage(2, solve_mask, GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, debug_state_.counters);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gas_state_.pressure_check);
         DispatchGrid(kGasWidth, kGasHeight);
@@ -2910,14 +2916,14 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
         glUniform1f(CachedUniform(gas_pressure_relax_program_, "sandLeak"), kSandLeak);
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "fineHeight"), kGasHeight);
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "bottomSweeps"), level == kGasLevels - 1 ? sweeps : 0);
-        glBindImageTexture(0, level_rhs(level), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(3, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(0, level_rhs(level), GL_READ_ONLY, GL_R32F);
+        BindImage(3, gas_state_.level_kind[level], GL_READ_ONLY, GL_R8UI);
         const bool bottom = level == kGasLevels - 1;
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "smoothSteps"), bottom ? 0 : 2 * sweeps);
         if (bottom) {
-            glBindImageTexture(1, level_pressure(level), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+            BindImage(1, level_pressure(level), GL_READ_WRITE, GL_R32F);
             DispatchGrid(sizes[level], sizes[level]);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
             return;
         }
         const GLuint from = reverse ? gas_state_.level_smoothed[level] : level_pressure(level);
@@ -2925,13 +2931,14 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "parity"), reverse ? 1 : 0);
         glUniform1i(CachedUniform(gas_pressure_relax_program_, "prolongate"), reverse ? 1 : 0);
         glUniform2i(CachedUniform(gas_pressure_relax_program_, "coarseSize"), sizes[level + 1], sizes[level + 1]);
-        glBindImageTexture(1, from, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(2, to, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-        glBindImageTexture(4, gas_state_.level_residual[level], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-        glBindImageTexture(5, level_pressure(level + 1), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(6, gas_state_.level_kind[level + 1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        // pressureTex is a read-write image (the bottom level relaxes in place), so this read binds an image unit too.
+        BindImage(1, from, GL_READ_WRITE, GL_R32F);
+        BindImage(2, to, GL_WRITE_ONLY, GL_R32F);
+        BindImage(4, gas_state_.level_residual[level], GL_WRITE_ONLY, GL_R32F);
+        BindImage(5, level_pressure(level + 1), GL_READ_ONLY, GL_R32F);
+        BindImage(6, gas_state_.level_kind[level + 1], GL_READ_ONLY, GL_R8UI);
         DispatchGrid(sizes[level], sizes[level]);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     };
     // The preconditioner: one V-cycle from zero for z ~ L^-1 s.
     const auto v_cycle = [&]() {
@@ -2944,17 +2951,17 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
             glUniform1i(CachedUniform(gas_pressure_restrict_program_, "openTop"), open_top);
             glUniform1f(CachedUniform(gas_pressure_restrict_program_, "sandLeak"), kSandLeak);
             glUniform1i(CachedUniform(gas_pressure_restrict_program_, "fineHeight"), kGasHeight);
-            glBindImageTexture(0, level_rhs(level), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-            glBindImageTexture(1, level_pressure(level), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-            glBindImageTexture(2, level_rhs(level + 1), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-            glBindImageTexture(3, gas_state_.level_kind[level], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-            glBindImageTexture(4, level_pressure(level + 1), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-            glBindImageTexture(5, gas_state_.level_kind[level + 1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-            glBindImageTexture(6, gas_state_.level_residual[level], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+            BindImage(0, level_rhs(level), GL_READ_ONLY, GL_R32F);
+            BindImage(1, level_pressure(level), GL_READ_ONLY, GL_R32F);
+            BindImage(2, level_rhs(level + 1), GL_WRITE_ONLY, GL_R32F);
+            BindImage(3, gas_state_.level_kind[level], GL_READ_ONLY, GL_R8UI);
+            BindImage(4, level_pressure(level + 1), GL_WRITE_ONLY, GL_R32F);
+            BindImage(5, gas_state_.level_kind[level + 1], GL_READ_ONLY, GL_R8UI);
+            BindImage(6, gas_state_.level_residual[level], GL_READ_WRITE, GL_R32F);
             // The residual (gatherPass 0) came with the fused pre-smoothing.
             glUniform1i(CachedUniform(gas_pressure_restrict_program_, "gatherPass"), 1);
             DispatchGrid(sizes[level + 1], sizes[level + 1]);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
         }
         relax_level(kGasLevels - 1, kGasCoarsestSweeps, false);
         // Prolongation is fused into each level's post-smoothing.
@@ -2969,13 +2976,13 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
         glUniform1f(CachedUniform(gas_cg_program_, "sandLeak"), kSandLeak);
         glUniform1i(CachedUniform(gas_cg_program_, "partialCount"), partial_count);
         glUniform1i(CachedUniform(gas_cg_program_, "first"), first ? 1 : 0);
-        glBindImageTexture(0, gas_state_.divergence, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-        glBindImageTexture(1, gas_state_.pressure_a, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(2, gas_state_.cg_s, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(3, gas_state_.cg_z, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(4, gas_state_.cg_d, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(5, gas_state_.cg_q, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(6, gas_state_.level_kind[0], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+        BindImage(0, gas_state_.divergence, GL_READ_ONLY, GL_R32F);
+        BindImage(1, gas_state_.pressure_a, GL_READ_WRITE, GL_R32F);
+        BindImage(2, gas_state_.cg_s, GL_READ_WRITE, GL_R32F);
+        BindImage(3, gas_state_.cg_z, GL_READ_WRITE, GL_R32F);
+        BindImage(4, gas_state_.cg_d, GL_READ_WRITE, GL_R32F);
+        BindImage(5, gas_state_.cg_q, GL_READ_WRITE, GL_R32F);
+        BindImage(6, gas_state_.level_kind[0], GL_READ_ONLY, GL_R8UI);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gas_state_.cg_partials);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gas_state_.cg_scalars);
         if (phase == 2 || phase == 5) {
@@ -2983,7 +2990,8 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
         } else {
             DispatchGrid(kGasWidth, kGasHeight);
         }
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT);
     };
     // z = M^-1 s, then rz and the new direction.
     const auto precondition = [&](bool first) {
@@ -3034,22 +3042,22 @@ void PowderApp::RunGasProjectionStage(bool begin, bool finish, int iteration_bud
     glUniform2i(CachedUniform(smoke_project_program_, "gasSize"), kGasWidth, kGasHeight);
     glUniform1i(CachedUniform(smoke_project_program_, "openTop"), open_top);
     glUniform1f(CachedUniform(smoke_project_program_, "sandLeak"), kSandLeak);
-    glBindImageTexture(0, CurrentGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, CurrentGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, gas_state_.pressure_a, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(3, NextGasU(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(4, NextGasV(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(5, solve_mask, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, CurrentGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, CurrentGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, gas_state_.pressure_a, GL_READ_ONLY, GL_R32F);
+    BindImage(3, NextGasU(), GL_WRITE_ONLY, GL_R32F);
+    BindImage(4, NextGasV(), GL_WRITE_ONLY, GL_R32F);
+    BindImage(5, solve_mask, GL_READ_ONLY, GL_R8UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth + 1, kGasHeight + 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glUseProgram(gas_face_to_center_program_);
     glUniform2i(CachedUniform(gas_face_to_center_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, NextGasU(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(1, NextGasV(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
-    glBindImageTexture(2, NextGasVelocityCenter(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(3, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
+    BindImage(0, NextGasU(), GL_READ_ONLY, GL_R32F);
+    BindImage(1, NextGasV(), GL_READ_ONLY, GL_R32F);
+    BindImage(2, NextGasVelocityCenter(), GL_WRITE_ONLY, GL_RG16F);
+    BindImage(3, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -3069,17 +3077,17 @@ void PowderApp::RunFireHeatPass(float dt) {
     glUniform1f(CachedUniform(fire_rd_program_, "smokeYield"), config_.gas_smoke_yield);
     glUniform1f(CachedUniform(fire_rd_program_, "smokeDissipation"), config_.gas_smoke_dissipation);
     glUniform1f(CachedUniform(fire_rd_program_, "oxygenRate"), config_.gas_oxygen_rate);
-    glBindImageTexture(0, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(4, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(5, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(6, NextFuel(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(7, NextOxidizer(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(8, NextTemperature(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(9, NextReactionRate(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(10, NextSmokeDen(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    BindImage(0, CurrentFuel(), GL_READ_ONLY, GL_R16F);
+    BindImage(1, CurrentOxidizer(), GL_READ_ONLY, GL_R16F);
+    BindImage(2, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentSmokeDen(), GL_READ_ONLY, GL_R16F);
+    BindImage(4, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
+    BindImage(5, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(0, NextFuel(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(1, NextOxidizer(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(2, NextTemperature(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(3, NextReactionRate(), GL_WRITE_ONLY, GL_RG16F);
+    BindImage(4, NextSmokeDen(), GL_WRITE_ONLY, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, debug_state_.counters);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -3096,14 +3104,14 @@ void PowderApp::RunCouplingPass(float dt) {
     glUniform2i(CachedUniform(coupling_fire_program_, "heatSize"), kGasWidth, kGasHeight);
     glUniform1f(CachedUniform(coupling_fire_program_, "dt"), dt);
     glUniform1f(CachedUniform(coupling_fire_program_, "waterCooling"), config_.gas_water_cooling);
-    glBindImageTexture(0, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(4, CurrentOxidizer(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(5, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(6, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(7, sand_state_.occupancy, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
+    BindImage(1, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+    BindImage(2, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(4, CurrentOxidizer(), GL_READ_WRITE, GL_R16F);
+    BindImage(5, CurrentFuel(), GL_READ_WRITE, GL_R16F);
+    BindImage(6, phase_state_.oil_field, GL_READ_ONLY, GL_RG16F);
+    BindImage(7, sand_state_.occupancy, GL_READ_ONLY, GL_R16F);
     glUniform1f(CachedUniform(coupling_fire_program_, "sandSmother"), kSandSmother);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
@@ -3113,9 +3121,9 @@ void PowderApp::RunCouplingPass(float dt) {
     glUniform2i(CachedUniform(coupling_heat_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1f(CachedUniform(coupling_heat_program_, "dt"), dt);
     glUniform1f(CachedUniform(coupling_heat_program_, "waterCooling"), config_.gas_water_cooling * 0.7F);
-    glBindImageTexture(0, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    BindImage(0, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(1, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+    BindImage(2, phase_state_.oil_field, GL_READ_ONLY, GL_RG16F);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
@@ -3138,11 +3146,11 @@ void PowderApp::RunPhasePass(float dt) {
     glUniform1f(CachedUniform(phase_particles_program_, "ignitionTemperature"), kOilIgnitionTemperature);
     glUniform1f(CachedUniform(phase_particles_program_, "restVolume"),
                 config_.water_rest_density * config_.water_amount_per_particle);
-    glBindImageTexture(0, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(1, water_state_.liquid_volume, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(4, phase_state_.oil_field, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
+    BindImage(0, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(1, water_state_.liquid_volume, GL_READ_ONLY, GL_R16F);
+    BindImage(2, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(4, phase_state_.oil_field, GL_READ_ONLY, GL_RG16F);
     glUniform1f(CachedUniform(phase_particles_program_, "flashRate"), oil_present_ ? kWaterFlashRate : 0.0F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, water_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, phase_state_.cell_counts);
@@ -3154,7 +3162,7 @@ void PowderApp::RunPhasePass(float dt) {
     glUseProgram(oil_field_program_);
     glUniform2i(CachedUniform(oil_field_program_, "gridSize"), kGridWidth, kGridHeight);
     glUniform1f(CachedUniform(oil_field_program_, "restDensity"), config_.water_rest_density);
-    glBindImageTexture(0, phase_state_.oil_field, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    BindImage(0, phase_state_.oil_field, GL_WRITE_ONLY, GL_RG16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, phase_state_.cell_counts);
     DispatchGrid(kGridWidth, kGridHeight);
 
@@ -3164,17 +3172,14 @@ void PowderApp::RunPhasePass(float dt) {
     glUniform1f(CachedUniform(steam_update_program_, "steamRise"), kSteamRise);
     glUniform1f(CachedUniform(steam_update_program_, "steamCondense"), kSteamCondense);
     glUniform1f(CachedUniform(steam_update_program_, "steamPerParticle"), kSteamPerParticle);
-    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, phase_state_.steam_ping ? phase_state_.steam_b : phase_state_.steam_a, 0, GL_FALSE, 0,
-                       GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(2, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(3, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(5, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(6, CurrentOxidizer(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, CurrentSteam());
-    glUniform1i(CachedUniform(steam_update_program_, "steamSrc"), 0);
+    BindImage(0, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(1, phase_state_.steam_ping ? phase_state_.steam_b : phase_state_.steam_a, GL_WRITE_ONLY, GL_R16F);
+    BindImage(2, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
+    BindImage(3, CurrentFuel(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(5, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(6, CurrentOxidizer(), GL_WRITE_ONLY, GL_R16F);
+    BindImage(7, CurrentSteam(), GL_READ_ONLY, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, phase_state_.gas_sources);
     DispatchGrid(kGasWidth, kGasHeight);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -3235,12 +3240,12 @@ void PowderApp::RunWoodPass() {
     glUniform1f(CachedUniform(wood_burn_program_, "ignitionTemperature"), 0.35F);
     // About 0.8 s to catch while hot, so fire creeps along a beam instead of jumping its length in one tick.
     glUniform1f(CachedUniform(wood_burn_program_, "igniteChance"), 0.02F);
-    glBindImageTexture(0, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16UI);
-    glBindImageTexture(1, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(3, CurrentFuel(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_R16F);
-    glBindImageTexture(4, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG16F);
-    glBindImageTexture(5, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, CurrentMaterial(), GL_READ_WRITE, GL_R16UI);
+    BindImage(1, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
+    BindImage(2, CurrentTemperature(), GL_READ_WRITE, GL_R16F);
+    BindImage(3, CurrentFuel(), GL_READ_WRITE, GL_R16F);
+    BindImage(4, CurrentReactionRate(), GL_READ_WRITE, GL_RG16F);
+    BindImage(5, CurrentWaterAmount(), GL_READ_ONLY, GL_R16F);
     for (int mode = 0; mode < 2; ++mode) {
         glUniform1i(CachedUniform(wood_burn_program_, "mode"), mode);
         DispatchGrid(kGasWidth, kGasHeight);
@@ -3261,14 +3266,14 @@ void PowderApp::RunRenderFieldExtractionPass() {
     glUseProgram(render_extract_program_);
     glUniform2i(CachedUniform(render_extract_program_, "fullSize"), kGridWidth, kGridHeight);
     glUniform2i(CachedUniform(render_extract_program_, "gasSize"), kGasWidth, kGasHeight);
-    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, CurrentSmokeDen(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(2, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(3, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(4, render_gas_velocity_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
-    glBindImageTexture(5, render_smoke_density_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(6, render_temperature_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
-    glBindImageTexture(7, render_fire_emissive_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16F);
+    BindImage(0, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(1, CurrentSmokeDen(), GL_READ_ONLY, GL_R16F);
+    BindImage(2, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(3, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(4, render_gas_velocity_, GL_WRITE_ONLY, GL_RG16F);
+    BindImage(5, render_smoke_density_, GL_WRITE_ONLY, GL_R16F);
+    BindImage(6, render_temperature_, GL_WRITE_ONLY, GL_R16F);
+    BindImage(7, render_fire_emissive_, GL_WRITE_ONLY, GL_R16F);
     DispatchGrid(kGridWidth, kGridHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -3283,7 +3288,7 @@ void PowderApp::RunLightBuildPass() {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, render_fire_emissive_);
     glUniform1i(CachedUniform(light_build_program_, "fireEmissiveTex"), 1);
-    glBindImageTexture(0, light_texture_, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    BindImage(0, light_texture_, GL_WRITE_ONLY, GL_RGBA16F);
     DispatchGrid(kLightWidth, kLightHeight);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
     glBindTexture(GL_TEXTURE_2D, light_texture_);
@@ -3299,10 +3304,10 @@ void PowderApp::RunSparkPass(float dt) {
     glUniform1ui(CachedUniform(spark_pick_program_, "tick"), frame_index_);
     glUniform1ui(CachedUniform(spark_pick_program_, "bucketCount"), static_cast<GLuint>(kSparkSpawnsPerTick));
     glUniform1i(CachedUniform(spark_pick_program_, "woodPresent"), wood_present_ ? 1 : 0);
-    glBindImageTexture(0, CurrentTemperature(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
-    glBindImageTexture(1, CurrentReactionRate(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(2, boundary_state_.mask_gas, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(3, CurrentMaterial(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16UI);
+    BindImage(0, CurrentTemperature(), GL_READ_ONLY, GL_R16F);
+    BindImage(1, CurrentReactionRate(), GL_READ_ONLY, GL_RG16F);
+    BindImage(2, boundary_state_.mask_gas, GL_READ_ONLY, GL_R8UI);
+    BindImage(3, CurrentMaterial(), GL_READ_ONLY, GL_R16UI);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, spark_state_.buckets);
     DispatchGrid(kGasWidth, kGasHeight);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -3315,9 +3320,9 @@ void PowderApp::RunSparkPass(float dt) {
     glUniform1ui(CachedUniform(spark_step_program_, "capacity"), static_cast<GLuint>(kSparkCapacity));
     glUniform1ui(CachedUniform(spark_step_program_, "perTick"), static_cast<GLuint>(kSparkSpawnsPerTick));
     glUniform1f(CachedUniform(spark_step_program_, "gravity"), std::abs(config_.water_gravity));
-    glBindImageTexture(0, CurrentGasVelocityCenter(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
-    glBindImageTexture(1, boundary_state_.mask_full, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R8UI);
-    glBindImageTexture(2, CurrentWaterAmount(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_R16F);
+    BindImage(0, CurrentGasVelocityCenter(), GL_READ_ONLY, GL_RG16F);
+    BindImage(1, boundary_state_.mask_full, GL_READ_ONLY, GL_R8UI);
+    BindImage(2, CurrentWaterAmount(), GL_READ_ONLY, GL_R16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, spark_state_.particles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, spark_state_.buckets);
     glDispatchCompute((kSparkCapacity + 63U) / 64U, 1, 1);

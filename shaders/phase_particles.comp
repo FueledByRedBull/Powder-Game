@@ -8,11 +8,11 @@
 // for oil_field.comp.
 layout(local_size_x = 256) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
-layout(r16f, binding = 1) uniform readonly image2D liquidVolumeTex;
-layout(r16f, binding = 2) uniform readonly image2D temperatureTex;  // gas grid
-layout(rg16f, binding = 3) uniform readonly image2D reactionTex;    // gas grid, y is the flame
-layout(rg16f, binding = 4) uniform readonly image2D oilFieldTex;    // x: oil share per cell (oil_field.comp, last tick)
+layout(binding = 0) uniform usampler2D boundaryMaskTex;
+layout(binding = 1) uniform sampler2D liquidVolumeTex;
+layout(binding = 2) uniform sampler2D temperatureTex;  // gas grid
+layout(binding = 3) uniform sampler2D reactionTex;    // gas grid, y is the flame
+layout(binding = 4) uniform sampler2D oilFieldTex;    // x: oil share per cell (oil_field.comp, last tick)
 
 struct WaterParticle {
     vec4 state0;
@@ -49,6 +49,15 @@ uniform uint seed;
 uniform float evaporateRate;  // 1/s for surface water under gas at full heat
 uniform float burnRate;       // 1/s for surface oil above its ignition temperature
 uniform float ignitionTemperature;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform float restVolume;  // liquid volume of a cell at rest density
 // Water meeting burning oil (oil under it, and in its own cell unless open air is beside or above it, with gas at the
 // ignition temperature over it) boils at once: the slick is far above 100 C, so water that lands on it or sinks through
@@ -60,7 +69,7 @@ float heatAbove(ivec2 gas, int span) {
     float hot = 0.0;
     for (int i = 0; i < span; ++i) {
         ivec2 g = min(gas + ivec2(0, i), gasSize - ivec2(1));
-        hot = max(hot, max(imageLoad(temperatureTex, g).x, imageLoad(reactionTex, g).y));
+        hot = max(hot, max(loadTexel(temperatureTex, g).x, loadTexel(reactionTex, g).y));
     }
     return hot;
 }
@@ -68,7 +77,7 @@ float heatAbove(ivec2 gas, int span) {
 // Open air next to the particle: a cell that is neither wall nor liquid.
 bool airCell(ivec2 cell) {
     return all(greaterThanEqual(cell, ivec2(0))) && all(lessThan(cell, gridSize)) &&
-           imageLoad(boundaryMaskTex, cell).x == 0u && imageLoad(liquidVolumeTex, cell).x < 0.3 * restVolume;
+           loadTexel(boundaryMaskTex, cell).x == 0u && loadTexel(liquidVolumeTex, cell).x < 0.3 * restVolume;
 }
 
 void main() {
@@ -101,8 +110,8 @@ void main() {
     }
     bool flash = false;
     if (!oil && flashRate > 0.0) {
-        bool onOil = imageLoad(oilFieldTex, max(cell - ivec2(0, 1), ivec2(0))).x > 0.25 &&
-                     (exposed || imageLoad(oilFieldTex, cell).x > 0.25);
+        bool onOil = loadTexel(oilFieldTex, max(cell - ivec2(0, 1), ivec2(0))).x > 0.25 &&
+                     (exposed || loadTexel(oilFieldTex, cell).x > 0.25);
         // From the record's own gas cell up 12 cells (6 cm): water a few cells down in a slick still meets its flame.
         flash = onOil && heatAbove(clamp(cell / 2, ivec2(0), gasSize - ivec2(1)), 6) >= ignitionTemperature;
         if (flash) rate = max(rate, flashRate);

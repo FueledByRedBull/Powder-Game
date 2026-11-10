@@ -2,13 +2,18 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D fineKindTex;
+layout(binding = 0) uniform usampler2D fineKindTex;
 layout(r8ui, binding = 1) uniform writeonly uimage2D coarseKindTex;
 
 uniform ivec2 fineSize;
 uniform ivec2 coarseSize;
 // 1 classifies the gas mask itself (level 0); 0 coarsens the level below.
 uniform int fromMask;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 // Footprint kinds of one multigrid level: 0 fluid, 1 solid, 4 porous sand (conducts at sandLeak, see
 // gas_pressure_relax.comp; it keeps gas sealed inside sand from making the system singular). A coarse cell is fluid when any child is: walls
@@ -21,7 +26,7 @@ void main() {
     }
     uint kind;
     if (fromMask != 0) {
-        uint mask = imageLoad(fineKindTex, coord).r;
+        uint mask = loadTexel(fineKindTex, coord).r;
         kind = mask == 0u ? 0u : (mask == 3u ? 4u : 1u);
     } else {
         bool fluid = false;
@@ -31,7 +36,7 @@ void main() {
             // Odd extents: a footprint past the domain edge is classified by its children inside it. As a wall
             // it would cut the last fine cells off every coarser correction.
             if (any(greaterThanEqual(child, fineSize))) continue;
-            uint childKind = imageLoad(fineKindTex, child).r;
+            uint childKind = loadTexel(fineKindTex, child).r;
             fluid = fluid || childKind == 0u;
             porous = porous || childKind == 4u;
         }

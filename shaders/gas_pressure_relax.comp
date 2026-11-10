@@ -2,16 +2,16 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D rhsTex;
+layout(binding = 0) uniform sampler2D rhsTex;
 layout(r32f, binding = 1) uniform coherent image2D pressureTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D kindTex;
+layout(binding = 3) uniform usampler2D kindTex;
 // Fused smoothing (smoothSteps > 0) reads pressureTex and writes the result here, so neighbouring workgroups never
 // see each other's updates; the pre-smoothing also writes its residual and the post-smoothing first adds the coarse
 // correction (gas_pressure_restrict.comp's pass 0 and gas_pressure_prolongate.comp, same arithmetic).
 layout(r32f, binding = 2) uniform writeonly image2D smoothedTex;
 layout(r32f, binding = 4) uniform writeonly image2D residualTex;
-layout(r32f, binding = 5) uniform readonly image2D coarsePressureTex;
-layout(r8ui, binding = 6) uniform readonly uimage2D coarseKindTex;
+layout(binding = 5) uniform sampler2D coarsePressureTex;
+layout(binding = 6) uniform usampler2D coarseKindTex;
 
 uniform ivec2 gridSize;
 uniform int boundaryScale;
@@ -35,6 +35,14 @@ uniform ivec2 coarseSize;
 // Height of the finest grid: with an open top it holds zero pressure at its ghost row, fineHeight + 0.5.
 uniform int fineHeight;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // Open top: a level with spacing h reaches that zero from its top centres, (top + 0.5) h fine cells up, so the
 // ghost weighs h / distance (1 on the finest grid; odd levels whose top row straddles the edge weigh more).
 float openTopWeight(int top) {
@@ -47,7 +55,7 @@ float openTopWeight(int top) {
 uint cellKind(ivec2 coord) {
     if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x) return 1u;
     if (coord.y >= gridSize.y) return openTop != 0 ? 3u : 1u;
-    return imageLoad(kindTex, coord).r;
+    return loadTexel(kindTex, coord).r;
 }
 
 void relaxCell(ivec2 coord, int colour) {
@@ -76,7 +84,7 @@ void relaxCell(ivec2 coord, int colour) {
         }
     }
     // Every level uses the unscaled 5-point operator; restriction (weights summing to 4) carries the h^2.
-    float pressure = diagonal > 0.0 ? (pressure_sum - imageLoad(rhsTex, coord).x) / diagonal : 0.0;
+    float pressure = diagonal > 0.0 ? (pressure_sum - loadTexel(rhsTex, coord).x) / diagonal : 0.0;
     imageStore(pressureTex, coord, vec4(pressure, 0.0, 0.0, 0.0));
 }
 
@@ -111,8 +119,8 @@ void fusedSmooth(int stepCount, bool whole) {
         if (all(lessThan(at, ivec2(coarseSpan)))) {
             ivec2 c = coarseOrigin + at;
             bool inside = all(greaterThanEqual(c, ivec2(0))) && all(lessThan(c, coarseSize));
-            float value = imageLoad(coarsePressureTex, c).x;
-            uint kind = imageLoad(coarseKindTex, c).r;
+            float value = loadTexel(coarsePressureTex, c).x;
+            uint kind = loadTexel(coarseKindTex, c).r;
             coarseValue[at.y * coarseSpan + at.x] = inside ? value : 0.0;
             coarseIsFluid[at.y * coarseSpan + at.x] = inside && kind == 0u;
         }
@@ -125,7 +133,7 @@ void fusedSmooth(int stepCount, bool whole) {
         int k = at.y * span + at.x;
         // Independent loads (zero outside the image), selected by the kind afterwards.
         float pressure = imageLoad(pressureTex, coord).x;
-        float rhs = imageLoad(rhsTex, coord).x;
+        float rhs = loadTexel(rhsTex, coord).x;
         uint kind = cellKind(coord);
         float value = 0.0;
         if (kind == 0u) {

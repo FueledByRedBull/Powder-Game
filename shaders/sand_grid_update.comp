@@ -2,14 +2,14 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
-layout(r16f, binding = 1) uniform readonly image2D waterAmountTex;
-layout(rg16f, binding = 2) uniform readonly image2D waterVelocityTex;
+layout(binding = 0) uniform sampler2D boundarySdfTex;
+layout(binding = 1) uniform sampler2D waterAmountTex;
+layout(binding = 2) uniform sampler2D waterVelocityTex;
 layout(rg32f, binding = 3) uniform writeonly image2D sandVelocityTex;
 // Sleeping grains per cell (sand_pack.comp): a packed cell is a wall to the moving sand.
-layout(r8ui, binding = 4) uniform readonly uimage2D packedTex;
+layout(binding = 4) uniform usampler2D packedTex;
 // Mean volume ratio J of a packed cell's grains (.x, sand_pack.comp).
-layout(rgba32f, binding = 5) uniform readonly image2D packedFTex;
+layout(binding = 5) uniform sampler2D packedFTex;
 
 // sand_particle_p2g.comp's deposit tiles; each workgroup is one tile (nodeOrigin is tile-aligned) and resets its flag.
 layout(std430, binding = 3) buffer SandTileFlags {
@@ -63,6 +63,14 @@ uniform float referenceDensity;
 uniform float frictionAlpha;
 uniform float cohesion;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 int linearIndex(ivec2 coord) {
     return coord.y * (gridSize.x + 2) + coord.x;
 }
@@ -74,7 +82,7 @@ ivec2 clampCell(ivec2 coord) {
 // Static walls and packed sand as -0.5, open cells as 0.5; the domain edge is handled separately.
 float packedField(ivec2 cell) {
     ivec2 c = clampCell(cell);
-    return imageLoad(boundarySdfTex, c).x <= 0.0 || imageLoad(packedTex, c).r > 0u ? -0.5 : 0.5;
+    return loadTexel(boundarySdfTex, c).x <= 0.0 || loadTexel(packedTex, c).r > 0u ? -0.5 : 0.5;
 }
 
 bool invalid(float value) {
@@ -101,9 +109,9 @@ vec2 packedImpulse(ivec2 node, out vec2 contact, out float bond) {
         for (int i = -1; i <= 1; ++i) {
             ivec2 c = node + ivec2(i, j);
             if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) continue;
-            uint count = imageLoad(packedTex, c).r;
+            uint count = loadTexel(packedTex, c).r;
             if (count == 0u) continue;
-            vec4 mean = imageLoad(packedFTex, c);
+            vec4 mean = loadTexel(packedFTex, c);
             float stress = (lameLambda + shearModulus) * min(log(max(mean.x, 1e-3)), 0.0);
             ivec2 o = ivec2(1) - ivec2(i, j);  // the node's offset from the cell, as an index into the averages
             vec2 gradient = vec2(kGradient[o.x] * kWeight[o.y], kWeight[o.x] * kGradient[o.y]);
@@ -145,7 +153,7 @@ void main() {
     bool halo = any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, gridSize));
     int index = linearIndex(coord);
     uint massAccum = gridMass[index];
-    float sdf = halo ? 1.0 : imageLoad(boundarySdfTex, cell).x;
+    float sdf = halo ? 1.0 : loadTexel(boundarySdfTex, cell).x;
     if (massAccum == 0u) {
         // A far stencil weight can round to zero mass but not to zero momentum.
         gridMomentumX[index] = ivec2(0);
@@ -168,11 +176,11 @@ void main() {
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             ivec2 sampleCell = clampCell(cell + ivec2(i, j));
-            float amount = imageLoad(waterAmountTex, sampleCell).x;
+            float amount = loadTexel(waterAmountTex, sampleCell).x;
             if (amount > 0.0) {
                 wettest = max(wettest, amount);
                 volume += amount;
-                flow += amount * imageLoad(waterVelocityTex, sampleCell).xy;
+                flow += amount * loadTexel(waterVelocityTex, sampleCell).xy;
             }
         }
     }
@@ -214,10 +222,10 @@ void main() {
         if (cell.y < 0) separate(velocity, vec2(0.0, 1.0));
         if (cell.y >= gridSize.y) separate(velocity, vec2(0.0, -1.0));
         if (!halo && sdf <= 0.0) {
-            float left = imageLoad(boundarySdfTex, clampCell(cell + ivec2(-1, 0))).x;
-            float right = imageLoad(boundarySdfTex, clampCell(cell + ivec2(1, 0))).x;
-            float down = imageLoad(boundarySdfTex, clampCell(cell + ivec2(0, -1))).x;
-            float up = imageLoad(boundarySdfTex, clampCell(cell + ivec2(0, 1))).x;
+            float left = loadTexel(boundarySdfTex, clampCell(cell + ivec2(-1, 0))).x;
+            float right = loadTexel(boundarySdfTex, clampCell(cell + ivec2(1, 0))).x;
+            float down = loadTexel(boundarySdfTex, clampCell(cell + ivec2(0, -1))).x;
+            float up = loadTexel(boundarySdfTex, clampCell(cell + ivec2(0, 1))).x;
             vec2 normal = vec2(right - left, up - down);
             if (length(normal) > 0.00001) {
                 separate(velocity, normalize(normal));
@@ -237,7 +245,7 @@ void main() {
                 }
                 if (!openX && !openY) velocity = vec2(0.0);
             }
-        } else if (!halo && imageLoad(packedTex, cell).r > 0u) {
+        } else if (!halo && loadTexel(packedTex, cell).r > 0u) {
             vec2 normal = vec2(packedField(cell + ivec2(1, 0)) - packedField(cell + ivec2(-1, 0)),
                                packedField(cell + ivec2(0, 1)) - packedField(cell + ivec2(0, -1)));
             if (length(normal) > 0.0) separate(velocity, normalize(normal));

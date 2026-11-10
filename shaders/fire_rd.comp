@@ -2,17 +2,17 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D fuelSrc;
-layout(r16f, binding = 1) uniform readonly image2D oxidizerSrc;
-layout(r16f, binding = 2) uniform readonly image2D temperatureSrc;
-layout(r16f, binding = 3) uniform readonly image2D smokeSrc;
-layout(r8ui, binding = 4) uniform readonly uimage2D boundaryTex;
-layout(rg16f, binding = 5) uniform readonly image2D reactionSrc;
-layout(r16f, binding = 6) uniform writeonly image2D fuelDst;
-layout(r16f, binding = 7) uniform writeonly image2D oxidizerDst;
-layout(r16f, binding = 8) uniform writeonly image2D temperatureDst;
-layout(rg16f, binding = 9) uniform writeonly image2D reactionDst;
-layout(r16f, binding = 10) uniform writeonly image2D smokeDst;
+layout(binding = 0) uniform sampler2D fuelSrc;
+layout(binding = 1) uniform sampler2D oxidizerSrc;
+layout(binding = 2) uniform sampler2D temperatureSrc;
+layout(binding = 3) uniform sampler2D smokeSrc;
+layout(binding = 4) uniform usampler2D boundaryTex;
+layout(binding = 5) uniform sampler2D reactionSrc;
+layout(r16f, binding = 0) uniform writeonly image2D fuelDst;
+layout(r16f, binding = 1) uniform writeonly image2D oxidizerDst;
+layout(r16f, binding = 2) uniform writeonly image2D temperatureDst;
+layout(rg16f, binding = 3) uniform writeonly image2D reactionDst;
+layout(r16f, binding = 4) uniform writeonly image2D smokeDst;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -34,28 +34,36 @@ uniform float smokeDissipation;
 // Oxygen relaxes toward fresh air (oxidizer 1) at this rate (1/s): the flame entrains surrounding air.
 uniform float oxygenRate;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 ivec2 clampGrid(ivec2 coord) {
     return clamp(coord, ivec2(0), gridSize - ivec2(1));
 }
 
 float fuelAt(ivec2 coord) {
-    return imageLoad(fuelSrc, clampGrid(coord)).x;
+    return loadTexel(fuelSrc, clampGrid(coord)).x;
 }
 
 float oxidizerAt(ivec2 coord) {
-    return imageLoad(oxidizerSrc, clampGrid(coord)).x;
+    return loadTexel(oxidizerSrc, clampGrid(coord)).x;
 }
 
 float temperatureAt(ivec2 coord) {
-    return imageLoad(temperatureSrc, clampGrid(coord)).x;
+    return loadTexel(temperatureSrc, clampGrid(coord)).x;
 }
 
 float smokeAt(ivec2 coord) {
-    return imageLoad(smokeSrc, clampGrid(coord)).x;
+    return loadTexel(smokeSrc, clampGrid(coord)).x;
 }
 
 vec2 reactionAt(ivec2 coord) {
-    return imageLoad(reactionSrc, clampGrid(coord)).xy;
+    return loadTexel(reactionSrc, clampGrid(coord)).xy;
 }
 
 bool invalid(float value) {
@@ -64,7 +72,7 @@ bool invalid(float value) {
 
 bool fluidAt(ivec2 coord) {
     return all(greaterThanEqual(coord, ivec2(0))) && all(lessThan(coord, gridSize)) &&
-           imageLoad(boundaryTex, coord).r == 0u;
+           loadTexel(boundaryTex, coord).r == 0u;
 }
 
 float laplacianTemperature(ivec2 coord, float center) {
@@ -87,7 +95,7 @@ void main() {
         return;
     }
 
-    if (imageLoad(boundaryTex, coord).r != 0u) {
+    if (loadTexel(boundaryTex, coord).r != 0u) {
         imageStore(reactionDst, coord, vec4(0.0));
         imageStore(fuelDst, coord, vec4(0.0));
         imageStore(oxidizerDst, coord, vec4(0.0));

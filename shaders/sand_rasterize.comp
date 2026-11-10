@@ -4,11 +4,11 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16f, binding = 0) uniform writeonly image2D sandOccupancyTex;
 // Sleeping grains per cell (sand_pack.comp).
-layout(r8ui, binding = 1) uniform readonly uimage2D packedTex;
+layout(binding = 1) uniform usampler2D packedTex;
 // Mean moisture of the cell's sand (moving and packed), drawn darker by composite.frag.
 layout(r8, binding = 2) uniform writeonly image2D sandMoistureTex;
 // Sleeping grains' mean stretch; .z is their mean moisture (sand_pack.comp).
-layout(rgba32f, binding = 3) uniform readonly image2D packedFTex;
+layout(binding = 3) uniform sampler2D packedFTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -29,6 +29,14 @@ layout(std430, binding = 1) readonly buffer SandGridMoisture {
 uniform ivec2 gridSize;
 uniform float massScale;
 uniform float referenceDensity;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 int linearIndex(ivec2 coord) {
     return (coord.y + 1) * (gridSize.x + 2) + coord.x + 1;
@@ -54,11 +62,11 @@ void main() {
         for (int i = -1; i <= 1; ++i) {
             ivec2 n = coord + ivec2(i, j);
             if (all(greaterThanEqual(n, ivec2(0))) && all(lessThan(n, gridSize))) {
-                uint count = imageLoad(packedTex, n).r;
+                uint count = loadTexel(packedTex, n).r;
                 if (count > 0u) {
                     float mass = kernel[i + 1] * kernel[j + 1] * float(count);
                     packedMass += mass;
-                    packedMoisture += mass * imageLoad(packedFTex, n).z;
+                    packedMoisture += mass * loadTexel(packedFTex, n).z;
                 }
             }
         }

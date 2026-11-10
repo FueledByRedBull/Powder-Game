@@ -1,10 +1,10 @@
 #version 430
 
 layout(local_size_x = 256) in;
-layout(r16f, binding = 0) uniform readonly image2D rhsTex;
+layout(binding = 0) uniform sampler2D rhsTex;
 layout(r32f, binding = 1) uniform image2D pressureTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
+layout(binding = 3) uniform sampler2D liquidPhiTex;
 
 // Per cell: residual, search direction, A*direction or preconditioned residual, diagonal of A=-L.
 layout(std430, binding = 0) buffer Vectors { vec4 vectors[]; };
@@ -64,6 +64,15 @@ uniform float thetaMin;
 // iteration runs 2: alpha, the stored d and the p and r update; pressure_mg.comp's z = M^-1 r; 1: the convergence test,
 // beta, the next d = z + beta*d and A*d.
 uniform int phase;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform int parity;          // iteration number & 1, from the host
 uniform int firstIteration;  // 1 on the first iteration, which tests the initial preconditioned residual
 uniform int gated;           // 1 in a restart: it only acts when phase 10 found it due, so the host may queue it blind
@@ -82,12 +91,12 @@ float airConductance(float phiLiquid, float phiAir) {
 
 bool blocked(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
-           imageLoad(boundaryTex, cell).r != 0u;
+           loadTexel(boundaryTex, cell).r != 0u;
 }
 
 bool sandWall(ivec2 cell) {
     return cell.x >= 0 && cell.y >= 0 && cell.x < gridSize.x && cell.y < gridSize.y &&
-           imageLoad(boundaryTex, cell).r >= 2u;
+           loadTexel(boundaryTex, cell).r >= 2u;
 }
 
 uint tileSlots() { return uint(((gridSize.x + 15) / 16) * ((gridSize.y + 15) / 16)); }
@@ -207,7 +216,7 @@ void initialize() {
         imageStore(pressureTex, cell, vec4(0.0));
         return;
     }
-    float phi = imageLoad(liquidPhiTex, cell).x;
+    float phi = loadTexel(liquidPhiTex, cell).x;
     if (invalid(phi)) {
         imageStore(pressureTex, cell, vec4(0.0));
         vectors[index].w = -1.0;
@@ -217,7 +226,7 @@ void initialize() {
         imageStore(pressureTex, cell, vec4(0.0));
         return;
     }
-    float rhs = -imageLoad(rhsTex, cell).x;
+    float rhs = -loadTexel(rhsTex, cell).x;
     float pressure = imageLoad(pressureTex, cell).x;
     if (invalid(rhs) || invalid(pressure)) {
         imageStore(pressureTex, cell, vec4(0.0));
@@ -232,7 +241,7 @@ void initialize() {
             if (sandWall(neighbor)) diagonal += sandLeak;
             continue;
         }
-        float neighbor_phi = imageLoad(liquidPhiTex, neighbor).x;
+        float neighbor_phi = loadTexel(liquidPhiTex, neighbor).x;
         if (neighbor_phi < liquidPhiThreshold) {
             diagonal += 1.0;
             neighbor_sum += imageLoad(pressureTex, neighbor).x;

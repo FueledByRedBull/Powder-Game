@@ -2,11 +2,11 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D rhsTex;
-layout(r32f, binding = 4) uniform readonly image2D rhsWideTex;  // the gas right-hand side
-uniform sampler2D pressureTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 3) uniform readonly image2D liquidPhiTex;
+layout(binding = 0) uniform sampler2D rhsTex;
+layout(binding = 4) uniform sampler2D rhsWideTex;  // the gas right-hand side
+layout(binding = 1) uniform sampler2D pressureTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
+layout(binding = 3) uniform sampler2D liquidPhiTex;
 
 layout(std430, binding = 0) buffer DebugCounters {
     uint nanInfDetected;
@@ -33,6 +33,14 @@ uniform int porousSand;
 // Water: ghost-fluid conductance of a liquid-air face (pressure_cg.comp), 0 for a plain Dirichlet cell.
 uniform float thetaMin;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 float airConductance(float phiLiquid, float phiAir) {
     if (thetaMin <= 0.0) return 1.0;
     float inside = phiLiquid - liquidPhiThreshold;
@@ -49,7 +57,7 @@ bool blockedCell(ivec2 coord) {
     ivec2 fineMax = fineMin + ivec2(boundaryScale);
     for (int y = fineMin.y; y < fineMax.y; ++y) {
         for (int x = fineMin.x; x < fineMax.x; ++x) {
-            if (imageLoad(boundaryTex, ivec2(x, y)).r != 0u) {
+            if (loadTexel(boundaryTex, ivec2(x, y)).r != 0u) {
                 return true;
             }
         }
@@ -68,7 +76,7 @@ vec4 residualStats(ivec2 coord) {
     }
     float cellPhi = 0.0;
     if (useLiquidMask != 0) {
-        cellPhi = imageLoad(liquidPhiTex, coord).x;
+        cellPhi = loadTexel(liquidPhiTex, coord).x;
         if (invalid(cellPhi)) {
             return vec4(0.0, 0.0, 1.0, 1.0);
         }
@@ -77,7 +85,7 @@ vec4 residualStats(ivec2 coord) {
         }
     }
 
-    float rhs = wideRhs != 0 ? imageLoad(rhsWideTex, coord).x : imageLoad(rhsTex, coord).x;
+    float rhs = wideRhs != 0 ? loadTexel(rhsWideTex, coord).x : loadTexel(rhsTex, coord).x;
     float pressure = texelFetch(pressureTex, coord, 0).x;
     const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
     float pressure_sum = 0.0;
@@ -93,13 +101,13 @@ vec4 residualStats(ivec2 coord) {
         if (blockedCell(neighbor)) {
             // Water's sand walls leak (see pressure_cg.comp); the gas solve has none.
             if ((useLiquidMask != 0 || porousSand != 0) && neighbor.x >= 0 && neighbor.y >= 0 && neighbor.x < gridSize.x &&
-                neighbor.y < gridSize.y && imageLoad(boundaryTex, neighbor).r >= 2u) {
+                neighbor.y < gridSize.y && loadTexel(boundaryTex, neighbor).r >= 2u) {
                 diagonal += sandLeak;
             }
             continue;
         }
         if (useLiquidMask != 0) {
-            float phi = imageLoad(liquidPhiTex, neighbor).x;
+            float phi = loadTexel(liquidPhiTex, neighbor).x;
             invalid_input = invalid_input || invalid(phi);
             if (phi >= liquidPhiThreshold) {
                 diagonal += airConductance(cellPhi, phi);

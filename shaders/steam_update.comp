@@ -8,15 +8,15 @@
 // condenses (decays) within a second or two. Steam is presentation and does not push the gas.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;  // cell centres, gas cells/s
+layout(binding = 0) uniform sampler2D gasVelocityTex;  // cell centres, gas cells/s
 layout(r16f, binding = 1) uniform writeonly image2D steamDst;
-layout(r8ui, binding = 2) uniform readonly uimage2D gasMaskTex;
+layout(binding = 2) uniform usampler2D gasMaskTex;
 layout(r16f, binding = 3) uniform image2D fuelTex;
 layout(r16f, binding = 4) uniform image2D temperatureTex;
 layout(rg16f, binding = 5) uniform image2D reactionTex;
 layout(r16f, binding = 6) uniform writeonly image2D oxidizerTex;
 
-uniform sampler2D steamSrc;
+layout(binding = 7) uniform sampler2D steamSrc;
 
 // Per gas cell: evaporated water records (bits 0-15) and records that flashed on burning oil at most four cells below
 // (bits 16-31), then lit oil records under it.
@@ -30,8 +30,16 @@ uniform float steamRise;      // gas cells/s relative to the gas
 uniform float steamCondense;  // 1/s
 uniform float steamPerParticle;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 bool blocked(ivec2 cell) {
-    return any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, gasSize)) || imageLoad(gasMaskTex, cell).r != 0u;
+    return any(lessThan(cell, ivec2(0))) || any(greaterThanEqual(cell, gasSize)) || loadTexel(gasMaskTex, cell).r != 0u;
 }
 
 void main() {
@@ -45,14 +53,14 @@ void main() {
     uint litOil = gasSources[2 * linear + 1];
     gasSources[2 * linear] = 0u;
     gasSources[2 * linear + 1] = 0u;
-    if (imageLoad(gasMaskTex, gas).r != 0u) {
+    if (loadTexel(gasMaskTex, gas).r != 0u) {
         imageStore(steamDst, gas, vec4(0.0));
         return;
     }
 
     // Semi-Lagrangian: a trace that ends in a wall takes the cell's own value (no steam through walls).
     vec2 here = vec2(gas) + 0.5;
-    vec2 back = here - (imageLoad(gasVelocityTex, gas).xy + vec2(0.0, steamRise)) * dt;
+    vec2 back = here - (loadTexel(gasVelocityTex, gas).xy + vec2(0.0, steamRise)) * dt;
     if (blocked(ivec2(floor(back)))) back = here;
     float steam = textureLod(steamSrc, back / vec2(gasSize), 0.0).r;
     steam = clamp(steam * exp(-steamCondense * dt) + float(steamCount) * steamPerParticle, 0.0, 1.0);

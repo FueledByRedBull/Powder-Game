@@ -2,12 +2,20 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
-layout(rg32i, binding = 1) uniform readonly iimage2D boundarySeedTex;
+layout(binding = 0) uniform usampler2D boundaryMaskTex;
+layout(binding = 1) uniform isampler2D boundarySeedTex;
 layout(r16f, binding = 2) uniform writeonly image2D boundarySdfTex;
 
 uniform ivec2 gridSize;
 uniform float maxDistance;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+ivec4 loadTexel(isampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : ivec4(0);
+}
 
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
@@ -19,8 +27,8 @@ void main() {
         return;
     }
 
-    bool inside = imageLoad(boundaryMaskTex, coord).r != 0u;
-    ivec2 seed = imageLoad(boundarySeedTex, coord).xy;
+    bool inside = loadTexel(boundaryMaskTex, coord).r != 0u;
+    ivec2 seed = loadTexel(boundarySeedTex, coord).xy;
     float distance = maxDistance;
     if (seed.x >= 0 && seed.y >= 0) {
         // Interface seeds are cell centers on both sides; a half-cell offset preserves their signs.

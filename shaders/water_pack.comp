@@ -12,9 +12,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r8ui, binding = 0) uniform uimage2D packedTex;
 layout(rg16f, binding = 1) uniform image2D wakeVelocityTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 3) uniform readonly image2D waterUFaceTex;
-layout(r16f, binding = 4) uniform readonly image2D waterVFaceTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
+layout(binding = 3) uniform sampler2D waterUFaceTex;
+layout(binding = 4) uniform sampler2D waterVFaceTex;
 
 struct WaterParticle {
     vec4 state0;
@@ -56,6 +56,14 @@ uniform float particleMass;
 uniform int maxParticles;
 uniform uint seed;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 const uint kPack = 1u << 31;
 const uint kWake = 128u;
 
@@ -68,7 +76,7 @@ int cellIndex(ivec2 c) {
 }
 
 bool liquid(ivec2 c) {
-    return inside(c) && imageLoad(boundaryTex, c).r == 0u && float(counts[cellIndex(c)]) >= liquidCount;
+    return inside(c) && loadTexel(boundaryTex, c).r == 0u && float(counts[cellIndex(c)]) >= liquidCount;
 }
 
 bool deepLiquid(ivec2 c, int radius) {
@@ -133,10 +141,10 @@ void apply(ivec2 c) {
 void decideWake(ivec2 c) {
     uint value = imageLoad(packedTex, c).r;
     if (value == 0u || (value & kWake) != 0u) return;
-    float uLeft = imageLoad(waterUFaceTex, c).x;
-    float uRight = imageLoad(waterUFaceTex, c + ivec2(1, 0)).x;
-    float vDown = imageLoad(waterVFaceTex, c).x;
-    float vUp = imageLoad(waterVFaceTex, c + ivec2(0, 1)).x;
+    float uLeft = loadTexel(waterUFaceTex, c).x;
+    float uRight = loadTexel(waterUFaceTex, c + ivec2(1, 0)).x;
+    float vDown = loadTexel(waterVFaceTex, c).x;
+    float vUp = loadTexel(waterVFaceTex, c + ivec2(0, 1)).x;
     float fastest = max(max(abs(uLeft), abs(uRight)), max(abs(vDown), abs(vUp)));
     if (fastest > wakeSpeed || !deepLiquid(c, 2)) {
         imageStore(packedTex, c, uvec4(value | kWake));

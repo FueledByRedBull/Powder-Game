@@ -2,8 +2,8 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 1) uniform readonly image2D liquidVolumeTex;
+layout(binding = 0) uniform usampler2D boundaryTex;
+layout(binding = 1) uniform sampler2D liquidVolumeTex;
 
 struct WaterParticle {
     vec4 state0;
@@ -48,6 +48,14 @@ uniform float oilFlag;
 uniform float tickDt;
 uniform vec2 gravity;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // PCG-style integer hash: per-particle jitter that varies with the cell, the particle and the tick (spawnSeed).
 uint hashBits(uvec3 v) {
     uint h = v.x * 1664525u + v.y * 22695477u + v.z * 2654435761u + spawnSeed * 2246822519u;
@@ -62,7 +70,7 @@ vec2 uniform2(uvec3 v) {
 
 bool blocked(vec2 p) {
     ivec2 c = ivec2(floor(p));
-    return any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize)) || imageLoad(boundaryTex, c).r != 0u;
+    return any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize)) || loadTexel(boundaryTex, c).r != 0u;
 }
 
 bool insideBrush(ivec2 coord) {
@@ -83,12 +91,12 @@ void main() {
     if (coord.x >= gridSize.x || coord.y >= gridSize.y) {
         return;
     }
-    if (!insideBrush(coord) || alreadyStamped(coord) || imageLoad(boundaryTex, coord).r != 0u) {
+    if (!insideBrush(coord) || alreadyStamped(coord) || loadTexel(boundaryTex, coord).r != 0u) {
         return;
     }
     // A held brush must not keep stacking particles into a cell already as dense as the brush emits.
     // A zero limit keeps the exact per-cell emission of scripted brushes.
-    if (densityLimit > 0.0 && imageLoad(liquidVolumeTex, coord).x >= densityLimit) {
+    if (densityLimit > 0.0 && loadTexel(liquidVolumeTex, coord).x >= densityLimit) {
         return;
     }
 

@@ -10,8 +10,8 @@ layout(r16f, binding = 4) uniform image2D temperatureTex;
 layout(r16f, binding = 5) uniform image2D fuelTex;
 layout(r16f, binding = 6) uniform image2D oxidizerTex;
 layout(rg16f, binding = 7) uniform image2D reactionTex;
-layout(r16f, binding = 9) uniform readonly image2D waterAmountTex;
-layout(r8ui, binding = 10) uniform readonly uimage2D boundaryTex;
+layout(binding = 9) uniform sampler2D waterAmountTex;
+layout(binding = 10) uniform usampler2D boundaryTex;
 
 uniform ivec2 gasSize;
 uniform ivec2 gridSize;
@@ -31,6 +31,14 @@ uniform float maxVelocity;
 // Per-cell random velocity (gas cells/s) so a stroke breaks up instead of moving as a block.
 uniform float velocitySpread;
 uniform uint spawnSeed;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 uint hashCell(uvec2 cell, uint salt) {
     uint h = cell.x * 0x8da6b343u ^ cell.y * 0xd8163841u ^ salt * 0xcb1ab31fu;
@@ -72,7 +80,7 @@ bool overlapsWater(ivec2 coord) {
     for (int y = fullMin.y; y < fullMax.y; ++y) {
         for (int x = fullMin.x; x < fullMax.x; ++x) {
             ivec2 fullCoord = ivec2(x, y);
-            if (fullCellInsideBrush(fullCoord) && imageLoad(waterAmountTex, fullCoord).x > 0.015) {
+            if (fullCellInsideBrush(fullCoord) && loadTexel(waterAmountTex, fullCoord).x > 0.015) {
                 return true;
             }
         }
@@ -126,7 +134,7 @@ void main() {
         return;
     }
 
-    if (blockedBySolid == 1 && imageLoad(boundaryTex, coord).r != 0u) {
+    if (blockedBySolid == 1 && loadTexel(boundaryTex, coord).r != 0u) {
         return;
     }
     if (blockedByWater == 1 && overlapsWater(coord)) {

@@ -2,12 +2,20 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16ui, binding = 0) uniform readonly uimage2D materialTex;
-layout(r16f, binding = 1) uniform readonly image2D sandOccupancyTex;
+layout(binding = 0) uniform usampler2D materialTex;
+layout(binding = 1) uniform sampler2D sandOccupancyTex;
 layout(r8ui, binding = 2) uniform writeonly uimage2D boundaryTex;
 layout(r8ui, binding = 3) uniform writeonly uimage2D staticBoundaryTex;
 
 uniform ivec2 gridSize;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -15,8 +23,8 @@ void main() {
         return;
     }
 
-    uint material = imageLoad(materialTex, coord).r;
-    float sand_occupancy = imageLoad(sandOccupancyTex, coord).x;
+    uint material = loadTexel(materialTex, coord).r;
+    float sand_occupancy = loadTexel(sandOccupancyTex, coord).x;
     // Painted rock (2) and wood (3, 256 and up while burning or charred; wood_burn.comp) are solids.
     bool solid = material >= 2u;
     uint static_blocked = solid ? 1u : 0u;

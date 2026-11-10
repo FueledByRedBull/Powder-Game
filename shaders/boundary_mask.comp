@@ -2,11 +2,16 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
+layout(binding = 0) uniform sampler2D boundarySdfTex;
 layout(r8ui, binding = 1) uniform writeonly uimage2D boundaryMaskTex;
 
 uniform ivec2 gridSize;
 uniform float solidThreshold;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -14,7 +19,7 @@ void main() {
         return;
     }
 
-    float sdf = imageLoad(boundarySdfTex, coord).x;
+    float sdf = loadTexel(boundarySdfTex, coord).x;
     uint blocked = sdf <= solidThreshold ? 1u : 0u;
     imageStore(boundaryMaskTex, coord, uvec4(blocked, 0u, 0u, 0u));
 }

@@ -5,17 +5,25 @@
 // applies exactly the transpose, which keeps the V-cycle symmetric for the conjugate gradient.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D coarsePressureTex;
+layout(binding = 0) uniform sampler2D coarsePressureTex;
 layout(r32f, binding = 1) uniform image2D finePressureTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D fineKindTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D coarseKindTex;
+layout(binding = 2) uniform usampler2D fineKindTex;
+layout(binding = 3) uniform usampler2D coarseKindTex;
 
 uniform ivec2 fineSize;
 uniform ivec2 coarseSize;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 bool coarseFluid(ivec2 coord) {
     return all(greaterThanEqual(coord, ivec2(0))) && all(lessThan(coord, coarseSize)) &&
-           imageLoad(coarseKindTex, coord).r == 0u;
+           loadTexel(coarseKindTex, coord).r == 0u;
 }
 
 void main() {
@@ -23,7 +31,7 @@ void main() {
     if (coord.x >= fineSize.x || coord.y >= fineSize.y) {
         return;
     }
-    if (imageLoad(fineKindTex, coord).r != 0u) {
+    if (loadTexel(fineKindTex, coord).r != 0u) {
         imageStore(finePressureTex, coord, vec4(0.0));
         return;
     }
@@ -35,7 +43,7 @@ void main() {
         ivec2 offset = ivec2(i & 1, i >> 1);
         ivec2 donor = parent + offset * toward;
         float weight = (offset.x == 0 ? 0.75 : 0.25) * (offset.y == 0 ? 0.75 : 0.25);
-        value += weight * imageLoad(coarsePressureTex, coarseFluid(donor) ? donor : parent).x;
+        value += weight * loadTexel(coarsePressureTex, coarseFluid(donor) ? donor : parent).x;
     }
     imageStore(finePressureTex, coord, vec4(value, 0.0, 0.0, 0.0));
 }

@@ -4,8 +4,8 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16f, binding = 0) uniform writeonly image2D waterUFaceTex;
 layout(r16f, binding = 1) uniform writeonly image2D waterVFaceTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
-layout(rg32f, binding = 3) uniform readonly image2D sandVelocityTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
+layout(binding = 3) uniform sampler2D sandVelocityTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -32,7 +32,7 @@ layout(std430, binding = 3) readonly buffer VFaceVelocitySums {
 
 // Packed calm water (water_pack.comp): a packed cell deposits here as rest-density water at rest, whatever count it
 // stores (packing admits the rest count +-1), so it asks the solve for no density correction.
-layout(r8ui, binding = 4) uniform readonly uimage2D waterPackedTex;
+layout(binding = 4) uniform usampler2D waterPackedTex;
 
 layout(std430, binding = 4) buffer WaterCellCounts {
     uint cellCounts[];
@@ -41,6 +41,15 @@ layout(std430, binding = 4) buffer WaterCellCounts {
 uniform ivec2 gridSize;
 uniform float weightScale;
 uniform float velocityScale;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform float restMass;  // particle mass of a cell at rest density
 
 // A packed cell's particles sit anywhere in it, so it deposits the P2G kernels averaged over the cell: the quadratic
@@ -76,12 +85,12 @@ float packedFaceWeight(ivec2 face, bool vertical) {
 // Velocity component of the wall on a face between in-bounds cells a and b, at least one of them blocked. Painted
 // solids (mask 1) rest; sand (mask 2 and 3) moves with the sand grid, so the pressure solve pushes water out of its way.
 float wallVelocity(ivec2 a, ivec2 b, int axis) {
-    uint maskA = imageLoad(boundaryTex, a).r;
-    uint maskB = imageLoad(boundaryTex, b).r;
+    uint maskA = loadTexel(boundaryTex, a).r;
+    uint maskB = loadTexel(boundaryTex, b).r;
     if (maskA == 1u || maskB == 1u || (maskA != 0u && maskB != 0u)) {
         return 0.0;
     }
-    return imageLoad(sandVelocityTex, (maskA != 0u ? a : b) + ivec2(1))[axis];
+    return loadTexel(sandVelocityTex, (maskA != 0u ? a : b) + ivec2(1))[axis];
 }
 
 int uFaceIndex(ivec2 face) {
@@ -111,7 +120,7 @@ void main() {
     for (uint i = gl_LocalInvocationIndex; i < 400u; i += 256u) {
         ivec2 cell = tileOrigin + ivec2(int(i % 20u), int(i / 20u));
         bool inGrid = all(greaterThanEqual(cell, ivec2(0))) && all(lessThan(cell, gridSize));
-        packedTile[i / 20u][i % 20u] = inGrid ? min(imageLoad(waterPackedTex, cell).r & 127u, 1u) : 0u;
+        packedTile[i / 20u][i % 20u] = inGrid ? min(loadTexel(waterPackedTex, cell).r & 127u, 1u) : 0u;
     }
     barrier();
 
@@ -130,7 +139,7 @@ void main() {
         float face_u = 0.0;
         if (coord.x > 0 && coord.x < gridSize.x) {
             ivec2 left = ivec2(coord.x - 1, coord.y);
-            if (imageLoad(boundaryTex, left).r != 0u || imageLoad(boundaryTex, coord).r != 0u) {
+            if (loadTexel(boundaryTex, left).r != 0u || loadTexel(boundaryTex, coord).r != 0u) {
                 face_u = wallVelocity(left, coord, 0);
             } else {
                 int index = uFaceIndex(coord);
@@ -147,7 +156,7 @@ void main() {
         float face_v = 0.0;
         if (coord.y > 0 && coord.y < gridSize.y) {
             ivec2 down = ivec2(coord.x, coord.y - 1);
-            if (imageLoad(boundaryTex, down).r != 0u || imageLoad(boundaryTex, coord).r != 0u) {
+            if (loadTexel(boundaryTex, down).r != 0u || loadTexel(boundaryTex, coord).r != 0u) {
                 face_v = wallVelocity(down, coord, 1);
             } else {
                 int index = vFaceIndex(coord);

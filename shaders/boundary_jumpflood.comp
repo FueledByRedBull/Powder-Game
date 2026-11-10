@@ -2,11 +2,16 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg32i, binding = 0) uniform readonly iimage2D srcSeedTex;
+layout(binding = 0) uniform isampler2D srcSeedTex;
 layout(rg32i, binding = 1) uniform writeonly iimage2D dstSeedTex;
 
 uniform ivec2 gridSize;
 uniform int stepSize;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+ivec4 loadTexel(isampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : ivec4(0);
+}
 
 bool inBounds(ivec2 coord) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < gridSize.x && coord.y < gridSize.y;
@@ -27,7 +32,7 @@ void main() {
         return;
     }
 
-    ivec2 best_seed = imageLoad(srcSeedTex, coord).xy;
+    ivec2 best_seed = loadTexel(srcSeedTex, coord).xy;
     float best_distance = validSeed(best_seed) ? seedDistanceSq(coord, best_seed) : 3.402823466e+38;
 
     for (int y = -1; y <= 1; ++y) {
@@ -36,7 +41,7 @@ void main() {
             if (!inBounds(sample_coord)) {
                 continue;
             }
-            ivec2 candidate_seed = imageLoad(srcSeedTex, sample_coord).xy;
+            ivec2 candidate_seed = loadTexel(srcSeedTex, sample_coord).xy;
             if (!validSeed(candidate_seed)) {
                 continue;
             }

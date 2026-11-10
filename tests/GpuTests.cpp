@@ -84,8 +84,15 @@ struct Resources {
     }
 };
 
+// Matches PowderApp: shaders sample what they only read and use image units for writes. Unit 47 is left active so
+// textures created or read back later cannot replace a bound input.
 void BindImage(GLuint binding, GLuint texture, GLenum access, GLenum format) {
-    glBindImageTexture(binding, texture, 0, GL_FALSE, 0, access, format);
+    if (access != GL_WRITE_ONLY) {
+        glActiveTexture(GL_TEXTURE0 + binding);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glActiveTexture(GL_TEXTURE0 + 47);
+    }
+    if (access != GL_READ_ONLY) glBindImageTexture(binding, texture, 0, GL_FALSE, 0, access, format);
 }
 
 // water_particle_step samples the sand fields; an empty world leaves the water untouched.
@@ -104,7 +111,7 @@ void BindNoSand(Resources& resources, int width, int height) {
 
 void Dispatch(int width, int height) {
     glDispatchCompute(static_cast<GLuint>((width + 15) / 16), static_cast<GLuint>((height + 15) / 16), 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
                     GL_TEXTURE_UPDATE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
     CheckGl("dispatch test shader");
 }
@@ -1196,7 +1203,8 @@ void WaterWallPressure() {
             } else {
                 glDispatchCompute(1, 1, 1);
             }
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_FETCH_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
         };
         const auto precondition = [&](int slot, bool initial) {
             glUseProgram(cg_multigrid);
@@ -1348,9 +1356,7 @@ void WaterWallPressure() {
     glUniform1i(glGetUniformLocation(program, "useLiquidMask"), 1);
     glUniform1f(glGetUniformLocation(program, "liquidPhiThreshold"), phi_threshold);
     BindImage(0, chamber_divergence, GL_READ_ONLY, GL_R16F);
-    glUniform1i(glGetUniformLocation(program, "pressureTex"), 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, pressure);
+    BindImage(1, pressure, GL_READ_ONLY, GL_R32F);
     BindImage(2, chamber_boundary, GL_READ_ONLY, GL_R8UI);
     BindImage(3, chamber_phi, GL_READ_ONLY, GL_R16F);
     Dispatch(size, size);
@@ -1753,10 +1759,10 @@ void SmokeDissipation() {
             BindImage(0, velocity, GL_READ_ONLY, GL_RG16F);
             for (GLuint field = 0; field < source.size(); ++field) {
                 BindImage(1 + field, source[field], GL_READ_ONLY, GL_R16F);
-                BindImage(6 + field, forward[field], GL_WRITE_ONLY, GL_R16F);
+                BindImage(field, forward[field], GL_WRITE_ONLY, GL_R16F);
             }
             BindImage(5, reaction_source, GL_READ_ONLY, GL_RG16F);
-            BindImage(10, reaction_forward, GL_WRITE_ONLY, GL_RG16F);
+            BindImage(4, reaction_forward, GL_WRITE_ONLY, GL_RG16F);
             BindImage(11, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
             for (std::size_t field = 0; field < source.size(); ++field) {
@@ -1777,11 +1783,11 @@ void SmokeDissipation() {
             for (GLuint field = 0; field < source.size(); ++field) {
                 BindImage(2 + field, source[field], GL_READ_ONLY, GL_R16F);
                 BindImage(7 + field, forward[field], GL_READ_ONLY, GL_R16F);
-                BindImage(12 + field, corrected[field], GL_WRITE_ONLY, GL_R16F);
+                BindImage(field, corrected[field], GL_WRITE_ONLY, GL_R16F);
             }
             BindImage(6, reaction_source, GL_READ_ONLY, GL_RG16F);
             BindImage(11, reaction_forward, GL_READ_ONLY, GL_RG16F);
-            BindImage(16, reaction_corrected, GL_WRITE_ONLY, GL_RG16F);
+            BindImage(4, reaction_corrected, GL_WRITE_ONLY, GL_RG16F);
             BindImage(17, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
             std::swap(source, corrected);
@@ -1912,8 +1918,8 @@ void GasVelocityDissipation() {
                     BindImage(5, forward_center, GL_READ_ONLY, GL_RG16F);
                     BindImage(6, smoke, GL_READ_ONLY, GL_R16F);
                     BindImage(7, temperature, GL_READ_ONLY, GL_R16F);
-                    BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R32F);
-                    BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R32F);
+                    BindImage(0, corrected_u, GL_WRITE_ONLY, GL_R32F);
+                    BindImage(1, corrected_v, GL_WRITE_ONLY, GL_R32F);
                     BindImage(10, boundary, GL_READ_ONLY, GL_R8UI);
                     Dispatch(size + 1, size + 1);
                     std::swap(source_u, corrected_u);
@@ -2055,10 +2061,10 @@ void GasWallTransport() {
             BindImage(0, velocity, GL_READ_ONLY, GL_RG16F);
             for (GLuint field = 0; field < forward.size(); ++field) {
                 BindImage(1 + field, source, GL_READ_ONLY, GL_R16F);
-                BindImage(6 + field, forward[field], GL_WRITE_ONLY, GL_R16F);
+                BindImage(field, forward[field], GL_WRITE_ONLY, GL_R16F);
             }
             BindImage(5, reaction_source, GL_READ_ONLY, GL_RG16F);
-            BindImage(10, reaction_forward, GL_WRITE_ONLY, GL_RG16F);
+            BindImage(4, reaction_forward, GL_WRITE_ONLY, GL_RG16F);
             BindImage(11, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
             std::array<float, 5> endpoint_forward{};
@@ -2094,11 +2100,11 @@ void GasWallTransport() {
             for (GLuint field = 0; field < forward.size(); ++field) {
                 BindImage(2 + field, source, GL_READ_ONLY, GL_R16F);
                 BindImage(7 + field, forward[field], GL_READ_ONLY, GL_R16F);
-                BindImage(12 + field, corrected[field], GL_WRITE_ONLY, GL_R16F);
+                BindImage(field, corrected[field], GL_WRITE_ONLY, GL_R16F);
             }
             BindImage(6, reaction_source, GL_READ_ONLY, GL_RG16F);
             BindImage(11, reaction_forward, GL_READ_ONLY, GL_RG16F);
-            BindImage(16, reaction_corrected, GL_WRITE_ONLY, GL_RG16F);
+            BindImage(4, reaction_corrected, GL_WRITE_ONLY, GL_RG16F);
             BindImage(17, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size, size);
 
@@ -2178,8 +2184,8 @@ void GasWallTransport() {
             BindImage(5, bounded_trace ? reverse_velocity : velocity, GL_READ_ONLY, GL_RG16F);
             BindImage(6, source, GL_READ_ONLY, GL_R16F);
             BindImage(7, source, GL_READ_ONLY, GL_R16F);
-            BindImage(8, corrected_u, GL_WRITE_ONLY, GL_R32F);
-            BindImage(9, corrected_v, GL_WRITE_ONLY, GL_R32F);
+            BindImage(0, corrected_u, GL_WRITE_ONLY, GL_R32F);
+            BindImage(1, corrected_v, GL_WRITE_ONLY, GL_R32F);
             BindImage(10, boundary, GL_READ_ONLY, GL_R8UI);
             Dispatch(size + 1, size + 1);
 
@@ -2573,9 +2579,7 @@ void PressureInvalid() {
     glUniform1i(glGetUniformLocation(program, "useLiquidMask"), 0);
     glUniform1f(glGetUniformLocation(program, "liquidPhiThreshold"), 0.42F);
     BindImage(0, rhs, GL_READ_ONLY, GL_R16F);
-    glUniform1i(glGetUniformLocation(program, "pressureTex"), 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, pressure);
+    BindImage(1, pressure, GL_READ_ONLY, GL_R32F);
     BindImage(2, boundary, GL_READ_ONLY, GL_R8UI);
     BindImage(3, rhs, GL_READ_ONLY, GL_R16F);
     Dispatch(size, size);
@@ -2596,6 +2600,7 @@ void PressureInvalid() {
     Require(counters[0] > 0U, "NaN in a fluid pressure cell must increment nanInfDetected; got 0");
 
     const GLuint pressure32 = resources.Texture(size, size, GL_R32F, GL_RED, GL_FLOAT, zeros.data());
+    BindImage(1, pressure32, GL_READ_ONLY, GL_R32F);
     glBindTexture(GL_TEXTURE_2D, pressure32);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 1, 1, 1, 1, GL_RED, GL_FLOAT, &invalid);
     counters.fill(0U);
@@ -2624,7 +2629,7 @@ void PressureInvalid() {
     BindImage(0, stats_rhs_tex, GL_READ_ONLY, GL_R16F);
     BindImage(2, stats_mask_tex, GL_READ_ONLY, GL_R8UI);
     BindImage(3, stats_phi_tex, GL_READ_ONLY, GL_R16F);
-    glBindTexture(GL_TEXTURE_2D, stats_pressure_tex);
+    BindImage(1, stats_pressure_tex, GL_READ_ONLY, GL_R32F);
     const auto read_stats = [&]() {
         Dispatch(stats_width, stats_height);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, stats_buffer);
@@ -2733,11 +2738,11 @@ void FireReaction() {
         glUniform1f(glGetUniformLocation(program, "smokeDissipation"), 0.0F);
         for (GLuint field = 0; field < source.size(); ++field) {
             BindImage(field, source[field], GL_READ_ONLY, GL_R16F);
-            BindImage(field == 3 ? 10 : 6 + field, output[field], GL_WRITE_ONLY, GL_R16F);
+            BindImage(field == 3 ? 4 : field, output[field], GL_WRITE_ONLY, GL_R16F);
         }
         BindImage(4, boundary, GL_READ_ONLY, GL_R8UI);
         BindImage(5, reaction, GL_READ_ONLY, GL_RG16F);
-        BindImage(9, reaction_out, GL_WRITE_ONLY, GL_RG16F);
+        BindImage(3, reaction_out, GL_WRITE_ONLY, GL_RG16F);
         Dispatch(size, size);
         std::array<std::vector<float>, 4> result;
         for (std::size_t field = 0; field < result.size(); ++field) result[field] = ReadScalar(output[field], size, size);
@@ -2788,6 +2793,45 @@ void FireReaction() {
     Require(failures == 0, "fire reaction/diffusion regressions failed");
 }
 
+// Every shader must fit the OpenGL 4.3 minimums (8 image units and output resources, 8 SSBO bindings, 16 texture
+// units per stage) so the game runs on GPUs that offer no more, such as NVIDIA and Intel.
+void RequireGl43Minimums(GLuint program) {
+    GLint uniforms = 0;
+    glGetProgramInterfaceiv(program, GL_UNIFORM, GL_ACTIVE_RESOURCES, &uniforms);
+    int images = 0, samplers = 0;
+    for (GLint i = 0; i < uniforms; ++i) {
+        const GLenum properties[] = {GL_TYPE, GL_LOCATION};
+        GLint values[2] = {};
+        glGetProgramResourceiv(program, GL_UNIFORM, static_cast<GLuint>(i), 2, properties, 2, nullptr, values);
+        const GLenum type = static_cast<GLenum>(values[0]);
+        const bool image = type == GL_IMAGE_2D || type == GL_INT_IMAGE_2D || type == GL_UNSIGNED_INT_IMAGE_2D;
+        const bool sampler = type == GL_SAMPLER_2D || type == GL_INT_SAMPLER_2D || type == GL_UNSIGNED_INT_SAMPLER_2D;
+        if (!image && !sampler) continue;
+        GLint unit = 0;
+        glGetUniformiv(program, values[1], &unit);
+        if (image) {
+            ++images;
+            Require(unit < 8, "image uniform on unit " + std::to_string(unit));
+        } else {
+            ++samplers;
+            Require(unit < 80, "sampler on texture unit " + std::to_string(unit));
+        }
+    }
+    GLint blocks = 0;
+    glGetProgramInterfaceiv(program, GL_SHADER_STORAGE_BLOCK, GL_ACTIVE_RESOURCES, &blocks);
+    for (GLint i = 0; i < blocks; ++i) {
+        const GLenum property = GL_BUFFER_BINDING;
+        GLint binding = 0;
+        glGetProgramResourceiv(program, GL_SHADER_STORAGE_BLOCK, static_cast<GLuint>(i), 1, &property, 1, nullptr,
+                               &binding);
+        Require(binding < 8, "storage block on binding " + std::to_string(binding));
+    }
+    Require(images <= 8, std::to_string(images) + " image uniforms");
+    Require(samplers <= 16, std::to_string(samplers) + " samplers");
+    Require(images + blocks <= 8, std::to_string(images + blocks) + " images and storage blocks");
+    CheckGl("query program resources");
+}
+
 void CompileShaders() {
     std::vector<std::filesystem::path> paths;
     for (const auto& entry : std::filesystem::directory_iterator(kShaderRoot)) {
@@ -2801,7 +2845,7 @@ void CompileShaders() {
     for (const auto& path : paths) {
         try {
             Resources resources;
-            resources.Program(path.filename().string().c_str());
+            RequireGl43Minimums(resources.Program(path.filename().string().c_str()));
             std::cout << "  compiled " << path.filename().string() << '\n';
         } catch (const std::exception& error) {
             ++failures;
@@ -2814,6 +2858,7 @@ void CompileShaders() {
             Resources resources;
             resources.programs.push_back(glutil::CreateProgramFromFiles((kShaderRoot / "fullscreen.vert").string(),
                                                                        (kShaderRoot / fragment).string()));
+            RequireGl43Minimums(resources.programs.back());
             CheckGl("compile render shaders");
             std::cout << "  compiled fullscreen.vert + " << fragment << '\n';
         } catch (const std::exception& error) {

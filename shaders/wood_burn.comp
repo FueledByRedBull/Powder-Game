@@ -10,11 +10,11 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(r16ui, binding = 0) uniform uimage2D materialTex;
-layout(r8ui, binding = 1) uniform readonly uimage2D gasMaskTex;
+layout(binding = 1) uniform usampler2D gasMaskTex;
 layout(r16f, binding = 2) uniform image2D temperatureTex;
 layout(r16f, binding = 3) uniform image2D fuelTex;
 layout(rg16f, binding = 4) uniform image2D reactionTex;
-layout(r16f, binding = 5) uniform readonly image2D waterAmountTex;
+layout(binding = 5) uniform sampler2D waterAmountTex;
 
 // On a sample tick (tally 1), mode 0 adds the wood cells left after its update to woodCells (intact, burning or charred).
 layout(std430, binding = 0) buffer WoodTally {
@@ -26,6 +26,15 @@ uniform int mode;
 uniform int tally;
 uniform uint seed;
 uniform float ignitionTemperature;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform float igniteChance;  // per tick while hot
 
 bool isWood(uint material) {
@@ -55,7 +64,7 @@ void main() {
         for (int y = -2; y <= 2; ++y) {
             for (int x = -2; x <= 2; ++x) {
                 ivec2 n = clamp(gas + ivec2(x, y), ivec2(0), gasSize - 1);
-                if (imageLoad(gasMaskTex, n).r == 0u) heat = max(heat, imageLoad(temperatureTex, n).x);
+                if (loadTexel(gasMaskTex, n).r == 0u) heat = max(heat, imageLoad(temperatureTex, n).x);
             }
         }
         uint remaining = 0u;
@@ -66,7 +75,7 @@ void main() {
             float wet = 0.0;
             for (int y = -1; y <= 1; ++y)
                 for (int x = -1; x <= 1; ++x)
-                    wet = max(wet, imageLoad(waterAmountTex, clamp(cell + ivec2(x, y), ivec2(0), gasSize * 2 - 1)).x);
+                    wet = max(wet, loadTexel(waterAmountTex, clamp(cell + ivec2(x, y), ivec2(0), gasSize * 2 - 1)).x);
             uint fuel = material == 3u ? 255u : (material & 255u);
             uint next = material;
             if (wet > 0.05) {
@@ -83,7 +92,7 @@ void main() {
         if (tally != 0 && remaining > 0u) atomicAdd(woodCells, remaining);
         return;
     }
-    if (imageLoad(gasMaskTex, gas).r != 0u) {
+    if (loadTexel(gasMaskTex, gas).r != 0u) {
         return;
     }
     // Burning wood cells among the 10x10 simulation cells around this open gas cell (past the mask halo).

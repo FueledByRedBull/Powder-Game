@@ -2,23 +2,31 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D gasUSrc;
-layout(r32f, binding = 1) uniform readonly image2D gasVSrc;
-layout(rg16f, binding = 2) uniform readonly image2D gasCenterVelocityTex;
+layout(binding = 0) uniform sampler2D gasUSrc;
+layout(binding = 1) uniform sampler2D gasVSrc;
+layout(binding = 2) uniform sampler2D gasCenterVelocityTex;
 layout(r32f, binding = 3) uniform writeonly image2D gasUDst;
 layout(r32f, binding = 4) uniform writeonly image2D gasVDst;
-layout(r8ui, binding = 5) uniform readonly uimage2D boundaryTex;
+layout(binding = 5) uniform usampler2D boundaryTex;
 
 uniform ivec2 gasSize;
 uniform float dt;
 uniform float maxVelocity;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 ivec2 clampCell(ivec2 coord) {
     return clamp(coord, ivec2(0), gasSize - ivec2(1));
 }
 
 bool blockedCell(ivec2 coord) {
-    return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || imageLoad(boundaryTex, coord).r != 0u;
+    return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || loadTexel(boundaryTex, coord).r != 0u;
 }
 
 
@@ -90,22 +98,22 @@ vec2 sampleCenterVelocity(vec2 position) {
     vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(p));
     vec2 frac = fract(p);
-    vec2 v00 = imageLoad(gasCenterVelocityTex, base).xy;
-    vec2 v10 = imageLoad(gasCenterVelocityTex, clampCell(base + ivec2(1, 0))).xy;
-    vec2 v01 = imageLoad(gasCenterVelocityTex, clampCell(base + ivec2(0, 1))).xy;
-    vec2 v11 = imageLoad(gasCenterVelocityTex, clampCell(base + ivec2(1, 1))).xy;
+    vec2 v00 = loadTexel(gasCenterVelocityTex, base).xy;
+    vec2 v10 = loadTexel(gasCenterVelocityTex, clampCell(base + ivec2(1, 0))).xy;
+    vec2 v01 = loadTexel(gasCenterVelocityTex, clampCell(base + ivec2(0, 1))).xy;
+    vec2 v11 = loadTexel(gasCenterVelocityTex, clampCell(base + ivec2(1, 1))).xy;
     return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
 }
 
 float sampleU(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(gasUSrc, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(gasUSrc, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
 float sampleV(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(gasVSrc, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(gasVSrc, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
