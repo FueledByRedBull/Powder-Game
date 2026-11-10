@@ -35,13 +35,20 @@ void CheckGl() {
 }
 
 void Barrier() {
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
                     GL_TEXTURE_UPDATE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
     CheckGl();
 }
 
+// Matches PowderApp: shaders sample what they only read and use image units for writes. Unit 47 is left active so
+// textures created or read back later cannot replace a bound input.
 void Image(GLuint binding, GLuint texture, GLenum access, GLenum format) {
-    glBindImageTexture(binding, texture, 0, GL_FALSE, 0, access, format);
+    if (access != GL_WRITE_ONLY) {
+        glActiveTexture(GL_TEXTURE0 + binding);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glActiveTexture(GL_TEXTURE0 + 47);
+    }
+    if (access != GL_READ_ONLY) glBindImageTexture(binding, texture, 0, GL_FALSE, 0, access, format);
 }
 
 struct SandFixture {

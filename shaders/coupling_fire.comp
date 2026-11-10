@@ -2,14 +2,14 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 1) uniform readonly image2D waterAmountTex;
-layout(r16f, binding = 2) uniform readonly image2D temperatureTex;
+layout(binding = 0) uniform usampler2D boundaryTex;
+layout(binding = 1) uniform sampler2D waterAmountTex;
+layout(binding = 2) uniform sampler2D temperatureTex;
 layout(rg16f, binding = 3) uniform image2D combustionTex;
 layout(r16f, binding = 4) uniform image2D oxidizerTex;
 layout(r16f, binding = 5) uniform image2D fuelTex;
-layout(rg16f, binding = 6) uniform readonly image2D oilTex;            // x: oil share of the liquid (oil_field.comp)
-layout(r16f, binding = 7) uniform readonly image2D sandOccupancyTex;
+layout(binding = 6) uniform sampler2D oilTex;            // x: oil share of the liquid (oil_field.comp)
+layout(binding = 7) uniform sampler2D sandOccupancyTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 heatSize;
@@ -18,6 +18,14 @@ uniform float waterCooling;
 // Sand occupancy at which sand covering a cell smothers its fire completely (cuts fuel and oxygen like water does).
 uniform float sandSmother;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // Liquid that is water, not oil (oil is fuel, not a quencher), and sand, averaged over the gas cell's 2x2 cells.
 float sampleWater(ivec2 gas_coord, out float sand) {
     ivec2 full = clamp(gas_coord * 2, ivec2(0), gridSize - ivec2(2));
@@ -25,8 +33,8 @@ float sampleWater(ivec2 gas_coord, out float sand) {
     sand = 0.0;
     for (int i = 0; i < 4; ++i) {
         ivec2 cell = full + ivec2(i & 1, i >> 1);
-        water += imageLoad(waterAmountTex, cell).x * (1.0 - imageLoad(oilTex, cell).x);
-        sand += imageLoad(sandOccupancyTex, cell).x;
+        water += loadTexel(waterAmountTex, cell).x * (1.0 - loadTexel(oilTex, cell).x);
+        sand += loadTexel(sandOccupancyTex, cell).x;
     }
     sand *= 0.25;
     return 0.25 * water;
@@ -44,7 +52,7 @@ void main() {
     float oxidizer = imageLoad(oxidizerTex, coord).x;
     float fuel = imageLoad(fuelTex, coord).x;
 
-    if (imageLoad(boundaryTex, coord).r != 0u) {
+    if (loadTexel(boundaryTex, coord).r != 0u) {
         imageStore(combustionTex, coord, vec4(0.0));
         imageStore(oxidizerTex, coord, vec4(0.0));
         imageStore(fuelTex, coord, vec4(0.0));

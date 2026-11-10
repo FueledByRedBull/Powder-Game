@@ -2,7 +2,7 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryTex;
+layout(binding = 0) uniform usampler2D boundaryTex;
 layout(r16f, binding = 1) uniform writeonly image2D liquidVolumeTex;
 layout(r16f, binding = 2) uniform writeonly image2D liquidPhiTex;
 layout(r16f, binding = 3) uniform writeonly image2D waterAmountTex;
@@ -21,6 +21,11 @@ uniform float amountPerParticle;
 uniform float surfaceLevel;
 uniform float restMass;
 uniform float liquidPhiThreshold;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 int linearIndex(ivec2 coord) {
     return coord.y * gridSize.x + coord.x;
@@ -41,7 +46,7 @@ float surfacePhi(ivec2 coord) {
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             ivec2 sample_coord = clampCell(coord + ivec2(x, y));
-            if (imageLoad(boundaryTex, sample_coord).r != 0u) continue;
+            if (loadTexel(boundaryTex, sample_coord).r != 0u) continue;
             float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);
             total += w * particleEquivalentAt(sample_coord);
             weights += w;
@@ -57,7 +62,7 @@ void main() {
         return;
     }
 
-    if (imageLoad(boundaryTex, coord).r != 0u) {
+    if (loadTexel(boundaryTex, coord).r != 0u) {
         imageStore(liquidVolumeTex, coord, vec4(0.0));
         imageStore(liquidPhiTex, coord, vec4(-1.0, 0.0, 0.0, 0.0));
         imageStore(waterAmountTex, coord, vec4(0.0));

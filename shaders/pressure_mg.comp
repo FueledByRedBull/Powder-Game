@@ -13,7 +13,7 @@
 // Prolongation treats walls as Neumann: a wall partner of the
 // bilinear stencil takes the fine cell's own coarse value (pulling it toward zero instead multiplied the iterations).
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
 
 // Level 0: residual, search direction, A*direction or preconditioned residual, diagonal (pressure_cg.comp).
 layout(std430, binding = 0) buffer Vectors { vec4 vectors[]; };
@@ -54,6 +54,12 @@ uniform float sandLeak;
 // steps run one workgroup per listed CG tile, the others over a level's box.
 uniform int phase;
 uniform int level;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform int slot;     // tile sum slot of z = M^-1 r (pressure_cg.comp)
 uniform int initial;  // 1: also start the search direction, d = z
 uniform int gated;    // 1 in a restart of the CG, which only acts when pressure_cg.comp phase 10 found it due
@@ -106,7 +112,7 @@ vec2 fineCell(ivec2 c) {
 // Level-0 child type: walls from the mask, liquid where the CG has a row (or invalid input), air elsewhere.
 float baseType(ivec2 c) {
     if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, gridSize))) return wall;
-    uint mask = imageLoad(boundaryTex, c).r;
+    uint mask = loadTexel(boundaryTex, c).r;
     if (mask != 0u) return mask >= 2u ? sandWall : wall;
     return vectors[c.y * gridSize.x + c.x].w != 0.0 ? liquid : air;
 }

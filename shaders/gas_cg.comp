@@ -8,13 +8,13 @@
 // s -= alpha q, partial s.z_old, z = 0; 4 partial s.z; 5 beta (one workgroup); 6 d = z + beta d.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D rhsTex;
+layout(binding = 0) uniform sampler2D rhsTex;
 layout(r32f, binding = 1) uniform image2D xTex;
 layout(r32f, binding = 2) uniform image2D sTex;
 layout(r32f, binding = 3) uniform image2D zTex;
 layout(r32f, binding = 4) uniform image2D dTex;
 layout(r32f, binding = 5) uniform image2D qTex;
-layout(r8ui, binding = 6) uniform readonly uimage2D kindTex;
+layout(binding = 6) uniform usampler2D kindTex;
 
 // Per workgroup: x s.z, y s.z_old, z d.q.
 layout(std430, binding = 0) buffer Partials {
@@ -37,13 +37,21 @@ uniform float sandLeak;
 uniform int partialCount;
 uniform int first;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 shared float sums[256];
 shared float sums2[256];
 
 uint cellKind(ivec2 coord) {
     if (coord.x < 0 || coord.y < 0 || coord.x >= gridSize.x) return 1u;
     if (coord.y >= gridSize.y) return openTop != 0 ? 2u : 1u;
-    return imageLoad(kindTex, coord).r;
+    return loadTexel(kindTex, coord).r;
 }
 
 // The fine operator of pressure_residual.comp: neighbours that are fluid add their value, every
@@ -129,7 +137,7 @@ void main() {
     float a = 0.0, b = 0.0;
     if (phase == 0) {
         if (inside) {
-            imageStore(sTex, coord, vec4(fluid ? imageLoad(rhsTex, coord).x - laplacian(false, coord) : 0.0));
+            imageStore(sTex, coord, vec4(fluid ? loadTexel(rhsTex, coord).x - laplacian(false, coord) : 0.0));
             imageStore(zTex, coord, vec4(0.0));
         }
         return;

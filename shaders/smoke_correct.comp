@@ -2,24 +2,24 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D gasVelocitySrc;
-layout(rg16f, binding = 1) uniform readonly image2D gasVelocityFwd;
-layout(r16f, binding = 2) uniform readonly image2D smokeDenSrc;
-layout(r16f, binding = 3) uniform readonly image2D temperatureSrc;
-layout(r16f, binding = 4) uniform readonly image2D fuelSrc;
-layout(r16f, binding = 5) uniform readonly image2D oxidizerSrc;
-layout(rg16f, binding = 6) uniform readonly image2D reactionSrc;
-layout(r16f, binding = 7) uniform readonly image2D smokeDenFwd;
-layout(r16f, binding = 8) uniform readonly image2D temperatureFwd;
-layout(r16f, binding = 9) uniform readonly image2D fuelFwd;
-layout(r16f, binding = 10) uniform readonly image2D oxidizerFwd;
-layout(rg16f, binding = 11) uniform readonly image2D reactionFwd;
-layout(r16f, binding = 12) uniform writeonly image2D smokeDenDst;
-layout(r16f, binding = 13) uniform writeonly image2D temperatureDst;
-layout(r16f, binding = 14) uniform writeonly image2D fuelDst;
-layout(r16f, binding = 15) uniform writeonly image2D oxidizerDst;
-layout(rg16f, binding = 16) uniform writeonly image2D reactionDst;
-layout(r8ui, binding = 17) uniform readonly uimage2D boundaryTex;
+layout(binding = 0) uniform sampler2D gasVelocitySrc;
+layout(binding = 1) uniform sampler2D gasVelocityFwd;
+layout(binding = 2) uniform sampler2D smokeDenSrc;
+layout(binding = 3) uniform sampler2D temperatureSrc;
+layout(binding = 4) uniform sampler2D fuelSrc;
+layout(binding = 5) uniform sampler2D oxidizerSrc;
+layout(binding = 6) uniform sampler2D reactionSrc;
+layout(binding = 7) uniform sampler2D smokeDenFwd;
+layout(binding = 8) uniform sampler2D temperatureFwd;
+layout(binding = 9) uniform sampler2D fuelFwd;
+layout(binding = 10) uniform sampler2D oxidizerFwd;
+layout(binding = 11) uniform sampler2D reactionFwd;
+layout(r16f, binding = 0) uniform writeonly image2D smokeDenDst;
+layout(r16f, binding = 1) uniform writeonly image2D temperatureDst;
+layout(r16f, binding = 2) uniform writeonly image2D fuelDst;
+layout(r16f, binding = 3) uniform writeonly image2D oxidizerDst;
+layout(rg16f, binding = 4) uniform writeonly image2D reactionDst;
+layout(binding = 17) uniform usampler2D boundaryTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -34,17 +34,25 @@ uniform float maxVelocity;
 uniform float densityDissipation;
 uniform float scalarDissipation;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 ivec2 clampCoord(ivec2 coord) {
     return clamp(coord, ivec2(0), gasSize - ivec2(1));
 }
 
 bool blocked(ivec2 coord) {
-    return imageLoad(boundaryTex, clampCoord(coord)).r != 0u;
+    return loadTexel(boundaryTex, clampCoord(coord)).r != 0u;
 }
 
 bool blockedCell(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gasSize.x || cell.y >= gasSize.y ||
-           imageLoad(boundaryTex, cell).r != 0u;
+           loadTexel(boundaryTex, cell).r != 0u;
 }
 
 struct TransportStencil {
@@ -115,10 +123,10 @@ vec2 sampleVelocitySrc(vec2 position) {
     vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(p));
     vec2 frac = fract(p);
-    vec2 v00 = imageLoad(gasVelocitySrc, base).xy;
-    vec2 v10 = imageLoad(gasVelocitySrc, clampCoord(base + ivec2(1, 0))).xy;
-    vec2 v01 = imageLoad(gasVelocitySrc, clampCoord(base + ivec2(0, 1))).xy;
-    vec2 v11 = imageLoad(gasVelocitySrc, clampCoord(base + ivec2(1, 1))).xy;
+    vec2 v00 = loadTexel(gasVelocitySrc, base).xy;
+    vec2 v10 = loadTexel(gasVelocitySrc, clampCoord(base + ivec2(1, 0))).xy;
+    vec2 v01 = loadTexel(gasVelocitySrc, clampCoord(base + ivec2(0, 1))).xy;
+    vec2 v11 = loadTexel(gasVelocitySrc, clampCoord(base + ivec2(1, 1))).xy;
     return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
 }
 
@@ -127,7 +135,7 @@ vec2 sampleVelocitySrc(vec2 position) {
 
 float sampleSmokeFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(smokeDenFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(smokeDenFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -135,7 +143,7 @@ float sampleSmokeFwd(TransportStencil stencil) {
 
 float sampleTemperatureFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(temperatureFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(temperatureFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -143,7 +151,7 @@ float sampleTemperatureFwd(TransportStencil stencil) {
 
 float sampleFuelFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(fuelFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(fuelFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -151,7 +159,7 @@ float sampleFuelFwd(TransportStencil stencil) {
 
 float sampleOxidizerFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(oxidizerFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(oxidizerFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -159,7 +167,7 @@ float sampleOxidizerFwd(TransportStencil stencil) {
 
 vec2 sampleReactionFwd(TransportStencil stencil) {
     vec2 value = vec2(0.0);
-    for (int i = 0; i < 4; ++i) value += stencil.weights[i] * imageLoad(reactionFwd, stencil.cells[i]).xy;
+    for (int i = 0; i < 4; ++i) value += stencil.weights[i] * loadTexel(reactionFwd, stencil.cells[i]).xy;
     return value;
 }
 
@@ -167,7 +175,7 @@ float clampLocalSmoke(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(smokeDenSrc, stencil.cells[i]).x;
+            float donor = loadTexel(smokeDenSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -179,7 +187,7 @@ float clampLocalTemperature(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(temperatureSrc, stencil.cells[i]).x;
+            float donor = loadTexel(temperatureSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -191,7 +199,7 @@ float clampLocalFuel(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(fuelSrc, stencil.cells[i]).x;
+            float donor = loadTexel(fuelSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -203,7 +211,7 @@ float clampLocalOxidizer(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(oxidizerSrc, stencil.cells[i]).x;
+            float donor = loadTexel(oxidizerSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -215,7 +223,7 @@ vec2 clampLocalReaction(TransportStencil stencil, vec2 value) {
     vec2 minV = vec2(1e30), maxV = vec2(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            vec2 donor = imageLoad(reactionSrc, stencil.cells[i]).xy;
+            vec2 donor = loadTexel(reactionSrc, stencil.cells[i]).xy;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -248,14 +256,14 @@ void main() {
     TransportStencil backStencil = transportStencil(center, backtrace, vec2(0.5), gasSize - ivec2(1), -1);
     TransportStencil reverseStencil = transportStencil(center, reverseTrace, vec2(0.5), gasSize - ivec2(1), -1);
 
-    float smoke = imageLoad(smokeDenFwd, coord).x + 0.5 * (imageLoad(smokeDenSrc, coord).x - sampleSmokeFwd(reverseStencil));
+    float smoke = loadTexel(smokeDenFwd, coord).x + 0.5 * (loadTexel(smokeDenSrc, coord).x - sampleSmokeFwd(reverseStencil));
     float temperature =
-        imageLoad(temperatureFwd, coord).x + 0.5 * (imageLoad(temperatureSrc, coord).x - sampleTemperatureFwd(reverseStencil));
-    float fuel = imageLoad(fuelFwd, coord).x + 0.5 * (imageLoad(fuelSrc, coord).x - sampleFuelFwd(reverseStencil));
+        loadTexel(temperatureFwd, coord).x + 0.5 * (loadTexel(temperatureSrc, coord).x - sampleTemperatureFwd(reverseStencil));
+    float fuel = loadTexel(fuelFwd, coord).x + 0.5 * (loadTexel(fuelSrc, coord).x - sampleFuelFwd(reverseStencil));
     float oxidizer =
-        imageLoad(oxidizerFwd, coord).x + 0.5 * (imageLoad(oxidizerSrc, coord).x - sampleOxidizerFwd(reverseStencil));
+        loadTexel(oxidizerFwd, coord).x + 0.5 * (loadTexel(oxidizerSrc, coord).x - sampleOxidizerFwd(reverseStencil));
     vec2 reaction =
-        imageLoad(reactionFwd, coord).xy + 0.5 * (imageLoad(reactionSrc, coord).xy - sampleReactionFwd(reverseStencil));
+        loadTexel(reactionFwd, coord).xy + 0.5 * (loadTexel(reactionSrc, coord).xy - sampleReactionFwd(reverseStencil));
 
     // Decay follows the limiter so the original extrema cannot restore it.
     imageStore(smokeDenDst, coord, vec4(clampLocalSmoke(backStencil, smoke) * densityDissipation, 0.0, 0.0, 0.0));

@@ -2,14 +2,14 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D waterUFaceTex;
-layout(r16f, binding = 1) uniform readonly image2D waterVFaceTex;
+layout(binding = 0) uniform sampler2D waterUFaceTex;
+layout(binding = 1) uniform sampler2D waterVFaceTex;
 layout(r16f, binding = 2) uniform writeonly image2D divergenceTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D boundaryTex;
-layout(r16f, binding = 4) uniform readonly image2D liquidPhiTex;
+layout(binding = 3) uniform usampler2D boundaryTex;
+layout(binding = 4) uniform sampler2D liquidPhiTex;
 // Packed calm water (water_pack.comp, bits 0-6 a count): packed cells and their neighbours, whose counts the packed
 // deposit shapes, take no density correction, so packing is not itself a density error that drives flow.
-layout(r8ui, binding = 5) uniform readonly uimage2D waterPackedTex;
+layout(binding = 5) uniform usampler2D waterPackedTex;
 
 layout(std430, binding = 0) readonly buffer WaterCellCounts {
     uint counts[];
@@ -30,6 +30,14 @@ uniform float weightScale;
 uniform float restDensity;
 uniform float densityRate;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // Largest density error (relative to rest) the correction acts on, so a source that overfills a cell is not blown out.
 const float kMaxDensityError = 0.5;
 // A cell is inside the bulk when the cell above holds at least this share of the rest density (or is a wall or the
@@ -40,14 +48,14 @@ bool nearPacked(ivec2 coord) {
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             ivec2 n = clamp(coord + ivec2(i, j), ivec2(0), gridSize - ivec2(1));
-            if ((imageLoad(waterPackedTex, n).r & 127u) != 0u) return true;
+            if ((loadTexel(waterPackedTex, n).r & 127u) != 0u) return true;
         }
     }
     return false;
 }
 
 bool liquidCell(ivec2 coord) {
-    return imageLoad(liquidPhiTex, coord).x < liquidPhiThreshold;
+    return loadTexel(liquidPhiTex, coord).x < liquidPhiThreshold;
 }
 
 float densityError(ivec2 coord) {
@@ -59,7 +67,7 @@ float densityError(ivec2 coord) {
 // nearly full, as before, left clusters of entrained voids at real gravity: a dam break kept 24% voids.)
 bool bulkCell(ivec2 coord) {
     ivec2 above = coord + ivec2(0, 1);
-    if (above.y >= gridSize.y || imageLoad(boundaryTex, above).r != 0u) {
+    if (above.y >= gridSize.y || loadTexel(boundaryTex, above).r != 0u) {
         return true;
     }
     return densityError(above) + 1.0 >= kBulkDensity;
@@ -69,13 +77,13 @@ float forcedV(ivec2 face) {
     if (face.y == 0 || face.y == gridSize.y) {
         return 0.0;
     }
-    uint below = imageLoad(boundaryTex, face - ivec2(0, 1)).r;
-    uint above = imageLoad(boundaryTex, face).r;
+    uint below = loadTexel(boundaryTex, face - ivec2(0, 1)).r;
+    uint above = loadTexel(boundaryTex, face).r;
     if (below == 1u || above == 1u) {
         return 0.0;
     }
     // A face of moving sand keeps the sand velocity water_mac_build gave it; gravity acts only on open faces.
-    float stored = imageLoad(waterVFaceTex, face).x;
+    float stored = loadTexel(waterVFaceTex, face).x;
     return below != 0u || above != 0u ? stored : stored + gravityDelta;
 }
 
@@ -87,13 +95,13 @@ void main() {
 
     // Sealed pockets, down to a pinhole walled in on all four sides, get their right-hand side's mean removed afterwards
     // (pressure_pockets.comp).
-    if (imageLoad(boundaryTex, coord).r != 0u || !liquidCell(coord)) {
+    if (loadTexel(boundaryTex, coord).r != 0u || !liquidCell(coord)) {
         imageStore(divergenceTex, coord, vec4(0.0));
         return;
     }
 
-    float u_left = imageLoad(waterUFaceTex, ivec2(coord.x, coord.y)).x;
-    float u_right = imageLoad(waterUFaceTex, ivec2(coord.x + 1, coord.y)).x;
+    float u_left = loadTexel(waterUFaceTex, ivec2(coord.x, coord.y)).x;
+    float u_right = loadTexel(waterUFaceTex, ivec2(coord.x + 1, coord.y)).x;
     float v_down = forcedV(ivec2(coord.x, coord.y));
     float v_up = forcedV(ivec2(coord.x, coord.y + 1));
 

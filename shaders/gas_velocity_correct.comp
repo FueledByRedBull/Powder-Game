@@ -2,17 +2,17 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D gasUSrc;
-layout(r32f, binding = 1) uniform readonly image2D gasVSrc;
-layout(rg16f, binding = 2) uniform readonly image2D gasCenterVelocitySrc;
-layout(r32f, binding = 3) uniform readonly image2D gasUFwd;
-layout(r32f, binding = 4) uniform readonly image2D gasVFwd;
-layout(rg16f, binding = 5) uniform readonly image2D gasCenterVelocityFwd;
-layout(r16f, binding = 6) uniform readonly image2D smokeDensityTex;
-layout(r16f, binding = 7) uniform readonly image2D temperatureTex;
-layout(r32f, binding = 8) uniform writeonly image2D gasUDst;
-layout(r32f, binding = 9) uniform writeonly image2D gasVDst;
-layout(r8ui, binding = 10) uniform readonly uimage2D boundaryTex;
+layout(binding = 0) uniform sampler2D gasUSrc;
+layout(binding = 1) uniform sampler2D gasVSrc;
+layout(binding = 2) uniform sampler2D gasCenterVelocitySrc;
+layout(binding = 3) uniform sampler2D gasUFwd;
+layout(binding = 4) uniform sampler2D gasVFwd;
+layout(binding = 5) uniform sampler2D gasCenterVelocityFwd;
+layout(binding = 6) uniform sampler2D smokeDensityTex;
+layout(binding = 7) uniform sampler2D temperatureTex;
+layout(r32f, binding = 0) uniform writeonly image2D gasUDst;
+layout(r32f, binding = 1) uniform writeonly image2D gasVDst;
+layout(binding = 10) uniform usampler2D boundaryTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -30,12 +30,20 @@ uniform float maxVelocity;
 // Vorticity confinement strength (1/s): puts back the small swirls that interpolation smooths away.
 uniform float vorticity;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 ivec2 clampCell(ivec2 coord) {
     return clamp(coord, ivec2(0), gasSize - ivec2(1));
 }
 
 bool blockedCell(ivec2 coord) {
-    return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || imageLoad(boundaryTex, coord).r != 0u;
+    return coord.x < 0 || coord.y < 0 || coord.x >= gasSize.x || coord.y >= gasSize.y || loadTexel(boundaryTex, coord).r != 0u;
 }
 
 
@@ -107,10 +115,10 @@ vec2 sampleCenterVelocitySrc(vec2 position) {
     vec2 p = clamp(position - vec2(0.5), vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(p));
     vec2 frac = fract(p);
-    vec2 v00 = imageLoad(gasCenterVelocitySrc, base).xy;
-    vec2 v10 = imageLoad(gasCenterVelocitySrc, clampCell(base + ivec2(1, 0))).xy;
-    vec2 v01 = imageLoad(gasCenterVelocitySrc, clampCell(base + ivec2(0, 1))).xy;
-    vec2 v11 = imageLoad(gasCenterVelocitySrc, clampCell(base + ivec2(1, 1))).xy;
+    vec2 v00 = loadTexel(gasCenterVelocitySrc, base).xy;
+    vec2 v10 = loadTexel(gasCenterVelocitySrc, clampCell(base + ivec2(1, 0))).xy;
+    vec2 v01 = loadTexel(gasCenterVelocitySrc, clampCell(base + ivec2(0, 1))).xy;
+    vec2 v11 = loadTexel(gasCenterVelocitySrc, clampCell(base + ivec2(1, 1))).xy;
     return clamp(mix(mix(v00, v10, frac.x), mix(v01, v11, frac.x), frac.y), vec2(-maxVelocity), vec2(maxVelocity));
 }
 
@@ -119,7 +127,7 @@ vec2 sampleCenterVelocitySrc(vec2 position) {
 
 float sampleUFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(gasUFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(gasUFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -127,7 +135,7 @@ float sampleUFwd(TransportStencil stencil) {
 
 float sampleVFwd(TransportStencil stencil) {
     vec4 values;
-    for (int i = 0; i < 4; ++i) values[i] = imageLoad(gasVFwd, stencil.cells[i]).x;
+    for (int i = 0; i < 4; ++i) values[i] = loadTexel(gasVFwd, stencil.cells[i]).x;
     return dot(stencil.weights, values);
 }
 
@@ -135,7 +143,7 @@ float clampLocalU(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(gasUSrc, stencil.cells[i]).x;
+            float donor = loadTexel(gasUSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -147,7 +155,7 @@ float clampLocalV(TransportStencil stencil, float value) {
     float minV = float(1e30), maxV = float(-1e30);
     for (int i = 0; i < 4; ++i) {
         if (stencil.weights[i] > 0.0) {
-            float donor = imageLoad(gasVSrc, stencil.cells[i]).x;
+            float donor = loadTexel(gasVSrc, stencil.cells[i]).x;
             minV = min(minV, donor);
             maxV = max(maxV, donor);
         }
@@ -156,20 +164,20 @@ float clampLocalV(TransportStencil stencil, float value) {
 }
 
 float sampleTemperature(ivec2 coord) {
-    return imageLoad(temperatureTex, clampCell(coord)).x;
+    return loadTexel(temperatureTex, clampCell(coord)).x;
 }
 
 float sampleSmoke(ivec2 coord) {
-    return imageLoad(smokeDensityTex, clampCell(coord)).x;
+    return loadTexel(smokeDensityTex, clampCell(coord)).x;
 }
 
 // Curl of the centred velocity at a cell; walls and the domain edge contribute none.
 float curlAt(ivec2 c) {
     if (blockedCell(c)) return 0.0;
-    vec2 l = imageLoad(gasCenterVelocitySrc, clampCell(c - ivec2(1, 0))).xy;
-    vec2 r = imageLoad(gasCenterVelocitySrc, clampCell(c + ivec2(1, 0))).xy;
-    vec2 b = imageLoad(gasCenterVelocitySrc, clampCell(c - ivec2(0, 1))).xy;
-    vec2 t = imageLoad(gasCenterVelocitySrc, clampCell(c + ivec2(0, 1))).xy;
+    vec2 l = loadTexel(gasCenterVelocitySrc, clampCell(c - ivec2(1, 0))).xy;
+    vec2 r = loadTexel(gasCenterVelocitySrc, clampCell(c + ivec2(1, 0))).xy;
+    vec2 b = loadTexel(gasCenterVelocitySrc, clampCell(c - ivec2(0, 1))).xy;
+    vec2 t = loadTexel(gasCenterVelocitySrc, clampCell(c + ivec2(0, 1))).xy;
     return 0.5 * ((r.y - l.y) - (t.x - b.x));
 }
 
@@ -204,7 +212,7 @@ void main() {
                                       vec2(gasSize.x, gasSize.y - 0.5));
             TransportStencil backStencil = transportStencil(facePos, backtrace, vec2(0.0, 0.5), ivec2(gasSize.x, gasSize.y - 1), 0);
             TransportStencil reverseStencil = transportStencil(facePos, reverseTrace, vec2(0.0, 0.5), ivec2(gasSize.x, gasSize.y - 1), 0);
-            value = imageLoad(gasUFwd, coord).x + 0.5 * (imageLoad(gasUSrc, coord).x - sampleUFwd(reverseStencil));
+            value = loadTexel(gasUFwd, coord).x + 0.5 * (loadTexel(gasUSrc, coord).x - sampleUFwd(reverseStencil));
             value = clampLocalU(backStencil, value) * velocityDissipation;
             value += 0.5 * (confinementAt(ivec2(coord.x - 1, coord.y)).x + confinementAt(coord).x) * dt;
             value = clamp(value, -maxVelocity, maxVelocity);
@@ -229,7 +237,7 @@ void main() {
                                       vec2(gasSize.x - 0.5, gasSize.y));
             TransportStencil backStencil = transportStencil(facePos, backtrace, vec2(0.5, 0.0), ivec2(gasSize.x - 1, gasSize.y), 1);
             TransportStencil reverseStencil = transportStencil(facePos, reverseTrace, vec2(0.5, 0.0), ivec2(gasSize.x - 1, gasSize.y), 1);
-            value = imageLoad(gasVFwd, coord).x + 0.5 * (imageLoad(gasVSrc, coord).x - sampleVFwd(reverseStencil));
+            value = loadTexel(gasVFwd, coord).x + 0.5 * (loadTexel(gasVSrc, coord).x - sampleVFwd(reverseStencil));
             value = clampLocalV(backStencil, value) * velocityDissipation;
 
             float temperature =

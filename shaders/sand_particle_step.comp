@@ -2,11 +2,11 @@
 
 layout(local_size_x = 256) in;
 
-layout(r16f, binding = 0) uniform readonly image2D boundarySdfTex;
-layout(rg32f, binding = 1) uniform readonly image2D sandVelocityTex;
+layout(binding = 0) uniform sampler2D boundarySdfTex;
+layout(binding = 1) uniform sampler2D sandVelocityTex;
 // Sleeping grains per cell (sand_pack.comp): moving grains collide with packed cells like with walls.
-layout(r8ui, binding = 2) uniform readonly uimage2D packedTex;
-layout(r16f, binding = 3) uniform readonly image2D waterAmountTex;
+layout(binding = 2) uniform usampler2D packedTex;
+layout(binding = 3) uniform sampler2D waterAmountTex;
 
 layout(std430, binding = 7) buffer DebugCounters {
     uint nanInfDetected;
@@ -64,9 +64,17 @@ uniform float dryingRate;
 uniform float moistureDt;
 uniform float waterFullVolume;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 bool blockedCell(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
-           imageLoad(boundarySdfTex, cell).x <= 0.0 || imageLoad(packedTex, cell).r > 0u;
+           loadTexel(boundarySdfTex, cell).x <= 0.0 || loadTexel(packedTex, cell).r > 0u;
 }
 
 float sweepGrid(vec2 position, vec2 displacement, out vec2 hitNormal, out ivec2 lastCell) {
@@ -204,7 +212,7 @@ mat2 gatherGridVelocity(vec2 position, out vec2 velocity, out mat2 velocityGradi
                 continue;
             }
             float weight = wx[i] * wy[j];
-            vec2 value = imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+            vec2 value = loadTexel(sandVelocityTex, cell + ivec2(1)).xy;
             gridMass[(cell.y + 1) * (gridSize.x + 2) + cell.x + 1] = 0u;
             vec2 delta = vec2(cell) + vec2(0.5) - position;
             velocity += weight * value;
@@ -332,6 +340,7 @@ const float kHardeningScale = 4.0;
 // Varies per substep (the host passes a counter), so the same grain rounds differently each time.
 uniform uint roundSeed;
 
+
 // timer + fraction as a float. Where the float's step is coarse (timer 16 and up: grains that have been still a while,
 // the sleep timer counts to 255, step 1.5e-5), increments below half a step would round away every substep and slow
 // creep would never harden. There the sum is rounded stochastically: the exact error of the nearest float (timer >= 1 >
@@ -404,7 +413,7 @@ void main() {
         float fill = 0.0;
         for (int j = -1; j <= 1; ++j) {
             for (int i = -1; i <= 1; ++i) {
-                fill = max(fill, imageLoad(waterAmountTex, clamp(cell + ivec2(i, j), ivec2(0), gridSize - ivec2(1))).x);
+                fill = max(fill, loadTexel(waterAmountTex, clamp(cell + ivec2(i, j), ivec2(0), gridSize - ivec2(1))).x);
             }
         }
         float saturation = clamp(fill / waterFullVolume, 0.0, 1.0);

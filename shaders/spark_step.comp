@@ -16,9 +16,9 @@ layout(std430, binding = 1) buffer Buckets {
     uint buckets[];
 };
 
-layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;  // gas cell centres, gas cells/s
-layout(r8ui, binding = 1) uniform readonly uimage2D boundaryTex;     // 0 open, 1 rock, 2-3 sand
-layout(r16f, binding = 2) uniform readonly image2D waterAmountTex;
+layout(binding = 0) uniform sampler2D gasVelocityTex;  // gas cell centres, gas cells/s
+layout(binding = 1) uniform usampler2D boundaryTex;     // 0 open, 1 rock, 2-3 sand
+layout(binding = 2) uniform sampler2D waterAmountTex;
 
 uniform ivec2 gridSize;
 uniform ivec2 gasSize;
@@ -26,6 +26,15 @@ uniform uint tick;
 uniform float dt;
 uniform uint capacity;
 uniform uint perTick;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 uniform float gravity;  // cells/s^2
 
 const float kMaxSpeed = 700.0;      // cells/s, above the 600 of a gas at its cap
@@ -51,8 +60,8 @@ vec2 gasVelocity(vec2 p) {
     ivec2 b = ivec2(floor(g));
     vec2 f = g - vec2(b);
     ivec2 hi = min(b + 1, gasSize - 1);
-    vec2 v = mix(mix(imageLoad(gasVelocityTex, b).xy, imageLoad(gasVelocityTex, ivec2(hi.x, b.y)).xy, f.x),
-                 mix(imageLoad(gasVelocityTex, ivec2(b.x, hi.y)).xy, imageLoad(gasVelocityTex, hi).xy, f.x), f.y);
+    vec2 v = mix(mix(loadTexel(gasVelocityTex, b).xy, loadTexel(gasVelocityTex, ivec2(hi.x, b.y)).xy, f.x),
+                 mix(loadTexel(gasVelocityTex, ivec2(b.x, hi.y)).xy, loadTexel(gasVelocityTex, hi).xy, f.x), f.y);
     return 2.0 * v;
 }
 
@@ -61,7 +70,7 @@ uint cellKind(vec2 p) {
     ivec2 c = ivec2(floor(p));
     if (c.y >= gridSize.y) return 2u;
     if (any(lessThan(c, ivec2(0))) || c.x >= gridSize.x) return 1u;
-    return min(imageLoad(boundaryTex, c).r, 2u);
+    return min(loadTexel(boundaryTex, c).r, 2u);
 }
 
 void main() {
@@ -147,7 +156,7 @@ void main() {
         pos = next;
     }
     // A hard hit can cool a spark past its life: it dies now rather than being stored older than its life.
-    if (dead || age >= state.y || imageLoad(waterAmountTex, ivec2(pos)).x > kWaterThreshold) {
+    if (dead || age >= state.y || loadTexel(waterAmountTex, ivec2(pos)).x > kWaterThreshold) {
         sparks[2u * i + 1u] = vec4(0.0);
         return;
     }

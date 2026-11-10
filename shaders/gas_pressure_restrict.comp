@@ -4,13 +4,13 @@
 // coarse cell in the interior), so every level uses the same unscaled 5-point operator.
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r32f, binding = 0) uniform readonly image2D rhsFineTex;
-layout(r32f, binding = 1) uniform readonly image2D pressureFineTex;
+layout(binding = 0) uniform sampler2D rhsFineTex;
+layout(binding = 1) uniform sampler2D pressureFineTex;
 layout(r32f, binding = 2) uniform writeonly image2D rhsCoarseTex;
-layout(r8ui, binding = 3) uniform readonly uimage2D kindTex;
+layout(binding = 3) uniform usampler2D kindTex;
 // Each V-cycle's coarse correction starts from zero.
 layout(r32f, binding = 4) uniform writeonly image2D pressureCoarseTex;
-layout(r8ui, binding = 5) uniform readonly uimage2D coarseKindTex;
+layout(binding = 5) uniform usampler2D coarseKindTex;
 // Fine residual, written by the first pass (gatherPass 0, over the fine grid) and gathered by the second.
 layout(r32f, binding = 6) uniform image2D residualTex;
 
@@ -25,6 +25,14 @@ uniform float sandLeak;
 uniform int fineHeight;
 uniform int gatherPass;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // Open top: a level with spacing h reaches that zero from its top centres, (top + 0.5) h fine cells up, so the
 // ghost weighs h / distance (1 on the finest grid; odd levels whose top row straddles the edge weigh more).
 float openTopWeight(int top) {
@@ -36,7 +44,7 @@ float openTopWeight(int top) {
 uint cellKind(ivec2 coord) {
     if (coord.x < 0 || coord.y < 0 || coord.x >= fineSize.x) return 1u;
     if (coord.y >= fineSize.y) return openTop != 0 ? 3u : 1u;
-    return imageLoad(kindTex, coord).r;
+    return loadTexel(kindTex, coord).r;
 }
 
 float residualAt(ivec2 coord) {
@@ -47,7 +55,7 @@ float residualAt(ivec2 coord) {
         ivec2 neighbor = coord + offsets[i];
         uint kind = cellKind(neighbor);
         if (kind == 0u) {
-            pressure_sum += imageLoad(pressureFineTex, neighbor).x;
+            pressure_sum += loadTexel(pressureFineTex, neighbor).x;
             diagonal += 1.0;
         } else if (kind == 3u) {
             diagonal += openTopWeight(fineSize.y - 1);
@@ -55,20 +63,20 @@ float residualAt(ivec2 coord) {
             diagonal += sandLeak;
         }
     }
-    float lap = pressure_sum - diagonal * imageLoad(pressureFineTex, coord).x;
-    return imageLoad(rhsFineTex, coord).x - lap;
+    float lap = pressure_sum - diagonal * loadTexel(pressureFineTex, coord).x;
+    return loadTexel(rhsFineTex, coord).x - lap;
 }
 
 bool coarseFluid(ivec2 coord) {
     return all(greaterThanEqual(coord, ivec2(0))) && all(lessThan(coord, coarseSize)) &&
-           imageLoad(coarseKindTex, coord).r == 0u;
+           loadTexel(coarseKindTex, coord).r == 0u;
 }
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     if (gatherPass == 0) {
         if (all(lessThan(coord, fineSize)))
-            imageStore(residualTex, coord, vec4(imageLoad(kindTex, coord).r == 0u ? residualAt(coord) : 0.0));
+            imageStore(residualTex, coord, vec4(loadTexel(kindTex, coord).r == 0u ? residualAt(coord) : 0.0));
         return;
     }
     if (coord.x >= coarseSize.x || coord.y >= coarseSize.y) {
@@ -83,7 +91,7 @@ void main() {
             for (int x = 2 * coord.x - 1; x <= 2 * coord.x + 2; ++x) {
                 ivec2 fine = ivec2(x, y);
                 if (any(lessThan(fine, ivec2(0))) || any(greaterThanEqual(fine, fineSize)) ||
-                    imageLoad(kindTex, fine).r != 0u) continue;
+                    loadTexel(kindTex, fine).r != 0u) continue;
                 ivec2 parent = fine / 2;
                 ivec2 toward = ivec2(fine.x & 1, fine.y & 1) * 2 - 1;
                 float weight = 0.0;

@@ -2,10 +2,10 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rg16f, binding = 0) uniform readonly image2D gasVelocityTex;
-layout(r16f, binding = 1) uniform readonly image2D smokeDensityTex;
-layout(r16f, binding = 2) uniform readonly image2D temperatureTex;
-layout(rg16f, binding = 3) uniform readonly image2D combustionTex;
+layout(binding = 0) uniform sampler2D gasVelocityTex;
+layout(binding = 1) uniform sampler2D smokeDensityTex;
+layout(binding = 2) uniform sampler2D temperatureTex;
+layout(binding = 3) uniform sampler2D combustionTex;
 layout(rg16f, binding = 4) uniform writeonly image2D renderGasVelocityTex;
 layout(r16f, binding = 5) uniform writeonly image2D renderSmokeDensityTex;
 layout(r16f, binding = 6) uniform writeonly image2D renderTemperatureTex;
@@ -13,6 +13,11 @@ layout(r16f, binding = 7) uniform writeonly image2D renderFireEmissiveTex;
 
 uniform ivec2 fullSize;
 uniform ivec2 gasSize;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
 
 ivec2 clampGasCoord(ivec2 coord) {
     return clamp(coord, ivec2(0), gasSize - ivec2(1));
@@ -22,10 +27,10 @@ float sampleSmokeLinear(vec2 coord) {
     vec2 samplePos = clamp(coord, vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(samplePos));
     vec2 frac = fract(samplePos);
-    float s00 = imageLoad(smokeDensityTex, clampGasCoord(base)).x;
-    float s10 = imageLoad(smokeDensityTex, clampGasCoord(base + ivec2(1, 0))).x;
-    float s01 = imageLoad(smokeDensityTex, clampGasCoord(base + ivec2(0, 1))).x;
-    float s11 = imageLoad(smokeDensityTex, clampGasCoord(base + ivec2(1, 1))).x;
+    float s00 = loadTexel(smokeDensityTex, clampGasCoord(base)).x;
+    float s10 = loadTexel(smokeDensityTex, clampGasCoord(base + ivec2(1, 0))).x;
+    float s01 = loadTexel(smokeDensityTex, clampGasCoord(base + ivec2(0, 1))).x;
+    float s11 = loadTexel(smokeDensityTex, clampGasCoord(base + ivec2(1, 1))).x;
     return mix(mix(s00, s10, frac.x), mix(s01, s11, frac.x), frac.y);
 }
 
@@ -33,10 +38,10 @@ float sampleTemperatureLinear(vec2 coord) {
     vec2 samplePos = clamp(coord, vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(samplePos));
     vec2 frac = fract(samplePos);
-    float s00 = imageLoad(temperatureTex, clampGasCoord(base)).x;
-    float s10 = imageLoad(temperatureTex, clampGasCoord(base + ivec2(1, 0))).x;
-    float s01 = imageLoad(temperatureTex, clampGasCoord(base + ivec2(0, 1))).x;
-    float s11 = imageLoad(temperatureTex, clampGasCoord(base + ivec2(1, 1))).x;
+    float s00 = loadTexel(temperatureTex, clampGasCoord(base)).x;
+    float s10 = loadTexel(temperatureTex, clampGasCoord(base + ivec2(1, 0))).x;
+    float s01 = loadTexel(temperatureTex, clampGasCoord(base + ivec2(0, 1))).x;
+    float s11 = loadTexel(temperatureTex, clampGasCoord(base + ivec2(1, 1))).x;
     return mix(mix(s00, s10, frac.x), mix(s01, s11, frac.x), frac.y);
 }
 
@@ -44,10 +49,10 @@ vec2 sampleGasVelocityLinear(vec2 coord) {
     vec2 samplePos = clamp(coord, vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(samplePos));
     vec2 frac = fract(samplePos);
-    vec2 s00 = imageLoad(gasVelocityTex, clampGasCoord(base)).xy;
-    vec2 s10 = imageLoad(gasVelocityTex, clampGasCoord(base + ivec2(1, 0))).xy;
-    vec2 s01 = imageLoad(gasVelocityTex, clampGasCoord(base + ivec2(0, 1))).xy;
-    vec2 s11 = imageLoad(gasVelocityTex, clampGasCoord(base + ivec2(1, 1))).xy;
+    vec2 s00 = loadTexel(gasVelocityTex, clampGasCoord(base)).xy;
+    vec2 s10 = loadTexel(gasVelocityTex, clampGasCoord(base + ivec2(1, 0))).xy;
+    vec2 s01 = loadTexel(gasVelocityTex, clampGasCoord(base + ivec2(0, 1))).xy;
+    vec2 s11 = loadTexel(gasVelocityTex, clampGasCoord(base + ivec2(1, 1))).xy;
     return mix(mix(s00, s10, frac.x), mix(s01, s11, frac.x), frac.y);
 }
 
@@ -55,10 +60,10 @@ vec2 sampleCombustionLinear(vec2 coord) {
     vec2 samplePos = clamp(coord, vec2(0.0), vec2(gasSize) - vec2(1.0));
     ivec2 base = ivec2(floor(samplePos));
     vec2 frac = fract(samplePos);
-    vec2 s00 = imageLoad(combustionTex, clampGasCoord(base)).xy;
-    vec2 s10 = imageLoad(combustionTex, clampGasCoord(base + ivec2(1, 0))).xy;
-    vec2 s01 = imageLoad(combustionTex, clampGasCoord(base + ivec2(0, 1))).xy;
-    vec2 s11 = imageLoad(combustionTex, clampGasCoord(base + ivec2(1, 1))).xy;
+    vec2 s00 = loadTexel(combustionTex, clampGasCoord(base)).xy;
+    vec2 s10 = loadTexel(combustionTex, clampGasCoord(base + ivec2(1, 0))).xy;
+    vec2 s01 = loadTexel(combustionTex, clampGasCoord(base + ivec2(0, 1))).xy;
+    vec2 s11 = loadTexel(combustionTex, clampGasCoord(base + ivec2(1, 1))).xy;
     return mix(mix(s00, s10, frac.x), mix(s01, s11, frac.x), frac.y);
 }
 

@@ -2,15 +2,15 @@
 
 layout(local_size_x = 256) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D boundaryMaskTex;
-layout(r16f, binding = 1) uniform readonly image2D waterUPrevTex;
-layout(r16f, binding = 2) uniform readonly image2D waterVPrevTex;
-layout(r16f, binding = 3) uniform readonly image2D waterUTex;
-layout(r16f, binding = 4) uniform readonly image2D waterVTex;
-layout(rg32f, binding = 5) uniform readonly image2D sandVelocityTex;
-layout(r16f, binding = 6) uniform readonly image2D sandOccupancyTex;
-layout(r16f, binding = 7) uniform readonly image2D liquidVolumeTex;
-layout(rg16f, binding = 8) uniform readonly image2D oilTex;  // x: oil share of the cell's records (oil_field.comp)
+layout(binding = 0) uniform usampler2D boundaryMaskTex;
+layout(binding = 1) uniform sampler2D waterUPrevTex;
+layout(binding = 2) uniform sampler2D waterVPrevTex;
+layout(binding = 3) uniform sampler2D waterUTex;
+layout(binding = 4) uniform sampler2D waterVTex;
+layout(binding = 5) uniform sampler2D sandVelocityTex;
+layout(binding = 6) uniform sampler2D sandOccupancyTex;
+layout(binding = 7) uniform sampler2D liquidVolumeTex;
+layout(binding = 8) uniform sampler2D oilTex;  // x: oil share of the cell's records (oil_field.comp)
 
 struct WaterParticle {
     vec4 state0;
@@ -59,12 +59,20 @@ uniform float restVolume;  // liquid volume of a cell at rest density
 uniform float bulkDamping;
 uniform vec2 gravity;
 
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
+
 // Set when a speed cap cut this particle's velocity; each such particle is counted, so clipping is never silent.
 bool speedClamped = false;
 
 bool blockedCell(ivec2 cell) {
     return cell.x < 0 || cell.y < 0 || cell.x >= gridSize.x || cell.y >= gridSize.y ||
-           imageLoad(boundaryMaskTex, cell).x != 0u;
+           loadTexel(boundaryMaskTex, cell).x != 0u;
 }
 
 // The domain edge is a wall like a painted one (blockedCell is true outside the grid): particles sweep to its face, as
@@ -134,7 +142,7 @@ void escapeSand(inout vec2 position, inout vec2 velocity) {
         for (int steps = 1; steps < bestSteps; ++steps) {
             ivec2 probe = cell + direction * steps;
             if (probe.x < 0 || probe.y < 0 || probe.x >= gridSize.x || probe.y >= gridSize.y) break;
-            uint mask = imageLoad(boundaryMaskTex, probe).x;
+            uint mask = loadTexel(boundaryMaskTex, probe).x;
             if (mask == 1u) break;
             if (mask == 0u) {
                 bestSteps = steps;
@@ -146,7 +154,7 @@ void escapeSand(inout vec2 position, inout vec2 velocity) {
     if (bestDirection == ivec2(0)) return;
     position += vec2(bestDirection * bestSteps);
     vec2 outward = vec2(bestDirection);
-    vec2 sandVelocity = imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+    vec2 sandVelocity = loadTexel(sandVelocityTex, cell + ivec2(1)).xy;
     velocity += outward * max(dot(sandVelocity - velocity, outward), 0.0);
     float speed = length(velocity);
     if (speed > maxVelocity) {
@@ -158,7 +166,7 @@ void escapeSand(inout vec2 position, inout vec2 velocity) {
 void moveWithCollisions(inout vec2 position, inout vec2 velocity, inout mat2 affine,
                         vec2 displacement, float bounce) {
     position = clamp(position, vec2(0.0), vec2(gridSize) - vec2(1.0 / 256.0));
-    if (imageLoad(boundaryMaskTex, ivec2(floor(position))).x >= 2u) {
+    if (loadTexel(boundaryMaskTex, ivec2(floor(position))).x >= 2u) {
         escapeSand(position, velocity);
     }
     // A particle still inside painted geometry waits for the brush's explicit clearing.
@@ -230,19 +238,19 @@ ivec2 liveV(ivec2 face, vec2 position) {
 }
 
 float sampleUPrev(ivec2 face) {
-    return imageLoad(waterUPrevTex, face).x;
+    return loadTexel(waterUPrevTex, face).x;
 }
 
 float sampleVPrev(ivec2 face) {
-    return imageLoad(waterVPrevTex, face).x;
+    return loadTexel(waterVPrevTex, face).x;
 }
 
 float sampleUCurrent(ivec2 face) {
-    return imageLoad(waterUTex, face).x;
+    return loadTexel(waterUTex, face).x;
 }
 
 float sampleVCurrent(ivec2 face) {
-    return imageLoad(waterVTex, face).x;
+    return loadTexel(waterVTex, face).x;
 }
 
 float bilerpUCurrent(vec2 position) {
@@ -366,11 +374,11 @@ float sampleSand(vec2 position, out vec2 velocity) {
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
             ivec2 cell = clamp(base + ivec2(i, j), ivec2(0), gridSize - ivec2(1));
-            float occupancy = imageLoad(sandOccupancyTex, cell).x;
+            float occupancy = loadTexel(sandOccupancyTex, cell).x;
             if (occupancy > 0.0) {
                 float weight = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y) * occupancy;
                 fraction += weight;
-                momentum += weight * imageLoad(sandVelocityTex, cell + ivec2(1)).xy;
+                momentum += weight * loadTexel(sandVelocityTex, cell + ivec2(1)).xy;
             }
         }
     }
@@ -389,7 +397,7 @@ vec2 cappedVelocity(vec2 value) {
 
 vec2 advectionVelocity(vec2 position, vec2 particleVelocity) {
     ivec2 cell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
-    return cappedVelocity(imageLoad(liquidVolumeTex, cell).x > 0.0 ? sampleProjectedGridVelocity(position) : particleVelocity);
+    return cappedVelocity(loadTexel(liquidVolumeTex, cell).x > 0.0 ? sampleProjectedGridVelocity(position) : particleVelocity);
 }
 
 void main() {
@@ -448,7 +456,7 @@ void main() {
         for (int i = 0; i < 4; ++i) {
             ivec2 o = ivec2(i & 1, i >> 1);
             ivec2 c = clamp(c0 + o, ivec2(0), gridSize - ivec2(1));
-            share += imageLoad(oilTex, c).x * (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+            share += loadTexel(oilTex, c).x * (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
         }
         // Capped at 2 g: an impact's pressure spike must not fling the oil.
         float magnitude = length(pressureAcceleration);
@@ -495,7 +503,7 @@ void main() {
         atomicAdd(waterVelocityClamped, 1u);
     }
     ivec2 finalCell = clamp(ivec2(floor(position)), ivec2(0), gridSize - ivec2(1));
-    if (clumpVolume > 0.0 && imageLoad(liquidVolumeTex, finalCell).x > clumpVolume) {
+    if (clumpVolume > 0.0 && loadTexel(liquidVolumeTex, finalCell).x > clumpVolume) {
         // Hashed from the particle's own state, not its slot: slots are reordered nondeterministically.
         // The record tag keeps coincident records apart: once FLIP has made their velocities equal too (the 0.97 blend
         // shrinks a difference below float precision within seconds), the state alone drew one jitter for all of them
@@ -520,8 +528,8 @@ void main() {
         for (int i = 0; i < 2; ++i) {
             ivec2 c = cell + ivec2(0, i == 0 ? 0 : (oil ? 1 : -1));
             if (blockedCell(c)) continue;
-            float share = imageLoad(oilTex, c).x;
-            other = max(other, imageLoad(liquidVolumeTex, c).x * (oil ? 1.0 - share : share));
+            float share = loadTexel(oilTex, c).x;
+            other = max(other, loadTexel(liquidVolumeTex, c).x * (oil ? 1.0 - share : share));
         }
         float drive = clamp(2.0 * other / restVolume, 0.0, 1.0) * support;
         if (drive > 0.0) {

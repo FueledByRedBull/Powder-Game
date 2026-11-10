@@ -2,10 +2,10 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r8ui, binding = 0) uniform readonly uimage2D srcBoundaryTex;
+layout(binding = 0) uniform usampler2D srcBoundaryTex;
 layout(r8ui, binding = 1) uniform writeonly uimage2D dstBoundaryTex;
-layout(r16f, binding = 2) uniform readonly image2D liquidVolumeTex;  // water plus oil volume per source cell
-layout(rg16f, binding = 3) uniform readonly image2D oilTex;          // x: oil share of that liquid (oil_field.comp)
+layout(binding = 2) uniform sampler2D liquidVolumeTex;  // water plus oil volume per source cell
+layout(binding = 3) uniform sampler2D oilTex;          // x: oil share of that liquid (oil_field.comp)
 
 uniform ivec2 srcSize;
 uniform ivec2 dstSize;
@@ -14,6 +14,14 @@ uniform int scale;
 // the gas like dense sand, so smoke and flame cannot pass through a pool and smoke that reaches it is washed out.
 // Zero (unset) leaves water open.
 uniform float waterBlockVolume;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 bool inBounds(ivec2 coord, ivec2 size) {
     return coord.x >= 0 && coord.y >= 0 && coord.x < size.x && coord.y < size.y;
@@ -32,7 +40,7 @@ void main() {
     uint blocked = 0u;
     for (int y = src_min.y; y < src_max.y && blocked != 1u; ++y) {
         for (int x = src_min.x; x < src_max.x; ++x) {
-            uint source = imageLoad(srcBoundaryTex, ivec2(x, y)).r;
+            uint source = loadTexel(srcBoundaryTex, ivec2(x, y)).r;
             if (source == 1u) {
                 blocked = 1u;
                 break;
@@ -46,7 +54,7 @@ void main() {
         bool submerged = true;
         for (int i = 0; i < scale * scale && submerged; ++i) {
             ivec2 cell = min(dst * scale + ivec2(i % scale, i / scale), srcSize - 1);
-            submerged = imageLoad(liquidVolumeTex, cell).x * (1.0 - imageLoad(oilTex, cell).x) >= waterBlockVolume;
+            submerged = loadTexel(liquidVolumeTex, cell).x * (1.0 - loadTexel(oilTex, cell).x) >= waterBlockVolume;
         }
         if (submerged) blocked = 3u;
     }

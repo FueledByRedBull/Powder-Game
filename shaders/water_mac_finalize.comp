@@ -2,12 +2,20 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(r16f, binding = 0) uniform readonly image2D waterUFaceTex;
-layout(r16f, binding = 1) uniform readonly image2D waterVFaceTex;
-layout(r8ui, binding = 2) uniform readonly uimage2D boundaryTex;
+layout(binding = 0) uniform sampler2D waterUFaceTex;
+layout(binding = 1) uniform sampler2D waterVFaceTex;
+layout(binding = 2) uniform usampler2D boundaryTex;
 layout(rg16f, binding = 3) uniform writeonly image2D waterCellVelocityTex;
 
 uniform ivec2 gridSize;
+
+// Sampled reads keep imageLoad's result outside the texture: zero.
+vec4 loadTexel(sampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : vec4(0.0);
+}
+uvec4 loadTexel(usampler2D t, ivec2 c) {
+    return all(lessThan(uvec2(c), uvec2(textureSize(t, 0)))) ? texelFetch(t, c, 0) : uvec4(0u);
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -15,15 +23,15 @@ void main() {
         return;
     }
 
-    if (imageLoad(boundaryTex, coord).r != 0u) {
+    if (loadTexel(boundaryTex, coord).r != 0u) {
         imageStore(waterCellVelocityTex, coord, vec4(0.0));
         return;
     }
 
-    float u_left = imageLoad(waterUFaceTex, ivec2(coord.x, coord.y)).x;
-    float u_right = imageLoad(waterUFaceTex, ivec2(coord.x + 1, coord.y)).x;
-    float v_down = imageLoad(waterVFaceTex, ivec2(coord.x, coord.y)).x;
-    float v_up = imageLoad(waterVFaceTex, ivec2(coord.x, coord.y + 1)).x;
+    float u_left = loadTexel(waterUFaceTex, ivec2(coord.x, coord.y)).x;
+    float u_right = loadTexel(waterUFaceTex, ivec2(coord.x + 1, coord.y)).x;
+    float v_down = loadTexel(waterVFaceTex, ivec2(coord.x, coord.y)).x;
+    float v_up = loadTexel(waterVFaceTex, ivec2(coord.x, coord.y + 1)).x;
     vec2 velocity = vec2(0.5 * (u_left + u_right), 0.5 * (v_down + v_up));
     imageStore(waterCellVelocityTex, coord, vec4(velocity, 0.0, 0.0));
 }
